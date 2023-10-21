@@ -5,6 +5,19 @@ use ruint::aliases::U256;
 
 #[cxx::bridge]
 mod ffi {
+
+    #[derive(Debug)]
+    pub struct InputOutputList {
+        pub list: Vec<IODef>,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct IODef {
+        pub code: usize,
+        pub offset: usize,
+        pub lengths: Vec<usize>,
+    }
+
     #[derive(Debug, Default)]
     struct Circom_Component {
         templateId: u32,
@@ -22,19 +35,20 @@ mod ffi {
         signalValues: Vec<FrElement>,
         componentMemory: Vec<Circom_Component>,
         circuitConstants: Vec<FrElement>,
-        // std::map<u32,IODefPair> templateInsId2IOSignalInfo;
-        // std::string* listOfTemplateMessages;
+        templateInsId2IOSignalInfoList: Vec<InputOutputList>,
+        listOfTemplateMessages: Vec<String>,
     }
 
     // Rust types and signatures exposed to C++.
     extern "Rust" {
         type FrElement;
+
         fn create_vec(len: usize) -> Vec<FrElement>;
 
         // Field operations
-        fn Fr_mul(to: &mut FrElement, a: &FrElement, b: &FrElement);
-        fn Fr_add(to: &mut FrElement, a: &FrElement, b: &FrElement);
-        fn Fr_sub(to: &mut FrElement, a: &FrElement, b: &FrElement);
+        unsafe fn Fr_mul(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
+        unsafe fn Fr_add(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
+        unsafe fn Fr_sub(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
         unsafe fn Fr_copy(to: *mut FrElement, a: *const FrElement);
         unsafe fn Fr_copyn(to: *mut FrElement, a: *const FrElement, n: usize);
         // fn Fr_neg(to: &mut FrElement, a: &FrElement);
@@ -82,6 +96,14 @@ fn main() {
             FrElement(U256::from(5)),
             FrElement(U256::from(5)),
         ],
+        templateInsId2IOSignalInfoList: vec![ffi::InputOutputList {
+            list: vec![ffi::IODef {
+                code: 0,
+                offset: 0,
+                lengths: vec![1],
+            }],
+        }],
+        listOfTemplateMessages: vec!["".to_string()],
     };
 
     // ffi::run(&mut ctx);

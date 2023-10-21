@@ -13,18 +13,18 @@ pub const INV: u64 = 14042775128853446655;
 pub const R: U256 = uint!(0x0e0a77c19a07df2f666ea36f7879462e36fc76959f60cd29ac96341c4ffffffb_U256);
 
 #[allow(warnings)]
-pub fn Fr_mul(to: &mut FrElement, a: &FrElement, b: &FrElement) {
-    to.0 = a.0.mul_mod(b.0, M);
+pub unsafe fn Fr_mul(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
+    (*to).0 = (*a).0.mul_mod((*b).0, M);
 }
 
 #[allow(warnings)]
-pub fn Fr_add(to: &mut FrElement, a: &FrElement, b: &FrElement) {
-    to.0 = a.0.add_mod(b.0, M);
+pub unsafe fn Fr_add(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
+    (*to).0 = (*a).0.add_mod((*b).0, M);
 }
 
 #[allow(warnings)]
-pub fn Fr_sub(to: &mut FrElement, a: &FrElement, b: &FrElement) {
-    to.0 = a.0.add_mod(-b.0, M);
+pub unsafe fn Fr_sub(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
+    (*to).0 = (*a).0.add_mod(-(*b).0, M);
 }
 
 #[allow(warnings)]
