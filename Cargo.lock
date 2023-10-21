@@ -979,6 +979,7 @@ dependencies = [
 name = "witness"
 version = "0.1.0"
 dependencies = [
+ "byteorder",
  "cxx",
  "cxx-build",
  "ruint",

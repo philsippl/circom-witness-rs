@@ -43,4 +43,6 @@ sed -e 's/FrElement\* signalValues/rust::Vec<FrElement> \&signalValues/g' \
     -e 's/FrElement lvar\[\([0-9]*\)\];/rust::Vec<FrElement> lvar = create_vec(\1);/g' \
     -e 's/PFrElement aux_dest/FrElement \*aux_dest/g' \
     -e 's/subcomponents = new uint\[0\];/subcomponents = rust::Vec<uint32_t>{};/g' \
+    -e '/^delete/d' \
+    -e '/mySubcomponentsParallel/d' \
     -e '/^#include/d' "$1" >> "$1.new"

@@ -1,7 +1,11 @@
 mod field;
 
+use std::{env, io::Read, str::FromStr};
+
+use byteorder::{LittleEndian, ReadBytesExt};
+use ffi::InputOutputList;
 use field::*;
-use ruint::aliases::U256;
+use ruint::{aliases::U256, uint};
 
 #[cxx::bridge]
 mod ffi {
@@ -18,7 +22,7 @@ mod ffi {
         pub lengths: Vec<usize>,
     }
 
-    #[derive(Debug, Default)]
+    #[derive(Debug, Default, Clone)]
     struct Circom_Component {
         templateId: u32,
         signalStart: u64,
@@ -78,35 +82,94 @@ mod ffi {
         include!("witness/include/blobstore.h");
 
         unsafe fn run(ctx: *mut Circom_CalcWit);
+        fn get_size_of_io_map() -> u32;
+        fn get_total_signal_no() -> u32;
+        fn get_main_input_signal_no() -> u32;
+        fn get_main_input_signal_start() -> u32;
+        fn get_number_of_components() -> u32;
+        fn get_size_of_constants() -> u32;
     }
 }
 
-fn main() {
-    let mut ctx = ffi::Circom_CalcWit {
-        signalValues: vec![
-            FrElement(U256::from(1)),
-            FrElement(U256::from(1)),
-            FrElement(U256::from(1)),
-            FrElement(U256::from(1)),
-            FrElement(U256::from(1)),
-        ],
-        componentMemory: vec![ffi::Circom_Component::default()],
-        circuitConstants: vec![
-            FrElement(U256::from(5)),
-            FrElement(U256::from(5)),
-            FrElement(U256::from(5)),
-        ],
-        templateInsId2IOSignalInfoList: vec![ffi::InputOutputList {
-            list: vec![ffi::IODef {
+const CONSTANTS_DAT_BYTES: &[u8] = include_bytes!("constants.dat");
+const DAT_BYTES: &[u8] = include_bytes!("iosignals.dat");
+
+pub fn get_constants() -> Vec<FrElement> {
+    let mut bytes = CONSTANTS_DAT_BYTES;
+    let mut constants = vec![FrElement(U256::from(1)); ffi::get_size_of_constants() as usize];
+    for i in 0..ffi::get_size_of_constants() as usize {
+        let sv = bytes.read_i32::<LittleEndian>().unwrap() as i32;
+        let typ = bytes.read_u32::<LittleEndian>().unwrap() as u32;
+
+        let mut buf = [0; 32];
+        bytes.read_exact(&mut buf);
+
+        if typ & 0x80000000 == 0 {
+            constants[i] = FrElement(U256::from(sv));
+        } else {
+            constants[i] = FrElement(U256::from_le_bytes(buf));
+        }
+    }
+    return constants;
+}
+
+pub fn get_iosignals() -> Vec<InputOutputList> {
+    let mut bytes = DAT_BYTES;
+    let io_size = ffi::get_size_of_io_map() as usize;
+    let mut indices = vec![0usize; io_size];
+    let mut map: Vec<InputOutputList> = Vec::with_capacity(io_size);
+
+    (0..io_size).for_each(|i| {
+        let t32 = bytes.read_u32::<LittleEndian>().unwrap() as usize;
+        indices[i] = t32;
+    });
+
+    (0..io_size).for_each(|i| {
+        let l32 = bytes.read_u32::<LittleEndian>().unwrap() as usize;
+        let mut io_list: InputOutputList = InputOutputList { list: vec![] };
+
+        (0..l32).for_each(|_j| {
+            let offset = bytes.read_u32::<LittleEndian>().unwrap() as usize;
+            let len = bytes.read_u32::<LittleEndian>().unwrap() as usize + 1;
+
+            let mut lengths = vec![0usize; len];
+
+            (1..len).for_each(|k| {
+                lengths[k] = bytes.read_u32::<LittleEndian>().unwrap() as usize;
+            });
+
+            io_list.list.push(ffi::IODef {
                 code: 0,
-                offset: 0,
-                lengths: vec![1],
-            }],
-        }],
-        listOfTemplateMessages: vec!["".to_string()],
+                offset,
+                lengths,
+            });
+        });
+        map[indices[i] % io_size] = io_list;
+    });
+    map
+}
+
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    let mut signal_values = vec![FrElement(uint!(0_U256)); ffi::get_total_signal_no() as usize];
+    signal_values[0] = FrElement(uint!(1_U256));
+
+    for (i, w) in args.into_iter().skip(1).enumerate() {
+        signal_values[ffi::get_main_input_signal_start() as usize + i] =
+            FrElement(U256::from_str(&w).unwrap());
+    }
+
+    let mut ctx = ffi::Circom_CalcWit {
+        signalValues: signal_values,
+        componentMemory: vec![
+            ffi::Circom_Component::default();
+            ffi::get_number_of_components() as usize
+        ],
+        circuitConstants: get_constants(),
+        templateInsId2IOSignalInfoList: get_iosignals(),
+        listOfTemplateMessages: vec![],
     };
 
-    // ffi::run(&mut ctx);
     unsafe {
         ffi::run(&mut ctx as *mut _);
     }
@@ -114,6 +177,4 @@ fn main() {
     for i in 0..ctx.signalValues.len() {
         println!("signalValues[{}]: {:?}", i, ctx.signalValues[i].0);
     }
-
-    dbg!(ctx);
 }
