@@ -9,6 +9,7 @@ edition = "2021"
 cxx = "1.0"
 ruint = "1.10.0"
 byteorder = "1.4.3"
+hex = "0.4.3"
 
 [build-dependencies]
 cxx-build = "1.0"

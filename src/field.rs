@@ -24,7 +24,7 @@ pub unsafe fn Fr_add(to: *mut FrElement, a: *const FrElement, b: *const FrElemen
 
 #[allow(warnings)]
 pub unsafe fn Fr_sub(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
-    (*to).0 = (*a).0.add_mod(-(*b).0, M);
+    (*to).0 = (*a).0.add_mod((M - (*b).0), M);
 }
 
 #[allow(warnings)]
@@ -45,4 +45,36 @@ pub fn Fr_copyn(to: *mut FrElement, a: *const FrElement, n: usize) {
 /// Needed because the default constructor of opaque type is not implemented.
 pub fn create_vec(len: usize) -> Vec<FrElement> {
     vec![FrElement(U256::from(0)); len]
+}
+
+pub unsafe fn Fr_toInt(a: *const FrElement) -> u64 {
+    (*a).0.as_limbs()[0]
+}
+
+pub unsafe fn Fr_isTrue(a: *mut FrElement) -> bool {
+    (*a).0 != U256::from(0)
+}
+
+pub unsafe fn Fr_eq(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
+    (*to).0 = U256::from(((*a).0 == (*b).0) as i32);
+}
+
+pub unsafe fn Fr_neq(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
+    (*to).0 = U256::from(((*a).0 != (*b).0) as i32);
+}
+
+pub unsafe fn Fr_lt(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
+    (*to).0 = U256::from(((*a).0 < (*b).0) as i32)
+}
+
+pub unsafe fn Fr_gt(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
+    (*to).0 = U256::from(((*a).0 > (*b).0) as i32)
+}
+
+pub unsafe fn Fr_leq(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
+    (*to).0 = U256::from(((*a).0 <= (*b).0) as i32)
+}
+
+pub unsafe fn Fr_geq(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
+    (*to).0 = U256::from(((*a).0 >= (*b).0) as i32)
 }

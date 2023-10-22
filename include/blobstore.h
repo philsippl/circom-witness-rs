@@ -15,3 +15,5 @@ uint get_main_input_signal_no();
 uint get_main_input_signal_start();
 uint get_number_of_components();
 uint get_size_of_constants();
+uint get_size_of_input_hashmap();
+uint get_size_of_witness();

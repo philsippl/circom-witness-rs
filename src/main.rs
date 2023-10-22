@@ -65,14 +65,15 @@ mod ffi {
         // fn Fr_bor(to: &mut FrElement, a: &FrElement, b: &FrElement);
         // fn Fr_bxor(to: &mut FrElement, a: &FrElement, b: &FrElement);
         // fn Fr_bnot(to: &mut FrElement, a: &FrElement);
-        // fn Fr_eq(a: &FrElement, b: &FrElement) -> bool;
-        // fn Fr_neq(a: &FrElement, b: &FrElement) -> bool;
-        // fn Fr_lt(a: &FrElement, b: &FrElement) -> bool;
-        // fn Fr_gt(a: &FrElement, b: &FrElement) -> bool;
-        // fn Fr_leq(a: &FrElement, b: &FrElement) -> bool;
-        // fn Fr_geq(a: &FrElement, b: &FrElement) -> bool;
+        unsafe fn Fr_eq(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
+        unsafe fn Fr_neq(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
+        unsafe fn Fr_lt(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
+        unsafe fn Fr_gt(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
+        unsafe fn Fr_leq(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
+        unsafe fn Fr_geq(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
+        unsafe fn Fr_isTrue(a: *mut FrElement) -> bool;
         // fn Fr_fromBool(to: &mut FrElement, a: bool);
-        // fn Fr_toInt(a: &FrElement) -> u64;
+        unsafe fn Fr_toInt(a: *mut FrElement) -> u64;
         // fn Fr_pow(to: &mut FrElement, a: &FrElement, b: &FrElement);
         // fn Fr_idiv(to: &mut FrElement, a: &FrElement, b: &FrElement);
     }
@@ -88,15 +89,22 @@ mod ffi {
         fn get_main_input_signal_start() -> u32;
         fn get_number_of_components() -> u32;
         fn get_size_of_constants() -> u32;
+        fn get_size_of_input_hashmap() -> u32;
+        fn get_size_of_witness() -> u32;
     }
 }
 
-const CONSTANTS_DAT_BYTES: &[u8] = include_bytes!("constants.dat");
-const DAT_BYTES: &[u8] = include_bytes!("iosignals.dat");
+const DAT_BYTES: &[u8] = include_bytes!("mimc.dat");
 
 pub fn get_constants() -> Vec<FrElement> {
-    let mut bytes = CONSTANTS_DAT_BYTES;
-    let mut constants = vec![FrElement(U256::from(1)); ffi::get_size_of_constants() as usize];
+    if ffi::get_size_of_constants() == 0 {
+        return vec![];
+    }
+
+    // skip the first part
+    let mut bytes = &DAT_BYTES[(ffi::get_size_of_input_hashmap() as usize) * 24
+        + (ffi::get_size_of_witness() as usize) * 8..];
+    let mut constants = vec![FrElement(U256::from(0)); ffi::get_size_of_constants() as usize];
     for i in 0..ffi::get_size_of_constants() as usize {
         let sv = bytes.read_i32::<LittleEndian>().unwrap() as i32;
         let typ = bytes.read_u32::<LittleEndian>().unwrap() as u32;
@@ -107,14 +115,21 @@ pub fn get_constants() -> Vec<FrElement> {
         if typ & 0x80000000 == 0 {
             constants[i] = FrElement(U256::from(sv));
         } else {
-            constants[i] = FrElement(U256::from_le_bytes(buf));
+            constants[i] = FrElement(U256::from_le_bytes(buf).mul_redc(uint!(1_U256), M, INV));
         }
     }
     return constants;
 }
 
 pub fn get_iosignals() -> Vec<InputOutputList> {
-    let mut bytes = DAT_BYTES;
+    if ffi::get_size_of_io_map() == 0 {
+        return vec![];
+    }
+
+    // skip the first part
+    let mut bytes = &DAT_BYTES[(ffi::get_size_of_input_hashmap() as usize) * 24
+        + (ffi::get_size_of_witness() as usize) * 8
+        + (ffi::get_size_of_constants() as usize * 40)..];
     let io_size = ffi::get_size_of_io_map() as usize;
     let mut indices = vec![0usize; io_size];
     let mut map: Vec<InputOutputList> = Vec::with_capacity(io_size);
