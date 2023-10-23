@@ -1,6 +1,6 @@
 mod field;
 
-use std::{env, io::Read, str::FromStr};
+use std::{env, io::Read, str::FromStr, time::Instant};
 
 use byteorder::{LittleEndian, ReadBytesExt};
 use ffi::InputOutputList;
@@ -10,12 +10,12 @@ use ruint::{aliases::U256, uint};
 #[cxx::bridge]
 mod ffi {
 
-    #[derive(Debug)]
+    #[derive(Debug, Default, Clone)]
     pub struct InputOutputList {
-        pub list: Vec<IODef>,
+        pub defs: Vec<IODef>,
     }
 
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, Default)]
     pub struct IODef {
         pub code: usize,
         pub offset: usize,
@@ -48,6 +48,13 @@ mod ffi {
         type FrElement;
 
         fn create_vec(len: usize) -> Vec<FrElement>;
+        fn create_vec_u32(len: usize) -> Vec<u32>;
+        fn generate_position_array(
+            prefix: String,
+            dimensions: Vec<u32>,
+            size_dimensions: u32,
+            index: u32,
+        ) -> String;
 
         // Field operations
         unsafe fn Fr_mul(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
@@ -94,7 +101,7 @@ mod ffi {
     }
 }
 
-const DAT_BYTES: &[u8] = include_bytes!("mimc.dat");
+const DAT_BYTES: &[u8] = include_bytes!("poseidon.dat");
 
 pub fn get_constants() -> Vec<FrElement> {
     if ffi::get_size_of_constants() == 0 {
@@ -113,11 +120,12 @@ pub fn get_constants() -> Vec<FrElement> {
         bytes.read_exact(&mut buf);
 
         if typ & 0x80000000 == 0 {
-            constants[i] = FrElement(U256::from(sv));
+            constants[i] = FrElement(U256::from(sv).mul_mod(R, M));
         } else {
-            constants[i] = FrElement(U256::from_le_bytes(buf).mul_redc(uint!(1_U256), M, INV));
+            constants[i] = FrElement(U256::from_le_bytes(buf));
         }
     }
+
     return constants;
 }
 
@@ -132,7 +140,7 @@ pub fn get_iosignals() -> Vec<InputOutputList> {
         + (ffi::get_size_of_constants() as usize * 40)..];
     let io_size = ffi::get_size_of_io_map() as usize;
     let mut indices = vec![0usize; io_size];
-    let mut map: Vec<InputOutputList> = Vec::with_capacity(io_size);
+    let mut map: Vec<InputOutputList> = vec![InputOutputList::default(); io_size];
 
     (0..io_size).for_each(|i| {
         let t32 = bytes.read_u32::<LittleEndian>().unwrap() as usize;
@@ -141,7 +149,7 @@ pub fn get_iosignals() -> Vec<InputOutputList> {
 
     (0..io_size).for_each(|i| {
         let l32 = bytes.read_u32::<LittleEndian>().unwrap() as usize;
-        let mut io_list: InputOutputList = InputOutputList { list: vec![] };
+        let mut io_list: InputOutputList = InputOutputList { defs: vec![] };
 
         (0..l32).for_each(|_j| {
             let offset = bytes.read_u32::<LittleEndian>().unwrap() as usize;
@@ -153,7 +161,7 @@ pub fn get_iosignals() -> Vec<InputOutputList> {
                 lengths[k] = bytes.read_u32::<LittleEndian>().unwrap() as usize;
             });
 
-            io_list.list.push(ffi::IODef {
+            io_list.defs.push(ffi::IODef {
                 code: 0,
                 offset,
                 lengths,
@@ -167,11 +175,11 @@ pub fn get_iosignals() -> Vec<InputOutputList> {
 fn main() {
     let args: Vec<String> = env::args().collect();
     let mut signal_values = vec![FrElement(uint!(0_U256)); ffi::get_total_signal_no() as usize];
-    signal_values[0] = FrElement(uint!(1_U256));
+    signal_values[0] = FrElement(uint!(1_U256).mul_mod(R, M));
 
     for (i, w) in args.into_iter().skip(1).enumerate() {
         signal_values[ffi::get_main_input_signal_start() as usize + i] =
-            FrElement(U256::from_str(&w).unwrap());
+            FrElement(U256::from_str(&w).unwrap().mul_mod(R, M));
     }
 
     let mut ctx = ffi::Circom_CalcWit {
@@ -185,11 +193,18 @@ fn main() {
         listOfTemplateMessages: vec![],
     };
 
+    // measure time
+    let now = Instant::now();
     unsafe {
         ffi::run(&mut ctx as *mut _);
     }
+    println!("calculation took: {:?}", now.elapsed());
 
     for i in 0..ctx.signalValues.len() {
-        println!("signalValues[{}]: {:?}", i, ctx.signalValues[i].0);
+        println!(
+            "signalValues[{}]: {:?}",
+            i,
+            ctx.signalValues[i].0.mul_redc(uint!(1_U256), M, INV)
+        );
     }
 }

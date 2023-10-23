@@ -36,13 +36,26 @@ EOT
 # Replace a few things we can't do in cxx
 sed -e 's/FrElement\* signalValues/rust::Vec<FrElement> \&signalValues/g' \
     -e 's/std::string/rust::string/g' \
+    -e 's/ctx->templateInsId2IOSignalInfo/IOSignalInfoAccessor(ctx)/g' \
     -e 's/u32\* mySubcomponents/rust::Vec<u32> mySubcomponents/g' \
     -e 's/FrElement\* circuitConstants/rust::Vec<FrElement> \&circuitConstants/g' \
     -e 's/rust::string\* listOfTemplateMessages/rust::Vec<rust::string> \&listOfTemplateMessages/g' \
     -e 's/FrElement expaux\[\([0-9]*\)\];/rust::Vec<FrElement> expaux = create_vec(\1);/g' \
     -e 's/FrElement lvar\[\([0-9]*\)\];/rust::Vec<FrElement> lvar = create_vec(\1);/g' \
+    -e 's/FrElement lvarcall\[\([0-9]*\)\];/rust::Vec<FrElement> lvarcall = create_vec(\1);/g' \
     -e 's/PFrElement aux_dest/FrElement \*aux_dest/g' \
-    -e 's/subcomponents = new uint\[0\];/subcomponents = rust::Vec<uint32_t>{};/g' \
+    -e 's/subcomponents = new uint\[\([0-9]*\)\];/subcomponents = create_vec_u32(\1);/g' \
     -e '/^delete/d' \
+    -e '/trace/d' \
+    -e 's/\(ctx,\)\(lvarcall,\)\(myId,\)/\1\&\2\3/g' \
+    -e '/^#include/d' \
     -e '/mySubcomponentsParallel/d' \
+    -e 's/FrElement lvarcall\[\([0-9]*\)\];/rust::Vec<FrElement> lvarcall = create_vec(\1);/g' \
+    -e 's/,FrElement\* lvar,/,rust::Vec<FrElement>\& lvar,/g' \
+    -e 's/ctx,\&lvarcall,myId,/ctx,lvarcall,myId,/g' \
     -e '/^#include/d' "$1" >> "$1.new"
+
+sed -E -e 's/"([^"]+)"\+ctx->generate_position_array\(([^)]+)\)/generate_position_array("\1", \2)/g' \
+    -e 's/^uint aux_dimensions\[([0-9]+)\] = \{([^}]+)\};$/rust::Vec<uint> aux_dimensions = rust::Vec<uint32_t>{\2};/' "$1.new" > "$1.new2"
+
+rm "$1.new"
