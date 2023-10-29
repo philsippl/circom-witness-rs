@@ -6,6 +6,7 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use ffi::InputOutputList;
 use field::*;
 use ruint::{aliases::U256, uint};
+use serde_json::Value;
 
 #[cxx::bridge]
 mod ffi {
@@ -24,9 +25,9 @@ mod ffi {
 
     #[derive(Debug, Default, Clone)]
     struct Circom_Component {
-        templateId: u32,
+        templateId: u64,
         signalStart: u64,
-        inputCounter: u32,
+        inputCounter: u64,
         templateName: String,
         componentName: String,
         idFather: u64,
@@ -81,6 +82,8 @@ mod ffi {
         unsafe fn Fr_isTrue(a: *mut FrElement) -> bool;
         // fn Fr_fromBool(to: &mut FrElement, a: bool);
         unsafe fn Fr_toInt(a: *mut FrElement) -> u64;
+        unsafe fn Fr_lor(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
+        unsafe fn print(a: *mut FrElement);
         // fn Fr_pow(to: &mut FrElement, a: &FrElement, b: &FrElement);
         // fn Fr_idiv(to: &mut FrElement, a: &FrElement, b: &FrElement);
     }
@@ -101,7 +104,30 @@ mod ffi {
     }
 }
 
-const DAT_BYTES: &[u8] = include_bytes!("poseidon.dat");
+const DAT_BYTES: &[u8] = include_bytes!("semaphore.dat");
+
+#[derive(Debug, Default, Clone)]
+pub struct HashSignalInfo {
+    pub hash: u64,
+    pub signalid: u64,
+    pub signalsize: u64,
+}
+
+pub fn get_input_hash_map() -> Vec<HashSignalInfo> {
+    let mut bytes = &DAT_BYTES[..(ffi::get_size_of_input_hashmap() as usize) * 24];
+    let mut input_hash_map = vec![HashSignalInfo::default(); ffi::get_size_of_input_hashmap() as usize];
+    for i in 0..ffi::get_size_of_input_hashmap() as usize {
+        let hash = bytes.read_u64::<LittleEndian>().unwrap();
+        let signalid = bytes.read_u64::<LittleEndian>().unwrap();
+        let signalsize = bytes.read_u64::<LittleEndian>().unwrap();
+        input_hash_map[i] = HashSignalInfo {
+            hash,
+            signalid,
+            signalsize,
+        };
+    }
+    input_hash_map
+}
 
 pub fn get_constants() -> Vec<FrElement> {
     if ffi::get_size_of_constants() == 0 {
@@ -120,9 +146,9 @@ pub fn get_constants() -> Vec<FrElement> {
         bytes.read_exact(&mut buf);
 
         if typ & 0x80000000 == 0 {
-            constants[i] = FrElement(U256::from(sv).mul_mod(R, M));
+            constants[i] = FrElement(U256::from(sv));
         } else {
-            constants[i] = FrElement(U256::from_le_bytes(buf));
+            constants[i] = FrElement(U256::from_le_bytes(buf).mul_redc(uint!(1_U256), M, INV));
         }
     }
 
@@ -139,8 +165,9 @@ pub fn get_iosignals() -> Vec<InputOutputList> {
         + (ffi::get_size_of_witness() as usize) * 8
         + (ffi::get_size_of_constants() as usize * 40)..];
     let io_size = ffi::get_size_of_io_map() as usize;
+    let hashmap_size = ffi::get_size_of_input_hashmap() as usize;
     let mut indices = vec![0usize; io_size];
-    let mut map: Vec<InputOutputList> = vec![InputOutputList::default(); io_size];
+    let mut map: Vec<InputOutputList> = vec![InputOutputList::default(); hashmap_size];
 
     (0..io_size).for_each(|i| {
         let t32 = bytes.read_u32::<LittleEndian>().unwrap() as usize;
@@ -167,20 +194,99 @@ pub fn get_iosignals() -> Vec<InputOutputList> {
                 lengths,
             });
         });
-        map[indices[i] % io_size] = io_list;
+        map[indices[i] % hashmap_size] = io_list;
     });
     map
 }
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
-    let mut signal_values = vec![FrElement(uint!(0_U256)); ffi::get_total_signal_no() as usize];
-    signal_values[0] = FrElement(uint!(1_U256).mul_mod(R, M));
-
-    for (i, w) in args.into_iter().skip(1).enumerate() {
-        signal_values[ffi::get_main_input_signal_start() as usize + i] =
-            FrElement(U256::from_str(&w).unwrap().mul_mod(R, M));
+fn fnv1a(s: &str) -> u64 {
+    let mut hash: u64 = 0xCBF29CE484222325;
+    for c in s.bytes() {
+        hash ^= c as u64;
+        hash = hash.wrapping_mul(0x100000001B3);
     }
+    hash
+}
+
+fn set_input_signal(input_hashmap: Vec<HashSignalInfo>, signal_values: &mut Vec<FrElement>, h: u64, i: u64, val: FrElement) {
+    let pos = input_hashmap.iter().position(|x| x.hash == h).unwrap();
+    let si = input_hashmap[pos].signalid + i;
+    signal_values[si as usize] = val;
+}
+
+fn main() {
+    let mut signal_values = vec![FrElement(uint!(0_U256)); ffi::get_total_signal_no() as usize];
+    signal_values[0] = FrElement(uint!(1_U256));
+
+    let data = r#"
+    {
+        "identityNullifier": "0x099ab25e555083e656e9ec66a5368d1edd3314bd2dc77553813c5145d37326a3",
+        "identityTrapdoor": "0x1db60e4cd8008edd85c68d461bf00d04f1620372f45c6ffacdb1a318791c2dd3",
+        "treePathIndices": [
+            "0x0",
+            "0x0",
+            "0x0",
+            "0x0",
+            "0x0",
+            "0x0",
+            "0x0",
+            "0x0",
+            "0x0",
+            "0x0",
+            "0x0",
+            "0x0",
+            "0x0",
+            "0x0",
+            "0x0",
+            "0x0"
+        ],
+        "treeSiblings": [
+            "0x0",
+            "0x2098f5fb9e239eab3ceac3f27b81e481dc3124d55ffed523a839ee8446b64864",
+            "0x1069673dcdb12263df301a6ff584a7ec261a44cb9dc68df067a4774460b1f1e1",
+            "0x18f43331537ee2af2e3d758d50f72106467c6eea50371dd528d57eb2b856d238",
+            "0x07f9d837cb17b0d36320ffe93ba52345f1b728571a568265caac97559dbc952a",
+            "0x2b94cf5e8746b3f5c9631f4c5df32907a699c58c94b2ad4d7b5cec1639183f55",
+            "0x2dee93c5a666459646ea7d22cca9e1bcfed71e6951b953611d11dda32ea09d78",
+            "0x078295e5a22b84e982cf601eb639597b8b0515a88cb5ac7fa8a4aabe3c87349d",
+            "0x2fa5e5f18f6027a6501bec864564472a616b2e274a41211a444cbe3a99f3cc61",
+            "0x0e884376d0d8fd21ecb780389e941f66e45e7acce3e228ab3e2156a614fcd747",
+            "0x1b7201da72494f1e28717ad1a52eb469f95892f957713533de6175e5da190af2",
+            "0x1f8d8822725e36385200c0b201249819a6e6e1e4650808b5bebc6bface7d7636",
+            "0x2c5d82f66c914bafb9701589ba8cfcfb6162b0a12acf88a8d0879a0471b5f85a",
+            "0x14c54148a0940bb820957f5adf3fa1134ef5c4aaa113f4646458f270e0bfbfd0",
+            "0x190d33b12f986f961e10c0ee44d8b9af11be25588cad89d416118e4bf4ebe80c",
+            "0x22f98aa9ce704152ac17354914ad73ed1167ae6596af510aa5b3649325e06c92"
+        ],
+        "externalNullifier": "0x00fd3a1e9736c12a5d4a31f26362b577ccafbd523d358daf40cdc04d90e17f77",
+        "signalHash": "0x00bc6bb462e38af7da48e0ae7b5cbae860141c04e5af2cf92328cd6548df111f"
+    }"#;
+
+    let input_map = get_input_hash_map();
+
+    let v: Value = serde_json::from_str(data).unwrap();
+    if let Value::Object(map) = v {
+        for (key, value) in map {
+            let h = fnv1a(key.as_str());
+            if value.is_array() {
+                for (idx, item) in value.as_array().unwrap().iter().enumerate() {
+                    let x = U256::from_str(item.as_str().unwrap()).unwrap();
+                    set_input_signal(input_map.clone(), &mut signal_values, h, idx as u64, FrElement(x));
+                }
+            } else {
+                let x = U256::from_str(value.as_str().unwrap()).unwrap();
+                set_input_signal(input_map.clone(), &mut signal_values, h, 0, FrElement(x));
+            }
+        }
+    } 
+
+    // for i in 0..signal_values.len() {
+    //     println!(
+    //         "signalValues[{}]: {:?}",
+    //         i,
+    //         signal_values[i].0
+    //     );
+    // }
 
     let mut ctx = ffi::Circom_CalcWit {
         signalValues: signal_values,
@@ -204,7 +310,7 @@ fn main() {
         println!(
             "signalValues[{}]: {:?}",
             i,
-            ctx.signalValues[i].0.mul_redc(uint!(1_U256), M, INV)
+            ctx.signalValues[i].0
         );
     }
 }

@@ -21,7 +21,7 @@ public:
       : calcWitContext(calcWit) {}
   auto operator[](size_t index) const -> decltype(auto) {
     return (calcWitContext
-                ->templateInsId2IOSignalInfoList)[index % get_size_of_io_map()];
+                ->templateInsId2IOSignalInfoList)[index % get_size_of_input_hashmap()];
   }
 };
 
@@ -45,7 +45,6 @@ sed -e 's/FrElement\* signalValues/rust::Vec<FrElement> \&signalValues/g' \
     -e 's/FrElement lvarcall\[\([0-9]*\)\];/rust::Vec<FrElement> lvarcall = create_vec(\1);/g' \
     -e 's/PFrElement aux_dest/FrElement \*aux_dest/g' \
     -e 's/subcomponents = new uint\[\([0-9]*\)\];/subcomponents = create_vec_u32(\1);/g' \
-    -e '/^delete/d' \
     -e '/trace/d' \
     -e 's/\(ctx,\)\(lvarcall,\)\(myId,\)/\1\&\2\3/g' \
     -e '/^#include/d' \
@@ -54,8 +53,14 @@ sed -e 's/FrElement\* signalValues/rust::Vec<FrElement> \&signalValues/g' \
     -e 's/,FrElement\* lvar,/,rust::Vec<FrElement>\& lvar,/g' \
     -e 's/ctx,\&lvarcall,myId,/ctx,lvarcall,myId,/g' \
     -e '/^#include/d' "$1" >> "$1.new"
+    # -e '/^delete/d' \
 
 sed -E -e 's/"([^"]+)"\+ctx->generate_position_array\(([^)]+)\)/generate_position_array("\1", \2)/g' \
+    -e 's/subcomponents = new uint\[([0-9]+)\]\{0\};/subcomponents = create_vec_u32(\1);/g' \
     -e 's/^uint aux_dimensions\[([0-9]+)\] = \{([^}]+)\};$/rust::Vec<uint> aux_dimensions = rust::Vec<uint32_t>{\2};/' "$1.new" > "$1.new2"
 
+# sed -n '1N;$!N;/\n.*delete/!P;D' "$1.new2" > "$1.new3"
+
 rm "$1.new"
+# rm "$1.new2"
+# mv "$1.new3" "$1.new2"
