@@ -52,8 +52,9 @@ sed -e 's/FrElement\* signalValues/rust::Vec<FrElement> \&signalValues/g' \
     -e 's/FrElement lvarcall\[\([0-9]*\)\];/rust::Vec<FrElement> lvarcall = create_vec(\1);/g' \
     -e 's/,FrElement\* lvar,/,rust::Vec<FrElement>\& lvar,/g' \
     -e 's/ctx,\&lvarcall,myId,/ctx,lvarcall,myId,/g' \
+    -e '/delete/{N;d;}' -e 'N;/\ndelete/!P;D' \
     -e '/^#include/d' "$1" >> "$1.new"
-    # -e '/^delete/d' \
+    
 
 sed -E -e 's/"([^"]+)"\+ctx->generate_position_array\(([^)]+)\)/generate_position_array("\1", \2)/g' \
     -e 's/subcomponents = new uint\[([0-9]+)\]\{0\};/subcomponents = create_vec_u32(\1);/g' \
