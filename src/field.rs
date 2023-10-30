@@ -1,5 +1,6 @@
 use ruint::{aliases::U256, uint};
 use std::{ptr, sync::Mutex};
+use crate::graph::{Node, Operation};
 
 pub const M: U256 =
     uint!(21888242871839275222246405745257275088548364400416034343698204186575808495617_U256);
@@ -7,27 +8,6 @@ pub const M: U256 =
 pub const INV: u64 = 14042775128853446655;
 
 pub const R: U256 = uint!(0x0e0a77c19a07df2f666ea36f7879462e36fc76959f60cd29ac96341c4ffffffb_U256);
-
-#[derive(Debug, Clone, Copy)]
-pub enum Operation {
-    Mul,
-    Add,
-    Sub,
-    Eq,
-    Neq,
-    Lt,
-    Gt,
-    Leq,
-    Geq,
-    Lor,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum Node {
-    Input(usize),
-    Constant(U256),
-    Op(Operation, usize, usize),
-}
 
 static NODES: Mutex<Vec<Node>> = Mutex::new(Vec::new());
 static VALUES: Mutex<Vec<U256>> = Mutex::new(Vec::new());
@@ -41,14 +21,21 @@ pub fn print_eval() {
     let values = VALUES.lock().unwrap();
     let constant = CONSTANT.lock().unwrap();
 
+    let mut constants = 0_usize;
     for (i, node) in nodes.iter().enumerate() {
         print!("{}: {:?}", i, node);
         if constant[i] {
+            constants += 1;
             println!(" = {}", values[i]);
         } else {
             println!("");
         }
     }
+    eprintln!("{} nodes of which {} constant and {} dynamic", nodes.len(), constants, nodes.len() - constants);
+}
+
+pub fn get_graph() -> Vec<Node> {
+    NODES.lock().unwrap().clone()
 }
 
 pub fn undefined() -> FrElement {
@@ -101,24 +88,6 @@ fn binop(op: Operation, to: *mut FrElement, a: *const FrElement, b: *const FrEle
 
     let (ca, cb) = (constant[a], constant[b]);
     constant.push(ca && cb);
-}
-
-impl Operation {
-    fn eval(&self, a: U256, b: U256) -> U256 {
-        use Operation::*;
-        match self {
-            Add => a.add_mod(b, M),
-            Sub => a.add_mod(M - b, M),
-            Mul => a.mul_mod(b, M),
-            Eq => U256::from(a == b),
-            Neq => U256::from(a != b),
-            Lt => U256::from(a < b),
-            Gt => U256::from(a > b),
-            Leq => U256::from(a <= b),
-            Geq => U256::from(a >= b),
-            Lor => U256::from(a != U256::ZERO || b != U256::ZERO),
-        }
-    }
 }
 
 pub fn Fr_mul(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {

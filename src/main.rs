@@ -1,5 +1,6 @@
 #![allow(non_snake_case)]
 
+mod graph;
 mod field;
 
 use byteorder::{LittleEndian, ReadBytesExt};
@@ -315,12 +316,22 @@ fn main() {
     unsafe {
         ffi::run(&mut ctx as *mut _);
     }
-    println!("calculation took: {:?}", now.elapsed());
+    eprintln!("Calculation took: {:?}", now.elapsed());
+    // field::print_eval();
 
+    let mut signals = ctx.signalValues.iter().map(|x| x.0).collect::<Vec<_>>();
+    let mut nodes = field::get_graph();
+    eprintln!("Graph with {} nodes", nodes.len());
 
-    field::print_eval();
-
-    for i in 0..ctx.signalValues.len() {
-        println!("signalValues[{}]: {:?}", i, ctx.signalValues[i].0);
+    // Optimize graph
+    graph::propagate(nodes.as_mut_slice());
+    graph::tree_shake(&mut nodes, &mut signals);
+    
+    // Print graph
+    for (i, node) in nodes.iter().enumerate() {
+        println!("node[{}] = {:?}", i, node);
+    }
+    for (i, j) in signals.iter().enumerate() {
+        println!("signal[{}] = node[{}]", i, j);
     }
 }
