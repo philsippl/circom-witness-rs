@@ -31,6 +31,7 @@ pub enum Node {
 
 static NODES: Mutex<Vec<Node>> = Mutex::new(Vec::new());
 static VALUES: Mutex<Vec<U256>> = Mutex::new(Vec::new());
+static CONSTANT: Mutex<Vec<bool>> = Mutex::new(Vec::new());
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FrElement(pub usize);
@@ -38,9 +39,15 @@ pub struct FrElement(pub usize);
 pub fn print_eval() {
     let nodes = NODES.lock().unwrap();
     let values = VALUES.lock().unwrap();
+    let constant = CONSTANT.lock().unwrap();
 
     for (i, node) in nodes.iter().enumerate() {
-        println!("{}: {:?}", i, node);
+        print!("{}: {:?}", i, node);
+        if constant[i] {
+            println!(" = {}", values[i]);
+        } else {
+            println!("");
+        }
     }
 }
 
@@ -49,37 +56,51 @@ pub fn undefined() -> FrElement {
 }
 
 pub fn constant(c: U256) -> FrElement {
-    let mut values = VALUES.lock().unwrap();
-    values.push(c);
-
     let mut nodes = NODES.lock().unwrap();
-    assert_eq!(values.len() - 1, nodes.len());
+    let mut values = VALUES.lock().unwrap();
+    let mut constant = CONSTANT.lock().unwrap();
+    assert_eq!(nodes.len(), values.len());
+    assert_eq!(nodes.len(), constant.len());
+
     nodes.push(Node::Constant(c));
+    values.push(c);
+    constant.push(true);
+
     FrElement(nodes.len() - 1)
 }
 
 pub fn input(i: usize, value: U256) -> FrElement {
-    let mut values = VALUES.lock().unwrap();
-    values.push(value);
-
     let mut nodes = NODES.lock().unwrap();
-    assert_eq!(values.len() - 1, nodes.len());
+    let mut values = VALUES.lock().unwrap();
+    let mut constant = CONSTANT.lock().unwrap();
+    assert_eq!(nodes.len(), values.len());
+    assert_eq!(nodes.len(), constant.len());
+
     nodes.push(Node::Input(i));
+    values.push(value);
+    constant.push(false);
+
     FrElement(nodes.len() - 1)
 }
 
 fn binop(op: Operation, to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
-    let (a, b, to) = unsafe { ((*a).0, (*b).0, &mut (*to).0) };
     let mut nodes = NODES.lock().unwrap();
+    let mut values = VALUES.lock().unwrap();
+    let mut constant = CONSTANT.lock().unwrap();
+    assert_eq!(nodes.len(), values.len());
+    assert_eq!(nodes.len(), constant.len());
+
+    let (a, b, to) = unsafe { ((*a).0, (*b).0, &mut (*to).0) };
     assert!(a < nodes.len());
     assert!(b < nodes.len());
     nodes.push(Node::Op(op, a, b));
     *to = nodes.len() - 1;
 
-    let mut values = VALUES.lock().unwrap();
-    assert_eq!(values.len(), nodes.len() - 1);
-    let (a, b) = (values[a], values[b]);
-    values.push(op.eval(a, b));
+    let (va, vb) = (values[a], values[b]);
+    values.push(op.eval(va, vb));
+
+    let (ca, cb) = (constant[a], constant[b]);
+    constant.push(ca && cb);
 }
 
 impl Operation {
@@ -156,8 +177,15 @@ pub fn generate_position_array(
 }
 
 pub unsafe fn Fr_toInt(a: *const FrElement) -> u64 {
+    let mut nodes = NODES.lock().unwrap();
+    let mut values = VALUES.lock().unwrap();
+    let mut constant = CONSTANT.lock().unwrap();
+    assert_eq!(nodes.len(), values.len());
+    assert_eq!(nodes.len(), constant.len());
+
     let a = unsafe { (*a).0 };
-    let values = VALUES.lock().unwrap();
+    assert!(a < nodes.len());
+    assert!(constant[a]);
     values[a].try_into().unwrap()
 }
 
@@ -166,8 +194,15 @@ pub unsafe fn print(a: *const FrElement) {
 }
 
 pub fn Fr_isTrue(a: *mut FrElement) -> bool {
+    let mut nodes = NODES.lock().unwrap();
+    let mut values = VALUES.lock().unwrap();
+    let mut constant = CONSTANT.lock().unwrap();
+    assert_eq!(nodes.len(), values.len());
+    assert_eq!(nodes.len(), constant.len());
+
     let a = unsafe { (*a).0 };
-    let values = VALUES.lock().unwrap();
+    assert!(a < nodes.len());
+    assert!(constant[a]);
     values[a] != U256::ZERO
 }
 
