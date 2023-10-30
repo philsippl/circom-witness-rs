@@ -1,6 +1,6 @@
+use crate::graph::{Node, Operation};
 use ruint::{aliases::U256, uint};
 use std::{ptr, sync::Mutex};
-use crate::graph::{Node, Operation};
 
 pub const M: U256 =
     uint!(21888242871839275222246405745257275088548364400416034343698204186575808495617_U256);
@@ -31,7 +31,12 @@ pub fn print_eval() {
             println!("");
         }
     }
-    eprintln!("{} nodes of which {} constant and {} dynamic", nodes.len(), constants, nodes.len() - constants);
+    eprintln!(
+        "{} nodes of which {} constant and {} dynamic",
+        nodes.len(),
+        constants,
+        nodes.len() - constants
+    );
 }
 
 pub fn get_graph() -> Vec<Node> {

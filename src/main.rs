@@ -1,7 +1,7 @@
 #![allow(non_snake_case)]
 
-mod graph;
 mod field;
+mod graph;
 
 use byteorder::{LittleEndian, ReadBytesExt};
 use ffi::InputOutputList;
@@ -326,7 +326,9 @@ fn main() {
     // Optimize graph
     graph::propagate(nodes.as_mut_slice());
     graph::tree_shake(&mut nodes, &mut signals);
-    
+    graph::global_value(&mut nodes, &mut signals);
+    graph::tree_shake(&mut nodes, &mut signals);
+
     // Print graph
     for (i, node) in nodes.iter().enumerate() {
         println!("node[{}] = {:?}", i, node);

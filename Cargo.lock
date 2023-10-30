@@ -1006,6 +1006,7 @@ dependencies = [
  "cxx",
  "cxx-build",
  "hex",
+ "rand",
  "ruint",
  "serde_json",
 ]

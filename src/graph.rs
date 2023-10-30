@@ -1,7 +1,10 @@
-use ruint::aliases::U256;
-use crate::field::M;
+use std::collections::HashMap;
 
-#[derive(Debug, Clone, Copy)]
+use crate::field::M;
+use rand::Rng;
+use ruint::aliases::U256;
+
+#[derive(Hash, PartialEq, Eq, Debug, Clone, Copy)]
 pub enum Operation {
     Mul,
     Add,
@@ -119,4 +122,63 @@ pub fn tree_shake(nodes: &mut Vec<Node>, outputs: &mut [usize]) {
     }
 
     eprintln!("Removed {} unused nodes", removed);
+}
+
+/// Global value numbering
+pub fn global_value(nodes: &mut Vec<Node>, outputs: &mut [usize]) {
+    assert_valid(nodes);
+
+    // Evaluate the graph in random field elements.
+    let mut rng = rand::thread_rng();
+    let mut values = Vec::with_capacity(nodes.len());
+    let mut inputs = HashMap::new();
+    let mut prfs = HashMap::new();
+    for node in nodes.iter() {
+        use Operation::*;
+        let value = match node {
+            // Constants evaluate to themselves
+            Node::Constant(c) => *c,
+
+            // Algebraic Ops are evaluated directly
+            // Since the field is large, by Swartz-Zippel if
+            // two values are the same then they are likely algebraically equal.
+            Node::Op(op @ (Add | Sub | Mul), a, b) => op.eval(values[*a], values[*b]),
+
+            // Input and non-algebraic ops are random functions
+            // TODO: https://github.com/recmo/uint/issues/95 and use .gen_range(..M)
+            // TODO: Eq and Neq can become constant iff values[*a] == values[*b]
+            Node::Op(op, a, b) => *prfs
+                .entry((*op, values[*a], values[*b]))
+                .or_insert_with(|| rng.gen::<U256>() % M),
+            Node::Input(i) => *inputs.entry(*i).or_insert_with(|| rng.gen::<U256>() % M),
+        };
+        values.push(value);
+    }
+
+    // Find all nodes with the same value.
+    let mut value_map = HashMap::new();
+    for (i, &value) in values.iter().enumerate() {
+        value_map.entry(value).or_insert_with(Vec::new).push(i);
+    }
+
+    // For nodes that are the same, pick the first index.
+    let mut renumber = Vec::with_capacity(nodes.len());
+    for i in 0..nodes.len() {
+        let value = values[i];
+        let index = value_map[&value][0];
+        renumber.push(index);
+    }
+
+    // Renumber references.
+    for node in nodes.iter_mut() {
+        if let Node::Op(_, a, b) = node {
+            *a = renumber[*a];
+            *b = renumber[*b];
+        }
+    }
+    for output in outputs.iter_mut() {
+        *output = renumber[*output];
+    }
+
+    eprintln!("Global value numbering applied");
 }
