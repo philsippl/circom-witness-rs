@@ -1,12 +1,13 @@
-mod field;
+#![allow(non_snake_case)]
 
-use std::{env, io::Read, str::FromStr, time::Instant};
+mod field;
 
 use byteorder::{LittleEndian, ReadBytesExt};
 use ffi::InputOutputList;
 use field::*;
 use ruint::{aliases::U256, uint};
 use serde_json::Value;
+use std::{env, io::Read, str::FromStr, time::Instant};
 
 #[cxx::bridge]
 mod ffi {
@@ -115,7 +116,8 @@ pub struct HashSignalInfo {
 
 pub fn get_input_hash_map() -> Vec<HashSignalInfo> {
     let mut bytes = &DAT_BYTES[..(ffi::get_size_of_input_hashmap() as usize) * 24];
-    let mut input_hash_map = vec![HashSignalInfo::default(); ffi::get_size_of_input_hashmap() as usize];
+    let mut input_hash_map =
+        vec![HashSignalInfo::default(); ffi::get_size_of_input_hashmap() as usize];
     for i in 0..ffi::get_size_of_input_hashmap() as usize {
         let hash = bytes.read_u64::<LittleEndian>().unwrap();
         let signalid = bytes.read_u64::<LittleEndian>().unwrap();
@@ -137,7 +139,7 @@ pub fn get_constants() -> Vec<FrElement> {
     // skip the first part
     let mut bytes = &DAT_BYTES[(ffi::get_size_of_input_hashmap() as usize) * 24
         + (ffi::get_size_of_witness() as usize) * 8..];
-    let mut constants = vec![FrElement(U256::from(0)); ffi::get_size_of_constants() as usize];
+    let mut constants = vec![field::constant(U256::from(0)); ffi::get_size_of_constants() as usize];
     for i in 0..ffi::get_size_of_constants() as usize {
         let sv = bytes.read_i32::<LittleEndian>().unwrap() as i32;
         let typ = bytes.read_u32::<LittleEndian>().unwrap() as u32;
@@ -146,9 +148,10 @@ pub fn get_constants() -> Vec<FrElement> {
         bytes.read_exact(&mut buf);
 
         if typ & 0x80000000 == 0 {
-            constants[i] = FrElement(U256::from(sv));
+            constants[i] = field::constant(U256::from(sv));
         } else {
-            constants[i] = FrElement(U256::from_le_bytes(buf).mul_redc(uint!(1_U256), M, INV));
+            constants[i] =
+                field::constant(U256::from_le_bytes(buf).mul_redc(uint!(1_U256), M, INV));
         }
     }
 
@@ -208,15 +211,22 @@ fn fnv1a(s: &str) -> u64 {
     hash
 }
 
-fn set_input_signal(input_hashmap: Vec<HashSignalInfo>, signal_values: &mut Vec<FrElement>, h: u64, i: u64, val: FrElement) {
+fn set_input_signal(
+    input_hashmap: Vec<HashSignalInfo>,
+    signal_values: &mut Vec<FrElement>,
+    h: u64,
+    i: u64,
+    val: U256,
+) {
     let pos = input_hashmap.iter().position(|x| x.hash == h).unwrap();
-    let si = input_hashmap[pos].signalid + i;
-    signal_values[si as usize] = val;
+    let si = (input_hashmap[pos].signalid + i) as usize;
+    // signal_values[si as usize] = val;
+    signal_values[si] = field::input(si, val);
 }
 
 fn main() {
-    let mut signal_values = vec![FrElement(uint!(0_U256)); ffi::get_total_signal_no() as usize];
-    signal_values[0] = FrElement(uint!(1_U256));
+    let mut signal_values = vec![field::undefined(); ffi::get_total_signal_no() as usize];
+    signal_values[0] = field::constant(uint!(1_U256));
 
     let data = r#"
     {
@@ -264,6 +274,7 @@ fn main() {
 
     let input_map = get_input_hash_map();
 
+    // Set input values from JSON
     let v: Value = serde_json::from_str(data).unwrap();
     if let Value::Object(map) = v {
         for (key, value) in map {
@@ -271,14 +282,14 @@ fn main() {
             if value.is_array() {
                 for (idx, item) in value.as_array().unwrap().iter().enumerate() {
                     let x = U256::from_str(item.as_str().unwrap()).unwrap();
-                    set_input_signal(input_map.clone(), &mut signal_values, h, idx as u64, FrElement(x));
+                    set_input_signal(input_map.clone(), &mut signal_values, h, idx as u64, x);
                 }
             } else {
                 let x = U256::from_str(value.as_str().unwrap()).unwrap();
-                set_input_signal(input_map.clone(), &mut signal_values, h, 0, FrElement(x));
+                set_input_signal(input_map.clone(), &mut signal_values, h, 0, x);
             }
         }
-    } 
+    }
 
     // for i in 0..signal_values.len() {
     //     println!(
@@ -306,11 +317,10 @@ fn main() {
     }
     println!("calculation took: {:?}", now.elapsed());
 
+
+    field::print_eval();
+
     for i in 0..ctx.signalValues.len() {
-        println!(
-            "signalValues[{}]: {:?}",
-            i,
-            ctx.signalValues[i].0
-        );
+        println!("signalValues[{}]: {:?}", i, ctx.signalValues[i].0);
     }
 }
