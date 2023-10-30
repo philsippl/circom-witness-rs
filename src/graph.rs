@@ -59,15 +59,25 @@ pub fn propagate(nodes: &mut [Node]) {
     let mut constants = 0_usize;
     for i in 0..nodes.len() {
         if let Node::Op(op, a, b) = nodes[i] {
-            let (a, b) = (a as usize, b as usize);
             if let (Node::Constant(va), Node::Constant(vb)) = (nodes[a], nodes[b]) {
                 nodes[i] = Node::Constant(op.eval(va, vb));
                 constants += 1;
+            } else if a == b {
+                // Not constant but equal
+                use Operation::*;
+                if let Some(c) = match op {
+                    Eq | Leq | Geq => Some(true),
+                    Neq | Lt | Gt => Some(false),
+                    _ => None,
+                } {
+                    nodes[i] = Node::Constant(U256::from(c));
+                    constants += 1;
+                }
             }
         }
     }
 
-    eprintln!("Propagated {} constants", constants);
+    eprintln!("Propagated {constants} constants");
 }
 
 /// Remove unused nodes
@@ -121,7 +131,7 @@ pub fn tree_shake(nodes: &mut Vec<Node>, outputs: &mut [usize]) {
         *output = renumber[*output].unwrap();
     }
 
-    eprintln!("Removed {} unused nodes", removed);
+    eprintln!("Removed {removed} unused nodes");
 }
 
 /// Global value numbering
@@ -146,11 +156,10 @@ pub fn global_value(nodes: &mut Vec<Node>, outputs: &mut [usize]) {
 
             // Input and non-algebraic ops are random functions
             // TODO: https://github.com/recmo/uint/issues/95 and use .gen_range(..M)
-            // TODO: Eq and Neq can become constant iff values[*a] == values[*b]
+            Node::Input(i) => *inputs.entry(*i).or_insert_with(|| rng.gen::<U256>() % M),
             Node::Op(op, a, b) => *prfs
                 .entry((*op, values[*a], values[*b]))
                 .or_insert_with(|| rng.gen::<U256>() % M),
-            Node::Input(i) => *inputs.entry(*i).or_insert_with(|| rng.gen::<U256>() % M),
         };
         values.push(value);
     }
@@ -163,10 +172,8 @@ pub fn global_value(nodes: &mut Vec<Node>, outputs: &mut [usize]) {
 
     // For nodes that are the same, pick the first index.
     let mut renumber = Vec::with_capacity(nodes.len());
-    for i in 0..nodes.len() {
-        let value = values[i];
-        let index = value_map[&value][0];
-        renumber.push(index);
+    for value in values {
+        renumber.push(value_map[&value][0]);
     }
 
     // Renumber references.

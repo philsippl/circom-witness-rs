@@ -8,7 +8,7 @@ use ffi::InputOutputList;
 use field::*;
 use ruint::{aliases::U256, uint};
 use serde_json::Value;
-use std::{env, io::Read, str::FromStr, time::Instant};
+use std::{io::Read, str::FromStr, time::Instant};
 
 #[cxx::bridge]
 mod ffi {

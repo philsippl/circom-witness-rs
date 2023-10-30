@@ -28,7 +28,7 @@ pub fn print_eval() {
             constants += 1;
             println!(" = {}", values[i]);
         } else {
-            println!("");
+            println!();
         }
     }
     eprintln!(
@@ -151,9 +151,9 @@ pub fn generate_position_array(
 }
 
 pub unsafe fn Fr_toInt(a: *const FrElement) -> u64 {
-    let mut nodes = NODES.lock().unwrap();
-    let mut values = VALUES.lock().unwrap();
-    let mut constant = CONSTANT.lock().unwrap();
+    let nodes = NODES.lock().unwrap();
+    let values = VALUES.lock().unwrap();
+    let constant = CONSTANT.lock().unwrap();
     assert_eq!(nodes.len(), values.len());
     assert_eq!(nodes.len(), constant.len());
 
@@ -168,9 +168,9 @@ pub unsafe fn print(a: *const FrElement) {
 }
 
 pub fn Fr_isTrue(a: *mut FrElement) -> bool {
-    let mut nodes = NODES.lock().unwrap();
-    let mut values = VALUES.lock().unwrap();
-    let mut constant = CONSTANT.lock().unwrap();
+    let nodes = NODES.lock().unwrap();
+    let values = VALUES.lock().unwrap();
+    let constant = CONSTANT.lock().unwrap();
     assert_eq!(nodes.len(), values.len());
     assert_eq!(nodes.len(), constant.len());
 
