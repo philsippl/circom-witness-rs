@@ -1,6 +1,7 @@
-use std::ptr;
+use std::{ptr, ops::Mul};
 
-use ruint::{aliases::U256, uint};
+use cached::proc_macro::cached;
+use ruint::{aliases::U256, aliases::U64, uint};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FrElement(pub U256);
@@ -14,7 +15,7 @@ pub const R: U256 = uint!(0x0e0a77c19a07df2f666ea36f7879462e36fc76959f60cd29ac96
 
 #[allow(warnings)]
 pub unsafe fn Fr_mul(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
-    (*to).0 = (*a).0.mul_mod((*b).0, M);
+    (*to).0 = (*a).0.mul_redc((*b).0, M, INV);
 }
 
 #[allow(warnings)]
@@ -69,7 +70,7 @@ pub fn generate_position_array(
 }
 
 pub unsafe fn Fr_toInt(a: *const FrElement) -> u64 {
-    (*a).0.as_limbs()[0]
+    to_normal((*a).0).as_limbs()[0]
 }
 
 pub unsafe fn print(a: *const FrElement) {
@@ -90,25 +91,25 @@ pub unsafe fn Fr_neq(to: *mut FrElement, a: *const FrElement, b: *const FrElemen
 
 pub unsafe fn Fr_lt(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
     (*to).0 = U256::from(
-        ((*a).0 < (*b).0) as i32,
+        (to_normal((*a).0) < to_normal((*b).0)) as i32,
     );
 }
 
 pub unsafe fn Fr_gt(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
     (*to).0 = U256::from(
-        ((*a).0 > (*b).0) as i32,
+        (to_normal((*a).0) > to_normal((*b).0)) as i32,
     );
 }
 
 pub unsafe fn Fr_leq(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
     (*to).0 = U256::from(
-        ((*a).0 <= (*b).0) as i32,
+        (to_normal((*a).0) <= to_normal((*b).0)) as i32,
     );
 }
 
 pub unsafe fn Fr_geq(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
     (*to).0 = U256::from(
-        ((*a).0 >= (*b).0) as i32,
+        (to_normal((*a).0) >= to_normal((*b).0)) as i32,
     );
 }
 
@@ -116,4 +117,9 @@ pub unsafe fn Fr_lor(to: *mut FrElement, a: *const FrElement, b: *const FrElemen
     (*to).0 = U256::from(
         (Fr_isTrue(&mut FrElement((*a).0 + (*b).0))) as i32,
     );
+}
+
+#[cached]
+fn to_normal(a: U256) -> U256 {
+    a.mul_redc(uint!(1_U256), M, INV)
 }

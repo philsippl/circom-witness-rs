@@ -146,9 +146,9 @@ pub fn get_constants() -> Vec<FrElement> {
         bytes.read_exact(&mut buf);
 
         if typ & 0x80000000 == 0 {
-            constants[i] = FrElement(U256::from(sv));
+            constants[i] = FrElement(U256::from(sv).mul_mod(R, M));
         } else {
-            constants[i] = FrElement(U256::from_le_bytes(buf).mul_redc(uint!(1_U256), M, INV));
+            constants[i] = FrElement(U256::from_le_bytes(buf));
         }
     }
 
@@ -216,7 +216,7 @@ fn set_input_signal(input_hashmap: Vec<HashSignalInfo>, signal_values: &mut Vec<
 
 fn main() {
     let mut signal_values = vec![FrElement(uint!(0_U256)); ffi::get_total_signal_no() as usize];
-    signal_values[0] = FrElement(uint!(1_U256));
+    signal_values[0] = FrElement(uint!(1_U256).mul_mod(R, M));
 
     let data = r#"
     {
@@ -271,11 +271,11 @@ fn main() {
             if value.is_array() {
                 for (idx, item) in value.as_array().unwrap().iter().enumerate() {
                     let x = U256::from_str(item.as_str().unwrap()).unwrap();
-                    set_input_signal(input_map.clone(), &mut signal_values, h, idx as u64, FrElement(x));
+                    set_input_signal(input_map.clone(), &mut signal_values, h, idx as u64, FrElement(x.mul_mod(R, M)));
                 }
             } else {
                 let x = U256::from_str(value.as_str().unwrap()).unwrap();
-                set_input_signal(input_map.clone(), &mut signal_values, h, 0, FrElement(x));
+                set_input_signal(input_map.clone(), &mut signal_values, h, 0, FrElement(x.mul_mod(R, M)));
             }
         }
     } 
@@ -310,7 +310,7 @@ fn main() {
         println!(
             "signalValues[{}]: {:?}",
             i,
-            ctx.signalValues[i].0
+            ctx.signalValues[i].0.mul_redc(uint!(1_U256), M, INV)
         );
     }
 }
