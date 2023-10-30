@@ -1,5 +1,5 @@
-#include "witness/include/blobstore.h"
-#include "witness/src/main.rs.h"
+#include "witness/include/witness.h"
+#include "witness/src/lib.rs.h"
 
 /// We need this accessor since cxx doesn't support hashmaps yet
 class IOSignalInfoAccessor {
@@ -630,7 +630,6 @@ uint get_size_of_io_map() {return 133;}
 void release_memory_component(Circom_CalcWit* ctx, uint pos) {{
 
 if (pos != 0){{
-
 
 }}
 
@@ -183970,4 +183969,3 @@ void run(Circom_CalcWit* ctx){
 Semaphore_145_create(1,0,ctx,"main",0);
 Semaphore_145_run(0,ctx);
 }
-
