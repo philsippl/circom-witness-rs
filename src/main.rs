@@ -329,6 +329,14 @@ fn main() {
     graph::global_value(&mut nodes, &mut signals);
     graph::tree_shake(&mut nodes, &mut signals);
 
+    // Evaluate the graph.
+    let inputs = vec![U256::from(0); 50]; // TODO: Set inputs.
+    let now = Instant::now();
+    for _ in 0..1000 {
+        let witness = graph::evaluate(&nodes, &inputs, &signals);
+    }
+    eprintln!("Calculation took: {:?}", now.elapsed() / 1000);
+
     // Print graph
     for (i, node) in nodes.iter().enumerate() {
         println!("node[{}] = {:?}", i, node);
