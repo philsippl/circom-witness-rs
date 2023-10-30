@@ -3,7 +3,7 @@ fn main() {
         .file("src/blobstore.cc")
         .flag_if_supported("-std=c++14")
         .flag_if_supported("-w")
-        .flag_if_supported("-Oz")
+        .flag_if_supported("-O3")
         .compile("witness");
 
     println!("cargo:rerun-if-changed=src/main.rs");
