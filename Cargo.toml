@@ -7,10 +7,11 @@ edition = "2021"
 
 [dependencies]
 cxx = "1.0"
-ruint = "1.10.0"
+ruint = { version = "1.10.0", features = ["rand"] }
 byteorder = "1.4.3"
 hex = "0.4.3"
 serde_json = "1.0.64"
+rand = "0.8.5"
 
 [build-dependencies]
 cxx-build = "1.0"

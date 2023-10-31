@@ -48,6 +48,7 @@ sed -e 's/FrElement\* signalValues/rust::Vec<FrElement> \&signalValues/g' \
     -e '/trace/d' \
     -e 's/\(ctx,\)\(lvarcall,\)\(myId,\)/\1\&\2\3/g' \
     -e '/^#include/d' \
+    -e '/assert/d' \
     -e '/mySubcomponentsParallel/d' \
     -e 's/FrElement lvarcall\[\([0-9]*\)\];/rust::Vec<FrElement> lvarcall = create_vec(\1);/g' \
     -e 's/,FrElement\* lvar,/,rust::Vec<FrElement>\& lvar,/g' \
