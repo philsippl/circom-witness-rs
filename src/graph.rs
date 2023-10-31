@@ -1,13 +1,15 @@
 use std::collections::HashMap;
 
-use crate::field::M;
+use crate::field::{R, M, INV};
 use rand::Rng;
-use ruint::aliases::U256;
+use ruint::{uint, aliases::U256};
 use serde::{Deserialize, Serialize};
+
 
 #[derive(Hash, PartialEq, Eq, Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum Operation {
     Mul,
+    MMul,
     Add,
     Sub,
     Eq,
@@ -33,7 +35,7 @@ impl Operation {
             Add => a.add_mod(b, M),
             Sub => a.add_mod(M - b, M),
             Mul => a.mul_mod(b, M),
-            // TODO: Mul => a.mul_redc(b, M, INV),
+            MMul => a.mul_redc(b, M, INV),
             Eq => U256::from(a == b),
             Neq => U256::from(a != b),
             Lt => U256::from(a < b),
@@ -61,6 +63,7 @@ pub fn optimize(nodes: &mut Vec<Node>, outputs: &mut [usize]) {
     value_numbering(nodes, outputs);
     constants(nodes);
     tree_shake(nodes, outputs);
+    montgomery_form(nodes);
 }
 
 pub fn evaluate(nodes: &[Node], inputs: &[U256], outputs: &[usize]) -> Vec<U256> {
@@ -71,14 +74,16 @@ pub fn evaluate(nodes: &[Node], inputs: &[U256], outputs: &[usize]) -> Vec<U256>
     for (i, &node) in nodes.iter().enumerate() {
         let value = match node {
             Node::Constant(c) => c,
-            Node::Input(i) => inputs[i],
+            Node::Input(i) => inputs[i].mul_mod(R, M),
             Node::Op(op, a, b) => op.eval(values[a], values[b]),
         };
         values.push(value);
     }
 
     // Return the outputs.
-    outputs.iter().map(|i| values[*i]).collect()
+    let mut out = outputs.iter().map(|i| values[*i]).collect::<Vec<_>>();
+    from_montgomery(out.as_mut_slice());
+    out
 }
 
 /// Constant propagation
@@ -244,4 +249,33 @@ pub fn constants(nodes: &mut Vec<Node>) {
         }
     }
     eprintln!("Found {} constants", constants);
+}
+
+/// Convert to Montgomery form
+pub fn montgomery_form(nodes: &mut [Node]) {
+    for node in nodes.iter_mut() {
+        use Node::*;
+        use Operation::*;
+        match node {
+            Constant(c) => *c = c.mul_mod(R, M),
+            Input(..) => (),
+            Op(Add | Sub, ..) => (),
+            Op(op @ Mul, ..) => *op = MMul,
+            Op(..) => unimplemented!("Operators Montgomery form"),
+        }
+    }
+    eprintln!("Converted to Montgomery form");
+}
+
+pub fn to_montgomery(values: &mut [U256]) {
+    for value in values.iter_mut() {
+        *value = value.mul_mod(R, M);
+    }
+}
+
+pub fn from_montgomery(values: &mut [U256]) {
+    const ONE: U256 = uint!(1_U256);
+    for value in values.iter_mut() {
+        *value = value.mul_redc(ONE, M, INV);
+    }
 }
