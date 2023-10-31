@@ -19,4 +19,6 @@ postcard = { version = "1.0.8", features = ["use-std"], default-features = false
 cxx-build = "1.0"
 
 [profile.release]
-opt-level = "z" 
+opt-level = 3
+lto = "fat"
+codegen-units = 1
