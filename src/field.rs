@@ -43,6 +43,10 @@ pub fn get_graph() -> Vec<Node> {
     NODES.lock().unwrap().clone()
 }
 
+pub fn get_values() -> Vec<U256> {
+    VALUES.lock().unwrap().clone()
+}
+
 pub fn undefined() -> FrElement {
     FrElement(usize::MAX)
 }

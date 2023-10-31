@@ -10,6 +10,8 @@ use ruint::{aliases::U256, uint};
 use serde_json::Value;
 use std::{io::Read, str::FromStr, time::Instant};
 
+use crate::graph::Node;
+
 #[cxx::bridge]
 mod ffi {
 
@@ -330,7 +332,21 @@ fn main() {
     graph::tree_shake(&mut nodes, &mut signals);
 
     // Evaluate the graph.
-    let inputs = vec![U256::from(0); 50]; // TODO: Set inputs.
+    let input_len = (ffi::get_main_input_signal_no() + ffi::get_main_input_signal_start()) as usize; // TODO: fetch from file
+    let mut inputs = vec![U256::from(0); input_len];
+    inputs[0] = U256::from(1);
+    for i in 1..nodes.len() {
+        if let Node::Input(j) = nodes[i] {
+            inputs[j] = get_values()[i];
+        } else {
+            break;
+        }
+    }
+
+    // DEBUG: assert correct output for semaphore circuit
+    let witness = graph::evaluate(&nodes, &inputs, &signals);
+    assert_eq!(witness[1], uint!(0x03eff1a8c0909996245c410247000b5e69e7307c1990cb84b8b1937c16be58c8_U256));
+
     let now = Instant::now();
     for _ in 0..1000 {
         let witness = graph::evaluate(&nodes, &inputs, &signals);
@@ -338,10 +354,10 @@ fn main() {
     eprintln!("Calculation took: {:?}", now.elapsed() / 1000);
 
     // Print graph
-    for (i, node) in nodes.iter().enumerate() {
-        println!("node[{}] = {:?}", i, node);
-    }
-    for (i, j) in signals.iter().enumerate() {
-        println!("signal[{}] = node[{}]", i, j);
-    }
+    // for (i, node) in nodes.iter().enumerate() {
+    //     println!("node[{}] = {:?}", i, node);
+    // }
+    // for (i, j) in signals.iter().enumerate() {
+    //     println!("signal[{}] = node[{}]", i, j);
+    // }
 }
