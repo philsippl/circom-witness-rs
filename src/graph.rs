@@ -3,8 +3,9 @@ use std::collections::HashMap;
 use crate::field::M;
 use rand::Rng;
 use ruint::aliases::U256;
+use serde::{Deserialize, Serialize};
 
-#[derive(Hash, PartialEq, Eq, Debug, Clone, Copy)]
+#[derive(Hash, PartialEq, Eq, Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum Operation {
     Mul,
     Add,
@@ -18,7 +19,7 @@ pub enum Operation {
     Lor,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Node {
     Input(usize),
     Constant(U256),
@@ -54,6 +55,14 @@ fn assert_valid(nodes: &[Node]) {
     }
 }
 
+pub fn optimize(nodes: &mut Vec<Node>, outputs: &mut [usize]) {
+    tree_shake(nodes, outputs);
+    propagate(nodes);
+    value_numbering(nodes, outputs);
+    constants(nodes);
+    tree_shake(nodes, outputs);
+}
+
 pub fn evaluate(nodes: &[Node], inputs: &[U256], outputs: &[usize]) -> Vec<U256> {
     // assert_valid(nodes);
 
@@ -70,7 +79,7 @@ pub fn evaluate(nodes: &[Node], inputs: &[U256], outputs: &[usize]) -> Vec<U256>
 
     // Return the outputs.
     outputs.iter().map(|i| values[*i]).collect()
-} 
+}
 
 /// Constant propagation
 pub fn propagate(nodes: &mut [Node]) {
@@ -153,11 +162,8 @@ pub fn tree_shake(nodes: &mut Vec<Node>, outputs: &mut [usize]) {
     eprintln!("Removed {removed} unused nodes");
 }
 
-/// Global value numbering
-pub fn global_value(nodes: &mut Vec<Node>, outputs: &mut [usize]) {
-    assert_valid(nodes);
-
-    // Evaluate the graph in random field elements.
+/// Randomly evaluate the graph
+fn random_eval(nodes: &mut Vec<Node>) -> Vec<U256> {
     let mut rng = rand::thread_rng();
     let mut values = Vec::with_capacity(nodes.len());
     let mut inputs = HashMap::new();
@@ -182,6 +188,15 @@ pub fn global_value(nodes: &mut Vec<Node>, outputs: &mut [usize]) {
         };
         values.push(value);
     }
+    values
+}
+
+/// Value numbering
+pub fn value_numbering(nodes: &mut Vec<Node>, outputs: &mut [usize]) {
+    assert_valid(nodes);
+
+    // Evaluate the graph in random field elements.
+    let values = random_eval(nodes);
 
     // Find all nodes with the same value.
     let mut value_map = HashMap::new();
@@ -207,4 +222,26 @@ pub fn global_value(nodes: &mut Vec<Node>, outputs: &mut [usize]) {
     }
 
     eprintln!("Global value numbering applied");
+}
+
+/// Probabilistic constant determination
+pub fn constants(nodes: &mut Vec<Node>) {
+    assert_valid(nodes);
+
+    // Evaluate the graph in random field elements.
+    let values_a = random_eval(nodes);
+    let values_b = random_eval(nodes);
+
+    // Find all nodes with the same value.
+    let mut constants = 0;
+    for i in 0..nodes.len() {
+        if let Node::Constant(_) = nodes[i] {
+            continue;
+        }
+        if values_a[i] == values_b[i] {
+            nodes[i] = Node::Constant(values_a[i]);
+            constants += 1;
+        }
+    }
+    eprintln!("Found {} constants", constants);
 }
