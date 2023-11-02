@@ -326,10 +326,12 @@ fn main() {
     eprintln!("Graph with {} nodes", nodes.len());
 
     // Optimize graph
-    graph::propagate(nodes.as_mut_slice());
-    graph::tree_shake(&mut nodes, &mut signals);
-    graph::global_value(&mut nodes, &mut signals);
-    graph::tree_shake(&mut nodes, &mut signals);
+    graph::optimize(&mut nodes, &mut signals);
+
+    // Store graph to file.
+    let bytes = postcard::to_stdvec(&(&nodes, &signals)).unwrap();
+    eprintln!("Graph size: {} bytes", bytes.len());
+    std::fs::write("graph.bin", bytes).unwrap();
 
     // Evaluate the graph.
     let input_len = (ffi::get_main_input_signal_no() + ffi::get_main_input_signal_start()) as usize; // TODO: fetch from file
