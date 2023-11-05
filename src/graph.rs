@@ -1,10 +1,25 @@
 use std::collections::HashMap;
 
-use crate::field::{R, M, INV};
+use crate::field::M;
 use rand::Rng;
-use ruint::{uint, aliases::U256};
+use ruint::aliases::U256;
 use serde::{Deserialize, Serialize};
+use ark_bn254::Fr;
+use ark_ff::PrimeField;
 
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress, Validate};
+
+fn ark_se<S, A: CanonicalSerialize>(a: &A, s: S) -> Result<S::Ok, S::Error> where S: serde::Serializer {
+      let mut bytes = vec![];
+      a.serialize_with_mode(&mut bytes, Compress::Yes).map_err(serde::ser::Error::custom)?;
+      s.serialize_bytes(&bytes)
+}
+
+fn ark_de<'de, D, A: CanonicalDeserialize>(data: D) -> Result<A, D::Error> where D: serde::de::Deserializer<'de> {
+      let s: Vec<u8> = serde::de::Deserialize::deserialize(data)?;
+      let a = A::deserialize_with_mode(s.as_slice(), Compress::Yes, Validate::Yes);
+      a.map_err(serde::de::Error::custom)
+}
 
 #[derive(Hash, PartialEq, Eq, Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum Operation {
@@ -25,6 +40,8 @@ pub enum Operation {
 pub enum Node {
     Input(usize),
     Constant(U256),
+    #[serde(serialize_with = "ark_se", deserialize_with = "ark_de")]
+    MontConstant(Fr),
     Op(Operation, usize, usize),
 }
 
@@ -35,7 +52,6 @@ impl Operation {
             Add => a.add_mod(b, M),
             Sub => a.add_mod(M - b, M),
             Mul => a.mul_mod(b, M),
-            MMul => a.mul_redc(b, M, INV),
             Eq => U256::from(a == b),
             Neq => U256::from(a != b),
             Lt => U256::from(a < b),
@@ -43,8 +59,20 @@ impl Operation {
             Leq => U256::from(a <= b),
             Geq => U256::from(a >= b),
             Lor => U256::from(a != U256::ZERO || b != U256::ZERO),
+            _ => unimplemented!("operator {:?} not implemented", self),
         }
     }
+
+    pub fn evalMontgomery(&self, a: Fr, b: Fr) -> Fr {
+        use Operation::*;
+        match self {
+            Add => a + b,
+            Sub => a - b,
+            Mul => a * b,
+            _ => unimplemented!("operator {:?} not implemented for Montgomery", self),
+        }
+    }
+
 }
 
 /// All references must be backwards.
@@ -71,18 +99,22 @@ pub fn evaluate(nodes: &[Node], inputs: &[U256], outputs: &[usize]) -> Vec<U256>
 
     // Evaluate the graph.
     let mut values = Vec::with_capacity(nodes.len());
-    for (i, &node) in nodes.iter().enumerate() {
+    for (_, &node) in nodes.iter().enumerate() {
         let value = match node {
-            Node::Constant(c) => c,
-            Node::Input(i) => inputs[i].mul_mod(R, M),
-            Node::Op(op, a, b) => op.eval(values[a], values[b]),
+            Node::Constant(c) => Fr::new(c.into()),
+            Node::MontConstant(c) => c,
+            Node::Input(i) => Fr::new(inputs[i].into()),
+            Node::Op(op, a, b) => op.evalMontgomery(values[a], values[b]),
         };
         values.push(value);
     }
 
-    // Return the outputs.
-    let mut out = outputs.iter().map(|i| values[*i]).collect::<Vec<_>>();
-    from_montgomery(out.as_mut_slice());
+    // Convert from Montgomery form and return the outputs.
+    let mut out = vec![U256::ZERO; outputs.len()];
+    for i in 0..outputs.len() {
+        out[i] = U256::try_from(values[outputs[i]].into_bigint()).unwrap();
+    }
+
     out
 }
 
@@ -179,6 +211,8 @@ fn random_eval(nodes: &mut Vec<Node>) -> Vec<U256> {
             // Constants evaluate to themselves
             Node::Constant(c) => *c,
 
+            Node::MontConstant(c) => unimplemented!("should not be used"),
+
             // Algebraic Ops are evaluated directly
             // Since the field is large, by Swartz-Zippel if
             // two values are the same then they are likely algebraically equal.
@@ -257,25 +291,12 @@ pub fn montgomery_form(nodes: &mut [Node]) {
         use Node::*;
         use Operation::*;
         match node {
-            Constant(c) => *c = c.mul_mod(R, M),
+            Constant(c) => *node = MontConstant(Fr::new((*c).into())),
+            MontConstant(..) => (),
             Input(..) => (),
-            Op(Add | Sub, ..) => (),
-            Op(op @ Mul, ..) => *op = MMul,
+            Op(Add | Sub | Mul, ..) => (),
             Op(..) => unimplemented!("Operators Montgomery form"),
         }
     }
     eprintln!("Converted to Montgomery form");
-}
-
-pub fn to_montgomery(values: &mut [U256]) {
-    for value in values.iter_mut() {
-        *value = value.mul_mod(R, M);
-    }
-}
-
-pub fn from_montgomery(values: &mut [U256]) {
-    const ONE: U256 = uint!(1_U256);
-    for value in values.iter_mut() {
-        *value = value.mul_redc(ONE, M, INV);
-    }
 }

@@ -9,6 +9,7 @@ use field::*;
 use ruint::{aliases::U256, uint};
 use serde_json::Value;
 use std::{io::Read, str::FromStr, time::Instant};
+use ark_ff::PrimeField;
 
 use crate::graph::Node;
 
@@ -319,7 +320,6 @@ fn main() {
         ffi::run(&mut ctx as *mut _);
     }
     eprintln!("Calculation took: {:?}", now.elapsed());
-    // field::print_eval();
 
     let mut signals = ctx.signalValues.iter().map(|x| x.0).collect::<Vec<_>>();
     let mut nodes = field::get_graph();

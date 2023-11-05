@@ -631,7 +631,6 @@ void release_memory_component(Circom_CalcWit* ctx, uint pos) {{
 
 if (pos != 0){{
 
-
 }}
 
 
@@ -1574,7 +1573,6 @@ Fr_copy(aux_dest,&circuitConstants[80]);
 Fr_copyn(destination,&lvar[1],destination_size);
 return;
 }else{
-assert(Fr_isTrue(&circuitConstants[81]));
 {
 FrElement *aux_dest = &lvar[1];
 // load src
@@ -4323,7 +4321,6 @@ Fr_copy(aux_dest,&circuitConstants[86]);
 Fr_copyn(destination,&lvar[1],destination_size);
 return;
 }else{
-assert(Fr_isTrue(&circuitConstants[81]));
 {
 FrElement *aux_dest = &lvar[1];
 // load src
@@ -4462,7 +4459,6 @@ Fr_copyn(aux_dest,&lvar[7],3);
 Fr_copyn(destination,&lvar[10],destination_size);
 return;
 }else{
-assert(Fr_isTrue(&circuitConstants[81]));
 {
 FrElement *aux_dest = &lvar[1];
 // load src
@@ -4607,7 +4603,6 @@ Fr_copyn(aux_dest,&lvar[7],3);
 Fr_copyn(destination,&lvar[10],destination_size);
 return;
 }else{
-assert(Fr_isTrue(&circuitConstants[81]));
 {
 FrElement *aux_dest = &lvar[1];
 // load src
@@ -114936,7 +114931,6 @@ Fr_copy(aux_dest,&signalValues[mySignalStart + 1]);
 }
 // no need to run sub component
 ctx->componentMemory[mySubcomponents[cmp_index_ref]].inputCounter -= 1;
-assert(ctx->componentMemory[mySubcomponents[cmp_index_ref]].inputCounter > 0);
 }
 {
 uint cmp_index_ref = 0;
@@ -114948,7 +114942,6 @@ Fr_copy(aux_dest,&signalValues[mySignalStart + 2]);
 }
 // need to run sub component
 ctx->componentMemory[mySubcomponents[cmp_index_ref]].inputCounter -= 1;
-assert(!(ctx->componentMemory[mySubcomponents[cmp_index_ref]].inputCounter));
 Poseidon_70_run(mySubcomponents[cmp_index_ref],ctx);
 }
 {
@@ -183388,7 +183381,6 @@ Fr_copy(aux_dest,&signalValues[mySignalStart + 1]);
 }
 // need to run sub component
 ctx->componentMemory[mySubcomponents[cmp_index_ref]].inputCounter -= 1;
-assert(!(ctx->componentMemory[mySubcomponents[cmp_index_ref]].inputCounter));
 Poseidon_140_run(mySubcomponents[cmp_index_ref],ctx);
 }
 {
@@ -183449,7 +183441,6 @@ Fr_copy(aux_dest,&signalValues[mySignalStart + 1]);
 }
 // no need to run sub component
 ctx->componentMemory[mySubcomponents[cmp_index_ref]].inputCounter -= 1;
-assert(ctx->componentMemory[mySubcomponents[cmp_index_ref]].inputCounter > 0);
 }
 {
 uint cmp_index_ref = 0;
@@ -183461,7 +183452,6 @@ Fr_copy(aux_dest,&signalValues[mySignalStart + 2]);
 }
 // need to run sub component
 ctx->componentMemory[mySubcomponents[cmp_index_ref]].inputCounter -= 1;
-assert(!(ctx->componentMemory[mySubcomponents[cmp_index_ref]].inputCounter));
 Poseidon_70_run(mySubcomponents[cmp_index_ref],ctx);
 }
 {
@@ -183611,7 +183601,6 @@ while(Fr_isTrue(&expaux[0])){
 Fr_sub(&expaux[3],&circuitConstants[83],&signalValues[mySignalStart + ((1 * Fr_toInt(&lvar[1])) + 2)]); // line circom 20
 Fr_mul(&expaux[1],&signalValues[mySignalStart + ((1 * Fr_toInt(&lvar[1])) + 2)],&expaux[3]); // line circom 20
 Fr_eq(&expaux[0],&expaux[1],&circuitConstants[81]); // line circom 20
-assert(Fr_isTrue(&expaux[0]));
 {
 uint cmp_index_ref = ((1 * Fr_toInt(&lvar[1])) + 16);
 {
@@ -183825,7 +183814,6 @@ Fr_copy(aux_dest,&signalValues[mySignalStart + 4]);
 }
 // no need to run sub component
 ctx->componentMemory[mySubcomponents[cmp_index_ref]].inputCounter -= 1;
-assert(ctx->componentMemory[mySubcomponents[cmp_index_ref]].inputCounter > 0);
 }
 {
 uint cmp_index_ref = 0;
@@ -183837,7 +183825,6 @@ Fr_copy(aux_dest,&signalValues[mySignalStart + 5]);
 }
 // need to run sub component
 ctx->componentMemory[mySubcomponents[cmp_index_ref]].inputCounter -= 1;
-assert(!(ctx->componentMemory[mySubcomponents[cmp_index_ref]].inputCounter));
 CalculateSecret_71_run(mySubcomponents[cmp_index_ref],ctx);
 }
 {
@@ -183856,7 +183843,6 @@ Fr_copy(aux_dest,&signalValues[mySignalStart + 38]);
 }
 // need to run sub component
 ctx->componentMemory[mySubcomponents[cmp_index_ref]].inputCounter -= 1;
-assert(!(ctx->componentMemory[mySubcomponents[cmp_index_ref]].inputCounter));
 CalculateIdentityCommitment_141_run(mySubcomponents[cmp_index_ref],ctx);
 }
 {
@@ -183869,7 +183855,6 @@ Fr_copy(aux_dest,&signalValues[mySignalStart + 3]);
 }
 // no need to run sub component
 ctx->componentMemory[mySubcomponents[cmp_index_ref]].inputCounter -= 1;
-assert(ctx->componentMemory[mySubcomponents[cmp_index_ref]].inputCounter > 0);
 }
 {
 uint cmp_index_ref = 2;
@@ -183881,7 +183866,6 @@ Fr_copy(aux_dest,&signalValues[mySignalStart + 4]);
 }
 // need to run sub component
 ctx->componentMemory[mySubcomponents[cmp_index_ref]].inputCounter -= 1;
-assert(!(ctx->componentMemory[mySubcomponents[cmp_index_ref]].inputCounter));
 CalculateNullifierHash_142_run(mySubcomponents[cmp_index_ref],ctx);
 }
 {
@@ -183916,7 +183900,6 @@ Fr_copy(aux_dest,&signalValues[mySignalStart + ((1 * Fr_toInt(&lvar[1])) + 22)])
 }
 // no need to run sub component
 ctx->componentMemory[mySubcomponents[cmp_index_ref]].inputCounter -= 1;
-assert(ctx->componentMemory[mySubcomponents[cmp_index_ref]].inputCounter > 0);
 }
 {
 uint cmp_index_ref = 3;
@@ -183970,4 +183953,3 @@ void run(Circom_CalcWit* ctx){
 Semaphore_145_create(1,0,ctx,"main",0);
 Semaphore_145_run(0,ctx);
 }
-

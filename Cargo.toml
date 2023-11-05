@@ -2,18 +2,20 @@
 name = "witness"
 version = "0.1.0"
 edition = "2021"
-
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-cxx = "1.0"
-ruint = { version = "1.10.0", features = ["rand", "serde"] }
+ark-bn254 = { version = "0.4.0", features = ["std"] }
+ark-ff = { version = "0.4.0", features = ["std"] }
+ark-serialize = { version = "0.4", features = ["derive"] }
 byteorder = "1.4.3"
+cxx = "1.0"
 hex = "0.4.3"
-serde_json = "1.0.64"
-rand = "0.8.5"
-serde = { version = "1.0.190", features = ["derive"] }
 postcard = { version = "1.0.8", features = ["use-std"], default-features = false }
+rand = "0.8.5"
+ruint = { version = "1.10.0", features = ["rand", "serde", "ark-ff-04"] }
+serde = { version = "1.0.190", features = ["derive"] }
+serde_json = "1.0.64"
 
 [build-dependencies]
 cxx-build = "1.0"
