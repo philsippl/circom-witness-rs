@@ -1,7 +1,8 @@
 use std::{env, fs, path::Path, process::Command};
 
 fn main() {
-    if let Some(witness_cpp) = env::var_os("WITNESS_CPP") {
+    if cfg!(feature = "build-witness") {
+        let witness_cpp = env::var("WITNESS_CPP").unwrap();
         let circuit_file = Path::new(&witness_cpp);
         let circuit_name = circuit_file.file_stem().unwrap().to_str().unwrap();
 
@@ -26,7 +27,7 @@ fn main() {
             .unwrap();
         assert!(status.success());
 
-        cxx_build::bridge("src/lib.rs")
+        cxx_build::bridge("src/generate.rs")
             .file("src/circuit.cc")
             .flag_if_supported("-std=c++14")
             .flag_if_supported("-w")

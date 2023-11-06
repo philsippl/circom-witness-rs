@@ -26,3 +26,6 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 debug = true
+
+[features]
+build-witness = []
