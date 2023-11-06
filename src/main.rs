@@ -2,8 +2,8 @@ use std::path::Path;
 
 use witness::{build_witness, calculate_witness};
 
-fn main() {
-    build_witness(Path::new(".")).unwrap();
+fn main() -> eyre::Result<> {
+    build_witness()?;
 
     let data = r#"
     {
@@ -49,10 +49,12 @@ fn main() {
         "signalHash": "0x00bc6bb462e38af7da48e0ae7b5cbae860141c04e5af2cf92328cd6548df111f"
     }"#;
 
-    let bytes = std::fs::read("graph.bin").unwrap();
-    let witness = calculate_witness(data, &bytes).unwrap();
+    let bytes = std::fs::read("graph.bin")?;
+    let witness = calculate_witness(data, &bytes)?;
 
     for i in 0..20 {
         println!("{:?}", witness[i]);
     }
+    
+    Ok(())
 }
