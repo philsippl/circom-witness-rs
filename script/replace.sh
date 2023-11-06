@@ -6,10 +6,12 @@ if [ "$#" -ne 1 ]; then
     exit 1
 fi
 
+filename=$(basename "$1" .cpp)
+
 # Add header
-cat <<EOT > "$1.new"
-#include "witness/include/blobstore.h"
-#include "witness/src/main.rs.h"
+cat <<EOT > "$filename.new"
+#include "witness/include/witness.h"
+#include "witness/src/lib.rs.h"
 
 /// We need this accessor since cxx doesn't support hashmaps yet
 class IOSignalInfoAccessor {
@@ -54,15 +56,11 @@ sed -e 's/FrElement\* signalValues/rust::Vec<FrElement> \&signalValues/g' \
     -e 's/,FrElement\* lvar,/,rust::Vec<FrElement>\& lvar,/g' \
     -e 's/ctx,\&lvarcall,myId,/ctx,lvarcall,myId,/g' \
     -e '/delete/{N;d;}' -e 'N;/\ndelete/!P;D' \
-    -e '/^#include/d' "$1" >> "$1.new"
+    -e '/^#include/d' "$1" >> "$filename.new"
     
 
 sed -E -e 's/"([^"]+)"\+ctx->generate_position_array\(([^)]+)\)/generate_position_array("\1", \2)/g' \
     -e 's/subcomponents = new uint\[([0-9]+)\]\{0\};/subcomponents = create_vec_u32(\1);/g' \
-    -e 's/^uint aux_dimensions\[([0-9]+)\] = \{([^}]+)\};$/rust::Vec<uint> aux_dimensions = rust::Vec<uint32_t>{\2};/' "$1.new" > "$1.new2"
+    -e 's/^uint aux_dimensions\[([0-9]+)\] = \{([^}]+)\};$/rust::Vec<uint> aux_dimensions = rust::Vec<uint32_t>{\2};/' "$filename.new" > "src/circuit.cc"
 
-# sed -n '1N;$!N;/\n.*delete/!P;D' "$1.new2" > "$1.new3"
-
-rm "$1.new"
-# rm "$1.new2"
-# mv "$1.new3" "$1.new2"
+cp "$(echo $filename)_cpp/$filename.dat" src/constants.dat
