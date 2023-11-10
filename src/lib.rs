@@ -1,6 +1,7 @@
 mod field;
 mod graph;
 
+#[cfg(feature = "build-witness")]
 pub mod generate;
 
 use std::collections::HashMap;
