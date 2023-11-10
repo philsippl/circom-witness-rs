@@ -1,5 +1,3 @@
-#![allow(non_snake_case)]
-
 mod field;
 mod graph;
 
@@ -8,7 +6,7 @@ pub mod generate;
 use std::collections::HashMap;
 
 use ruint::aliases::U256;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 use crate::graph::Node;
 
@@ -40,8 +38,7 @@ fn set_input_signal_eval(
     signal_values[si] = val;
 }
 
-
-/// Calculate witness based on serialized graph
+/// Calculate witness based on serialized graph and inputs
 pub fn calculate_witness(
     input_list: HashMap<String, Vec<U256>>,
     graph_bytes: &[u8],

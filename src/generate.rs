@@ -1,8 +1,10 @@
+#![allow(non_snake_case)]
+
+use crate::field::{self, *};
+use crate::graph::{self, Node};
+use crate::HashSignalInfo;
 use byteorder::{LittleEndian, ReadBytesExt};
 use ffi::InputOutputList;
-use crate::HashSignalInfo;
-use crate::field::{*, self};
-use crate::graph::{Node, self};
 use ruint::{aliases::U256, uint};
 use serde::{Deserialize, Serialize};
 use std::{io::Read, time::Instant};
@@ -122,6 +124,17 @@ pub fn get_input_hash_map() -> Vec<HashSignalInfo> {
     input_hash_map
 }
 
+pub fn get_witness_to_signal() -> Vec<usize> {
+    let mut bytes = &DAT_BYTES[(ffi::get_size_of_input_hashmap() as usize) * 24
+        ..(ffi::get_size_of_input_hashmap() as usize) * 24
+            + (ffi::get_size_of_witness() as usize) * 8];
+    let mut signal_list = Vec::with_capacity(ffi::get_size_of_witness() as usize);
+    for i in 0..ffi::get_size_of_witness() as usize {
+        signal_list.push(bytes.read_u64::<LittleEndian>().unwrap() as usize);
+    }
+    signal_list
+}
+
 pub fn get_constants() -> Vec<FrElement> {
     if ffi::get_size_of_constants() == 0 {
         return vec![];
@@ -223,7 +236,8 @@ pub fn build_witness() -> eyre::Result<()> {
     }
     eprintln!("Calculation took: {:?}", now.elapsed());
 
-    let mut signals = ctx.signalValues.iter().map(|x| x.0).collect::<Vec<_>>();
+    let signal_values = get_witness_to_signal();
+    let mut signals = signal_values.into_iter().map(|i| ctx.signalValues[i].0).collect::<Vec<_>>();
     let mut nodes = field::get_graph();
     eprintln!("Graph with {} nodes", nodes.len());
 
