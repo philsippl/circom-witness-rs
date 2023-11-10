@@ -1,17 +1,13 @@
 #![allow(non_snake_case)]
 
-mod field;
-mod graph;
-
+use crate::field::{self, *};
+use crate::graph::{self, Node};
+use crate::HashSignalInfo;
 use byteorder::{LittleEndian, ReadBytesExt};
 use ffi::InputOutputList;
-use field::*;
 use ruint::{aliases::U256, uint};
-use serde_json::Value;
-use std::{io::Read, str::FromStr, time::Instant};
-use ark_ff::PrimeField;
-
-use crate::graph::Node;
+use serde::{Deserialize, Serialize};
+use std::{io::Read, time::Instant};
 
 #[cxx::bridge]
 mod ffi {
@@ -95,7 +91,7 @@ mod ffi {
 
     // C++ types and signatures exposed to Rust.
     unsafe extern "C++" {
-        include!("witness/include/blobstore.h");
+        include!("witness/include/witness.h");
 
         unsafe fn run(ctx: *mut Circom_CalcWit);
         fn get_size_of_io_map() -> u32;
@@ -109,14 +105,7 @@ mod ffi {
     }
 }
 
-const DAT_BYTES: &[u8] = include_bytes!("semaphore.dat");
-
-#[derive(Debug, Default, Clone)]
-pub struct HashSignalInfo {
-    pub hash: u64,
-    pub signalid: u64,
-    pub signalsize: u64,
-}
+const DAT_BYTES: &[u8] = include_bytes!("constants.dat");
 
 pub fn get_input_hash_map() -> Vec<HashSignalInfo> {
     let mut bytes = &DAT_BYTES[..(ffi::get_size_of_input_hashmap() as usize) * 24];
@@ -133,6 +122,17 @@ pub fn get_input_hash_map() -> Vec<HashSignalInfo> {
         };
     }
     input_hash_map
+}
+
+pub fn get_witness_to_signal() -> Vec<usize> {
+    let mut bytes = &DAT_BYTES[(ffi::get_size_of_input_hashmap() as usize) * 24
+        ..(ffi::get_size_of_input_hashmap() as usize) * 24
+            + (ffi::get_size_of_witness() as usize) * 8];
+    let mut signal_list = Vec::with_capacity(ffi::get_size_of_witness() as usize);
+    for i in 0..ffi::get_size_of_witness() as usize {
+        signal_list.push(bytes.read_u64::<LittleEndian>().unwrap() as usize);
+    }
+    signal_list
 }
 
 pub fn get_constants() -> Vec<FrElement> {
@@ -206,102 +206,17 @@ pub fn get_iosignals() -> Vec<InputOutputList> {
     map
 }
 
-fn fnv1a(s: &str) -> u64 {
-    let mut hash: u64 = 0xCBF29CE484222325;
-    for c in s.bytes() {
-        hash ^= c as u64;
-        hash = hash.wrapping_mul(0x100000001B3);
-    }
-    hash
-}
-
-fn set_input_signal(
-    input_hashmap: Vec<HashSignalInfo>,
-    signal_values: &mut Vec<FrElement>,
-    h: u64,
-    i: u64,
-    val: U256,
-) {
-    let pos = input_hashmap.iter().position(|x| x.hash == h).unwrap();
-    let si = (input_hashmap[pos].signalid + i) as usize;
-    // signal_values[si as usize] = val;
-    signal_values[si] = field::input(si, val);
-}
-
-fn main() {
+/// Run cpp witness generator and optimize graph
+pub fn build_witness() -> eyre::Result<()> {
     let mut signal_values = vec![field::undefined(); ffi::get_total_signal_no() as usize];
     signal_values[0] = field::constant(uint!(1_U256));
 
-    let data = r#"
-    {
-        "identityNullifier": "0x099ab25e555083e656e9ec66a5368d1edd3314bd2dc77553813c5145d37326a3",
-        "identityTrapdoor": "0x1db60e4cd8008edd85c68d461bf00d04f1620372f45c6ffacdb1a318791c2dd3",
-        "treePathIndices": [
-            "0x0",
-            "0x0",
-            "0x0",
-            "0x0",
-            "0x0",
-            "0x0",
-            "0x0",
-            "0x0",
-            "0x0",
-            "0x0",
-            "0x0",
-            "0x0",
-            "0x0",
-            "0x0",
-            "0x0",
-            "0x0"
-        ],
-        "treeSiblings": [
-            "0x0",
-            "0x2098f5fb9e239eab3ceac3f27b81e481dc3124d55ffed523a839ee8446b64864",
-            "0x1069673dcdb12263df301a6ff584a7ec261a44cb9dc68df067a4774460b1f1e1",
-            "0x18f43331537ee2af2e3d758d50f72106467c6eea50371dd528d57eb2b856d238",
-            "0x07f9d837cb17b0d36320ffe93ba52345f1b728571a568265caac97559dbc952a",
-            "0x2b94cf5e8746b3f5c9631f4c5df32907a699c58c94b2ad4d7b5cec1639183f55",
-            "0x2dee93c5a666459646ea7d22cca9e1bcfed71e6951b953611d11dda32ea09d78",
-            "0x078295e5a22b84e982cf601eb639597b8b0515a88cb5ac7fa8a4aabe3c87349d",
-            "0x2fa5e5f18f6027a6501bec864564472a616b2e274a41211a444cbe3a99f3cc61",
-            "0x0e884376d0d8fd21ecb780389e941f66e45e7acce3e228ab3e2156a614fcd747",
-            "0x1b7201da72494f1e28717ad1a52eb469f95892f957713533de6175e5da190af2",
-            "0x1f8d8822725e36385200c0b201249819a6e6e1e4650808b5bebc6bface7d7636",
-            "0x2c5d82f66c914bafb9701589ba8cfcfb6162b0a12acf88a8d0879a0471b5f85a",
-            "0x14c54148a0940bb820957f5adf3fa1134ef5c4aaa113f4646458f270e0bfbfd0",
-            "0x190d33b12f986f961e10c0ee44d8b9af11be25588cad89d416118e4bf4ebe80c",
-            "0x22f98aa9ce704152ac17354914ad73ed1167ae6596af510aa5b3649325e06c92"
-        ],
-        "externalNullifier": "0x00fd3a1e9736c12a5d4a31f26362b577ccafbd523d358daf40cdc04d90e17f77",
-        "signalHash": "0x00bc6bb462e38af7da48e0ae7b5cbae860141c04e5af2cf92328cd6548df111f"
-    }"#;
+    let total_input_len =
+        (ffi::get_main_input_signal_no() + ffi::get_main_input_signal_start()) as usize;
 
-    let input_map = get_input_hash_map();
-
-    // Set input values from JSON
-    let v: Value = serde_json::from_str(data).unwrap();
-    if let Value::Object(map) = v {
-        for (key, value) in map {
-            let h = fnv1a(key.as_str());
-            if value.is_array() {
-                for (idx, item) in value.as_array().unwrap().iter().enumerate() {
-                    let x = U256::from_str(item.as_str().unwrap()).unwrap();
-                    set_input_signal(input_map.clone(), &mut signal_values, h, idx as u64, x);
-                }
-            } else {
-                let x = U256::from_str(value.as_str().unwrap()).unwrap();
-                set_input_signal(input_map.clone(), &mut signal_values, h, 0, x);
-            }
-        }
+    for i in 0..total_input_len {
+        signal_values[i + 1] = field::input(i + 1, uint!(0_U256));
     }
-
-    // for i in 0..signal_values.len() {
-    //     println!(
-    //         "signalValues[{}]: {:?}",
-    //         i,
-    //         signal_values[i].0
-    //     );
-    // }
 
     let mut ctx = ffi::Circom_CalcWit {
         signalValues: signal_values,
@@ -321,7 +236,8 @@ fn main() {
     }
     eprintln!("Calculation took: {:?}", now.elapsed());
 
-    let mut signals = ctx.signalValues.iter().map(|x| x.0).collect::<Vec<_>>();
+    let signal_values = get_witness_to_signal();
+    let mut signals = signal_values.into_iter().map(|i| ctx.signalValues[i].0).collect::<Vec<_>>();
     let mut nodes = field::get_graph();
     eprintln!("Graph with {} nodes", nodes.len());
 
@@ -329,7 +245,8 @@ fn main() {
     graph::optimize(&mut nodes, &mut signals);
 
     // Store graph to file.
-    let bytes = postcard::to_stdvec(&(&nodes, &signals)).unwrap();
+    let input_map = get_input_hash_map();
+    let bytes = postcard::to_stdvec(&(&nodes, &signals, &input_map)).unwrap();
     eprintln!("Graph size: {} bytes", bytes.len());
     std::fs::write("graph.bin", bytes).unwrap();
 
@@ -345,21 +262,19 @@ fn main() {
         }
     }
 
-    // DEBUG: assert correct output for semaphore circuit
-    let witness = graph::evaluate(&nodes, &inputs, &signals);
-    assert_eq!(witness[1], uint!(0x03eff1a8c0909996245c410247000b5e69e7307c1990cb84b8b1937c16be58c8_U256));
-
     let now = Instant::now();
-    for _ in 0..1000 {
-       _ = graph::evaluate(&nodes, &inputs, &signals);
+    for _ in 0..10 {
+        _ = graph::evaluate(&nodes, &inputs, &signals);
     }
-    eprintln!("Calculation took: {:?}", now.elapsed() / 1000);
+    eprintln!("Calculation took: {:?}", now.elapsed() / 10);
 
     // Print graph
-    for (i, node) in nodes.iter().enumerate() {
-        println!("node[{}] = {:?}", i, node);
-    }
-    for (i, j) in signals.iter().enumerate() {
-        println!("signal[{}] = node[{}]", i, j);
-    }
+    // for (i, node) in nodes.iter().enumerate() {
+    //     println!("node[{}] = {:?}", i, node);
+    // }
+    // for (i, j) in signals.iter().enumerate() {
+    //     println!("signal[{}] = node[{}]", i, j);
+    // }
+
+    Ok(())
 }

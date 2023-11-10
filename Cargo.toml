@@ -10,6 +10,7 @@ ark-ff = { version = "0.4.0", features = ["std"] }
 ark-serialize = { version = "0.4", features = ["derive"] }
 byteorder = "1.4.3"
 cxx = "1.0"
+eyre = "0.6.5"
 hex = "0.4.3"
 postcard = { version = "1.0.8", features = ["use-std"], default-features = false }
 rand = "0.8.5"
@@ -25,3 +26,6 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 debug = true
+
+[features]
+build-witness = []

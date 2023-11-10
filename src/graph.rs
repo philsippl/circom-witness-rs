@@ -63,7 +63,7 @@ impl Operation {
         }
     }
 
-    pub fn evalMontgomery(&self, a: Fr, b: Fr) -> Fr {
+    pub fn eval_fr(&self, a: Fr, b: Fr) -> Fr {
         use Operation::*;
         match self {
             Add => a + b,
@@ -104,7 +104,7 @@ pub fn evaluate(nodes: &[Node], inputs: &[U256], outputs: &[usize]) -> Vec<U256>
             Node::Constant(c) => Fr::new(c.into()),
             Node::MontConstant(c) => c,
             Node::Input(i) => Fr::new(inputs[i].into()),
-            Node::Op(op, a, b) => op.evalMontgomery(values[a], values[b]),
+            Node::Op(op, a, b) => op.eval_fr(values[a], values[b]),
         };
         values.push(value);
     }
