@@ -1,14 +1,24 @@
-# witness generator
+# 🏎️ circom-witness-rs
+
+## Benchmarks
+
+### [semaphore-rs](https://github.com/worldcoin/semaphore-rs/tree/main)
 
 ```
-witness git:(master) ✗ ./target/release/witness | more
-calculation took: 14.187083ms
-signalValues[0]: 0x0000000000000000000000000000000000000000000000000000000000000001_U256
-signalValues[1]: 0x03eff1a8c0909996245c410247000b5e69e7307c1990cb84b8b1937c16be58c8_U256
-signalValues[2]: 0x0cfb271f5bde21d951776fc0db7308858c8249d7cacc40323142eba250fead03_U256
-signalValues[3]: 0x00bc6bb462e38af7da48e0ae7b5cbae860141c04e5af2cf92328cd6548df111f_U256
-signalValues[4]: 0x00fd3a1e9736c12a5d4a31f26362b577ccafbd523d358daf40cdc04d90e17f77_U256
-signalValues[5]: 0x099ab25e555083e656e9ec66a5368d1edd3314bd2dc77553813c5145d37326a3_U256
-signalValues[6]: 0x1db60e4cd8008edd85c68d461bf00d04f1620372f45c6ffacdb1a318791c2dd3_U256
-...
+cargo bench --bench=criterion --features=bench,depth_30
 ```
+
+With `circom-witness-rs`:
+```
+witness_30              time:   [993.84 µs 996.62 µs 999.42 µs]
+```
+
+With wasm witness generator from [`circom-compat`](https://github.com/arkworks-rs/circom-compat/blob/master/src/witness/witness_calculator.rs):
+```
+witness_30              time:   [24.630 ms 24.693 ms 24.759 ms]
+```
+
+With native c++ witness generator from circom: `9.640ms`
+
+**Result: For semaphore circuit (depth 30) `circom-witness-rs` is ~25x faster than wasm and ~10x faster than native c++ version**
+
