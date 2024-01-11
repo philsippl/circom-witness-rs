@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, ops::Shl};
 
 use crate::field::M;
 use rand::Rng;
@@ -34,6 +34,7 @@ pub enum Operation {
     Leq,
     Geq,
     Lor,
+    Shl
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +60,7 @@ impl Operation {
             Leq => U256::from(a <= b),
             Geq => U256::from(a >= b),
             Lor => U256::from(a != U256::ZERO || b != U256::ZERO),
+            Shl => compute_shl_uint(a, b),
             _ => unimplemented!("operator {:?} not implemented", self),
         }
     }
@@ -73,6 +75,12 @@ impl Operation {
         }
     }
 
+}
+
+fn compute_shl_uint(a: U256, b: U256) -> U256 {
+    assert!(b.lt(&U256::from(256)));
+    let ls_limb = b.as_limbs()[0];
+    a.shl(ls_limb as usize)
 }
 
 /// All references must be backwards.
