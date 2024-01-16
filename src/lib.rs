@@ -45,8 +45,8 @@ pub fn init_graph(graph_bytes: &[u8]) -> eyre::Result<Graph> {
     })
 }
 
-/// Calculates the number of needed inputs and allocates vec
-pub fn generate_inputs_buffer(graph: &Graph) -> Vec<U256> {
+/// Calculates the number of needed inputs
+pub fn get_inputs_size(graph: &Graph) -> usize {
     let mut start = false;
     let mut max_index = 0usize;
     for &node in graph.nodes.iter() {
@@ -59,27 +59,28 @@ pub fn generate_inputs_buffer(graph: &Graph) -> Vec<U256> {
             break;
         }
     }
+    max_index + 1
+}
 
-    let mut inputs = vec![U256::ZERO; max_index + 1];
+/// Allocates inputs vec with position 0 set to 1
+pub fn get_inputs_buffer(size: usize) -> Vec<U256> {
+    let mut inputs = vec![U256::ZERO; size];
     inputs[0] = U256::from(1);
     inputs
 }
 
 /// Calculates the position of the given signal in the inputs buffer
-pub fn get_input_mapping(
-    input_list: HashMap<String, Vec<U256>>,
-    graph: &Graph,
-) -> HashMap<String, usize> {
+pub fn get_input_mapping(input_list: &Vec<String>, graph: &Graph) -> HashMap<String, usize> {
     let mut input_mapping = HashMap::new();
-    for (key, _) in input_list {
-        let h = fnv1a(key.as_str());
+    for key in input_list {
+        let h = fnv1a(key);
         let pos = graph
             .input_mapping
             .iter()
             .position(|x| x.hash == h)
             .unwrap();
         let si = (graph.input_mapping[pos].signalid) as usize;
-        input_mapping.insert(key, si);
+        input_mapping.insert(key.to_string(), si);
     }
     input_mapping
 }
@@ -102,8 +103,8 @@ pub fn calculate_witness(
     input_list: HashMap<String, Vec<U256>>,
     graph: &Graph,
 ) -> eyre::Result<Vec<U256>> {
-    let mut inputs_buffer = generate_inputs_buffer(graph);
-    let input_mapping = get_input_mapping(input_list.clone(), graph);
+    let mut inputs_buffer = get_inputs_buffer(get_inputs_size(graph));
+    let input_mapping = get_input_mapping(&input_list.keys().cloned().collect(), graph);
     populate_inputs(&input_list, &input_mapping, &mut inputs_buffer);
     Ok(graph::evaluate(
         &graph.nodes,
