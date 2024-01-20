@@ -55,7 +55,7 @@ sed -e 's/FrElement\* signalValues/rust::Vec<FrElement> \&signalValues/g' \
     -e 's/FrElement lvarcall\[\([0-9]*\)\];/rust::Vec<FrElement> lvarcall = create_vec(\1);/g' \
     -e 's/,FrElement\* lvar,/,rust::Vec<FrElement>\& lvar,/g' \
     -e 's/ctx,\&lvarcall,myId,/ctx,lvarcall,myId,/g' \
-    -e '/delete \[\] [^;]*;/d' -e 'N;/\ndelete/!P;D' \
+    -e '/delete \[\][^;]*;/d' -e 'N;/\ndelete/!P;D' \
     -e '/^#include/d' "$1" >> "$filename.new"
 
 
