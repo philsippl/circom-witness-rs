@@ -1,5 +1,5 @@
 mod field;
-mod graph;
+pub mod graph;
 
 #[cfg(feature = "build-witness")]
 pub mod generate;
@@ -33,18 +33,6 @@ fn fnv1a(s: &str) -> u64 {
     hash
 }
 
-fn set_input_signal_eval(
-    input_hashmap: Vec<HashSignalInfo>,
-    signal_values: &mut Vec<U256>,
-    h: u64,
-    i: u64,
-    val: U256,
-) {
-    let pos = input_hashmap.iter().position(|x| x.hash == h).unwrap();
-    let si = (input_hashmap[pos].signalid + i) as usize;
-    signal_values[si] = val;
-}
-
 /// Loads the graph from bytes
 pub fn init_graph(graph_bytes: &[u8]) -> eyre::Result<Graph> {
     let (nodes, signals, input_mapping): (Vec<Node>, Vec<usize>, Vec<HashSignalInfo>) =
@@ -57,12 +45,8 @@ pub fn init_graph(graph_bytes: &[u8]) -> eyre::Result<Graph> {
     })
 }
 
-/// Calculate witness based on serialized graph and inputs
-pub fn calculate_witness(
-    input_list: HashMap<String, Vec<U256>>,
-    graph: &Graph,
-) -> eyre::Result<Vec<U256>> {
-    // Calculate number of inputs from graph
+/// Calculates the number of needed inputs
+pub fn get_inputs_size(graph: &Graph) -> usize {
     let mut start = false;
     let mut max_index = 0usize;
     for &node in graph.nodes.iter() {
@@ -75,21 +59,56 @@ pub fn calculate_witness(
             break;
         }
     }
+    max_index + 1
+}
 
-    // Prepare inputs
-    let mut inputs = vec![U256::ZERO; max_index + 1];
+/// Allocates inputs vec with position 0 set to 1
+pub fn get_inputs_buffer(size: usize) -> Vec<U256> {
+    let mut inputs = vec![U256::ZERO; size];
     inputs[0] = U256::from(1);
+    inputs
+}
 
-    // Set input values from JSON
-    for (key, value) in input_list {
-        let h = fnv1a(key.as_str());
-        for (idx, item) in value.into_iter().enumerate() {
-            set_input_signal_eval(graph.input_mapping.clone(), &mut inputs, h, idx as u64, item);
-        }
+/// Calculates the position of the given signal in the inputs buffer
+pub fn get_input_mapping(input_list: &Vec<String>, graph: &Graph) -> HashMap<String, usize> {
+    let mut input_mapping = HashMap::new();
+    for key in input_list {
+        let h = fnv1a(key);
+        let pos = graph
+            .input_mapping
+            .iter()
+            .position(|x| x.hash == h)
+            .unwrap();
+        let si = (graph.input_mapping[pos].signalid) as usize;
+        input_mapping.insert(key.to_string(), si);
     }
+    input_mapping
+}
 
-    // Calculate witness
-    let witness = graph::evaluate(&graph.nodes, &inputs, &graph.signals);
+/// Sets all provided inputs given the mapping and inputs buffer
+pub fn populate_inputs(
+    input_list: &HashMap<String, Vec<U256>>,
+    input_mapping: &HashMap<String, usize>,
+    input_buffer: &mut Vec<U256>,
+) {
+    for (key, value) in input_list {
+        let start = input_mapping[key];
+        let end = start + value.len();
+        input_buffer[start..end].copy_from_slice(value);
+    }
+}
 
-    Ok(witness)
+/// Calculate witness based on serialized graph and inputs
+pub fn calculate_witness(
+    input_list: HashMap<String, Vec<U256>>,
+    graph: &Graph,
+) -> eyre::Result<Vec<U256>> {
+    let mut inputs_buffer = get_inputs_buffer(get_inputs_size(graph));
+    let input_mapping = get_input_mapping(&input_list.keys().cloned().collect(), graph);
+    populate_inputs(&input_list, &input_mapping, &mut inputs_buffer);
+    Ok(graph::evaluate(
+        &graph.nodes,
+        &inputs_buffer,
+        &graph.signals,
+    ))
 }
