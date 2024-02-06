@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    ops::{BitAnd, Shl},
+    ops::{BitAnd, Shl, Shr},
 };
 
 use crate::field::M;
@@ -45,6 +45,7 @@ pub enum Operation {
     Geq,
     Lor,
     Shl,
+    Shr,
     Band,
 }
 
@@ -72,6 +73,7 @@ impl Operation {
             Geq => U256::from(a >= b),
             Lor => U256::from(a != U256::ZERO || b != U256::ZERO),
             Shl => compute_shl_uint(a, b),
+            Shr => compute_shr_uint(a, b),
             Band => a.bitand(b),
             _ => unimplemented!("operator {:?} not implemented", self),
         }
@@ -89,9 +91,15 @@ impl Operation {
 }
 
 fn compute_shl_uint(a: U256, b: U256) -> U256 {
-    assert!(b.lt(&U256::from(256)));
+    debug_assert!(b.lt(&U256::from(256)));
     let ls_limb = b.as_limbs()[0];
     a.shl(ls_limb as usize)
+}
+
+fn compute_shr_uint(a: U256, b: U256) -> U256 {
+    debug_assert!(b.lt(&U256::from(256)));
+    let ls_limb = b.as_limbs()[0];
+    a.shr(ls_limb as usize)
 }
 
 /// All references must be backwards.

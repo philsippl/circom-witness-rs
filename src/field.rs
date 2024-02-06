@@ -216,6 +216,10 @@ pub unsafe fn Fr_shl(to: *mut FrElement, a: *const FrElement, b: *const FrElemen
     binop(Operation::Shl, to, a, b);
 }
 
+pub unsafe fn Fr_shr(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
+    binop(Operation::Shr, to, a, b);
+}
+
 pub unsafe fn Fr_band(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
-    binop(Operation::Band, to, a, b)
+    binop(Operation::Band, to, a, b);
 }
