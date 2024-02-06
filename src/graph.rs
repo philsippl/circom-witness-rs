@@ -1,4 +1,7 @@
-use std::{collections::HashMap, ops::Shl};
+use std::{
+    collections::HashMap,
+    ops::{BitAnd, Shl},
+};
 
 use crate::field::M;
 use ark_bn254::Fr;
@@ -42,6 +45,7 @@ pub enum Operation {
     Geq,
     Lor,
     Shl,
+    Band,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +72,7 @@ impl Operation {
             Geq => U256::from(a >= b),
             Lor => U256::from(a != U256::ZERO || b != U256::ZERO),
             Shl => compute_shl_uint(a, b),
+            Band => a.bitand(b),
             _ => unimplemented!("operator {:?} not implemented", self),
         }
     }
