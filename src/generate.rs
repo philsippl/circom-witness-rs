@@ -70,7 +70,7 @@ mod ffi {
         // unsafe fn Fr_square(to: *mut FrElement, a: *const FrElement);
         unsafe fn Fr_shl(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
         // fn Fr_shr(to: &mut FrElement, a: &FrElement, b: u32);
-        // fn Fr_band(to: &mut FrElement, a: &FrElement, b: &FrElement);
+        unsafe fn Fr_band(to: &mut FrElement, a: *const FrElement, b: *const FrElement);
         // fn Fr_bor(to: &mut FrElement, a: &FrElement, b: &FrElement);
         // fn Fr_bxor(to: &mut FrElement, a: &FrElement, b: &FrElement);
         // fn Fr_bnot(to: &mut FrElement, a: &FrElement);
@@ -237,7 +237,10 @@ pub fn build_witness() -> eyre::Result<()> {
     eprintln!("Calculation took: {:?}", now.elapsed());
 
     let signal_values = get_witness_to_signal();
-    let mut signals = signal_values.into_iter().map(|i| ctx.signalValues[i].0).collect::<Vec<_>>();
+    let mut signals = signal_values
+        .into_iter()
+        .map(|i| ctx.signalValues[i].0)
+        .collect::<Vec<_>>();
     let mut nodes = field::get_graph();
     eprintln!("Graph with {} nodes", nodes.len());
 
