@@ -13,6 +13,11 @@ In the first mode, it generates the c++ version of the witness generator through
 
 ## Usage
 
+Generate the `graph.bin` with the following command:
+```sh
+WITNESS_CPP=<PATH_TO_CIRCOM_CIRCUIT> cargo run --bin generate-witness --features=build-witness --release
+```
+
 See this [example project](https://github.com/philsippl/semaphore-witness-example) for Semaphore with more details on building. 
 
 See `semaphore-rs` for an [example at runtime](https://github.com/worldcoin/semaphore-rs/blob/62f556bdc1a2a25021dcccc97af4dfa522ab5789/src/protocol/mod.rs#L161-L163).
