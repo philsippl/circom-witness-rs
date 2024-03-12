@@ -5,3 +5,4 @@
 circuit.cc
 constants.dat
 .idea
+*.bin
