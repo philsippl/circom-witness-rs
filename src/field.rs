@@ -1,6 +1,7 @@
 use crate::graph::{Node, Operation};
+use rand::Rng;
 use ruint::{aliases::U256, uint};
-use std::{ptr, sync::Mutex};
+use std::{cmp::min, ptr, sync::Mutex};
 
 pub const M: U256 =
     uint!(21888242871839275222246405745257275088548364400416034343698204186575808495617_U256);
@@ -47,8 +48,8 @@ pub fn get_values() -> Vec<U256> {
     VALUES.lock().unwrap().clone()
 }
 
-pub fn undefined() -> FrElement {
-    FrElement(usize::MAX)
+pub fn undefined(i: usize) -> FrElement {
+    FrElement(i)
 }
 
 pub fn constant(c: U256) -> FrElement {
@@ -62,6 +63,7 @@ pub fn constant(c: U256) -> FrElement {
     values.push(c);
     constant.push(true);
 
+    println!("DEBUG>> constant: {:?}", nodes.len() - 1);
     FrElement(nodes.len() - 1)
 }
 
@@ -130,7 +132,7 @@ pub fn Fr_copyn(to: *mut FrElement, a: *const FrElement, n: usize) {
 /// Create a vector of FrElement with length `len`.
 /// Needed because the default constructor of opaque type is not implemented.
 pub fn create_vec(len: usize) -> Vec<FrElement> {
-    vec![FrElement(usize::MAX); len]
+    (0..len).map(|i| FrElement(i)).collect()
 }
 
 pub fn create_vec_u32(len: usize) -> Vec<u32> {
@@ -222,4 +224,46 @@ pub unsafe fn Fr_shr(to: *mut FrElement, a: *const FrElement, b: *const FrElemen
 
 pub unsafe fn Fr_band(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
     binop(Operation::Band, to, a, b);
+}
+
+pub unsafe fn Fr_neg(to: *mut FrElement, a: *const FrElement) {
+    binop(Operation::Neg, to, a, a);
+}
+
+pub unsafe fn Fr_inv(to: *mut FrElement, a: *const FrElement) {
+    binop(Operation::Inv, to, a, a);
+}
+
+pub unsafe fn Fr_div(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
+    binop(Operation::Div, to, a, b);
+}
+
+pub unsafe fn Fr_pow(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
+    binop(Operation::Pow, to, a, b);
+}
+
+pub unsafe fn Fr_land(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
+    binop(Operation::Land, to, a, b);
+}
+
+pub unsafe fn bbf(component_name: String, lvarcall: &Vec<FrElement>, destination: *mut FrElement, index: usize) {
+    let mut nodes = NODES.lock().unwrap();
+    let mut values = VALUES.lock().unwrap();
+    let mut constant = CONSTANT.lock().unwrap();
+    assert_eq!(nodes.len(), values.len());
+    assert_eq!(nodes.len(), constant.len());
+
+    let mut params = [0; 10];
+    for i in 0..min(lvarcall.len(), 10) {
+        params[i] = lvarcall[i].0;
+        assert!(params[i] < nodes.len());
+    }
+    nodes.push(Node::BBF(params));
+    let (destination) = unsafe { &mut (*destination).0 };
+    *destination = nodes.len() - 1;
+
+    let mut rng = rand::thread_rng();
+    values.push(rng.gen::<U256>() % M);
+
+    constant.push(false);
 }

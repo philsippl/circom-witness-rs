@@ -49,6 +49,7 @@ mod ffi {
     extern "Rust" {
         type FrElement;
 
+        unsafe fn bbf(component_name: String, lvarcall: &Vec<FrElement>, destination: *mut FrElement, index: usize);
         fn create_vec(len: usize) -> Vec<FrElement>;
         fn create_vec_u32(len: usize) -> Vec<u32>;
         fn generate_position_array(
@@ -64,13 +65,14 @@ mod ffi {
         unsafe fn Fr_sub(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
         unsafe fn Fr_copy(to: *mut FrElement, a: *const FrElement);
         unsafe fn Fr_copyn(to: *mut FrElement, a: *const FrElement, n: usize);
-        // unsafe fn Fr_neg(to: *mut FrElement, a: *const FrElement);
-        // unsafe fn Fr_inv(to: *mut FrElement, a: *const FrElement);
-        // unsafe fn Fr_div(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
+        unsafe fn Fr_neg(to: *mut FrElement, a: *const FrElement);
+        unsafe fn Fr_inv(to: *mut FrElement, a: *const FrElement);
+        unsafe fn Fr_div(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
         // unsafe fn Fr_square(to: *mut FrElement, a: *const FrElement);
         unsafe fn Fr_shl(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
         unsafe fn Fr_shr(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
         unsafe fn Fr_band(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
+        unsafe fn Fr_land(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
         // fn Fr_bor(to: &mut FrElement, a: &FrElement, b: &FrElement);
         // fn Fr_bxor(to: &mut FrElement, a: &FrElement, b: &FrElement);
         // fn Fr_bnot(to: &mut FrElement, a: &FrElement);
@@ -85,7 +87,7 @@ mod ffi {
         unsafe fn Fr_toInt(a: *mut FrElement) -> u64;
         unsafe fn Fr_lor(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
         unsafe fn print(a: *mut FrElement);
-        // fn Fr_pow(to: &mut FrElement, a: &FrElement, b: &FrElement);
+        unsafe fn Fr_pow(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
         // fn Fr_idiv(to: &mut FrElement, a: &FrElement, b: &FrElement);
     }
 
@@ -145,7 +147,7 @@ pub fn get_constants() -> Vec<FrElement> {
         + (ffi::get_size_of_witness() as usize) * 8..];
     let mut constants = vec![field::constant(U256::from(0)); ffi::get_size_of_constants() as usize];
     for i in 0..ffi::get_size_of_constants() as usize {
-        let sv = bytes.read_i32::<LittleEndian>().unwrap() as i32;
+        let sv = bytes.read_u32::<LittleEndian>().unwrap();
         let typ = bytes.read_u32::<LittleEndian>().unwrap() as u32;
 
         let mut buf = [0; 32];
@@ -208,7 +210,10 @@ pub fn get_iosignals() -> Vec<InputOutputList> {
 
 /// Run cpp witness generator and optimize graph
 pub fn build_witness() -> eyre::Result<()> {
-    let mut signal_values = vec![field::undefined(); ffi::get_total_signal_no() as usize];
+    let mut signal_values = vec![];
+    for i in 0..ffi::get_total_signal_no() as usize {
+        signal_values.push(field::undefined(i));
+    }
     signal_values[0] = field::constant(uint!(1_U256));
 
     let total_input_len =
@@ -245,7 +250,7 @@ pub fn build_witness() -> eyre::Result<()> {
     eprintln!("Graph with {} nodes", nodes.len());
 
     // Optimize graph
-    graph::optimize(&mut nodes, &mut signals);
+    graph::optimize(&mut nodes, &mut signals); 
 
     // Store graph to file.
     let input_map = get_input_hash_map();
@@ -257,7 +262,7 @@ pub fn build_witness() -> eyre::Result<()> {
     let input_len = (ffi::get_main_input_signal_no() + ffi::get_main_input_signal_start()) as usize; // TODO: fetch from file
     let mut inputs = vec![U256::from(0); input_len];
     inputs[0] = U256::from(1);
-    for i in 1..nodes.len() {
+    for i in 1..inputs.len() {
         if let Node::Input(j) = nodes[i] {
             inputs[j] = get_values()[i];
         } else {

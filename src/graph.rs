@@ -47,6 +47,11 @@ pub enum Operation {
     Shl,
     Shr,
     Band,
+    Neg,
+    Inv,
+    Div,
+    Pow,
+    Land,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +61,7 @@ pub enum Node {
     #[serde(serialize_with = "ark_se", deserialize_with = "ark_de")]
     MontConstant(Fr),
     Op(Operation, usize, usize),
+    BBF([usize;10]),
 }
 
 impl Operation {
@@ -75,6 +81,11 @@ impl Operation {
             Shl => compute_shl_uint(a, b),
             Shr => compute_shr_uint(a, b),
             Band => a.bitand(b),
+            Neg => U256::from(M - a),
+            Inv => a.inv_mod(M).unwrap(),
+            Div => a * b.inv_mod(M).unwrap(),
+            Pow => a.pow_mod(b, M),
+            Land => U256::from(a != U256::ZERO && b != U256::ZERO),
             _ => unimplemented!("operator {:?} not implemented", self),
         }
     }
@@ -85,6 +96,7 @@ impl Operation {
             Add => a + b,
             Sub => a - b,
             Mul => a * b,
+            Eq => (a == b).into(),
             _ => unimplemented!("operator {:?} not implemented for Montgomery", self),
         }
     }
@@ -121,6 +133,13 @@ pub fn optimize(nodes: &mut Vec<Node>, outputs: &mut [usize]) {
     montgomery_form(nodes);
 }
 
+
+/// BBF implementation
+/// TODO: this needs to be dynamically configured
+fn bbf_xx(inputs: &[Fr]) -> Fr {
+    Fr::new(U256::from(0xabcd).into())
+}
+
 pub fn evaluate(nodes: &[Node], inputs: &[U256], outputs: &[usize]) -> Vec<U256> {
     // assert_valid(nodes);
 
@@ -130,8 +149,15 @@ pub fn evaluate(nodes: &[Node], inputs: &[U256], outputs: &[usize]) -> Vec<U256>
         let value = match node {
             Node::Constant(c) => Fr::new(c.into()),
             Node::MontConstant(c) => c,
-            Node::Input(i) => Fr::new(inputs[i].into()),
+            Node::Input(i) => {
+                if i < inputs.len() {
+                    Fr::new(inputs[i].into())
+                } else {
+                    Fr::new(U256::from(1337).into())
+                }
+            }
             Node::Op(op, a, b) => op.eval_fr(values[a], values[b]),
+            Node::BBF(params) => bbf_xx(&params.iter().map(|i| values[*i]).collect::<Vec<_>>()),
         };
         values.push(value);
     }
@@ -189,6 +215,11 @@ pub fn tree_shake(nodes: &mut Vec<Node>, outputs: &mut [usize]) {
                 used[a] = true;
                 used[b] = true;
             }
+            if let Node::BBF(params) = nodes[i] {
+                for &param in params.iter() {
+                    used[param] = true;
+                }
+            }
         }
     }
 
@@ -218,6 +249,11 @@ pub fn tree_shake(nodes: &mut Vec<Node>, outputs: &mut [usize]) {
             *a = renumber[*a].unwrap();
             *b = renumber[*b].unwrap();
         }
+        if let Node::BBF(params) = node {
+            for param in params.iter_mut() {
+                *param = renumber[*param].unwrap();
+            }
+        }
     }
     for output in outputs.iter_mut() {
         *output = renumber[*output].unwrap();
@@ -235,6 +271,7 @@ fn random_eval(nodes: &mut Vec<Node>) -> Vec<U256> {
     for node in nodes.iter() {
         use Operation::*;
         let value = match node {
+            Node::BBF(i) => rng.gen::<U256>() % M,
             // Constants evaluate to themselves
             Node::Constant(c) => *c,
 
@@ -323,6 +360,7 @@ pub fn montgomery_form(nodes: &mut [Node]) {
             Input(..) => (),
             Op(Add | Sub | Mul, ..) => (),
             Op(..) => unimplemented!("Operators Montgomery form"),
+            BBF(..) => (),
         }
     }
     eprintln!("Converted to Montgomery form");
