@@ -137,7 +137,7 @@ pub fn optimize(nodes: &mut Vec<Node>, outputs: &mut [usize]) {
 /// BBF implementation
 /// TODO: this needs to be dynamically configured
 fn bbf_xx(inputs: &[Fr]) -> Fr {
-    Fr::new(U256::from(0xabcd).into())
+    Fr::new(U256::from(0x1000000).into()) + inputs[0]
 }
 
 pub fn evaluate(nodes: &[Node], inputs: &[U256], outputs: &[usize]) -> Vec<U256> {
@@ -153,7 +153,7 @@ pub fn evaluate(nodes: &[Node], inputs: &[U256], outputs: &[usize]) -> Vec<U256>
                 if i < inputs.len() {
                     Fr::new(inputs[i].into())
                 } else {
-                    Fr::new(U256::from(1337).into())
+                    Fr::new(U256::MAX.into())
                 }
             }
             Node::Op(op, a, b) => op.eval_fr(values[a], values[b]),
