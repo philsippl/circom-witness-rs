@@ -6,7 +6,6 @@ use crate::HashSignalInfo;
 use byteorder::{LittleEndian, ReadBytesExt};
 use ffi::InputOutputList;
 use ruint::{aliases::U256, uint};
-use serde::{Deserialize, Serialize};
 use std::{io::Read, time::Instant};
 
 #[cxx::bridge]
@@ -49,7 +48,7 @@ mod ffi {
     extern "Rust" {
         type FrElement;
 
-        unsafe fn bbf(component_name: String, lvarcall: &Vec<FrElement>, destination: *mut FrElement, index: usize);
+        unsafe fn bbf(component_name: String, lvarcall: &Vec<FrElement>, destination: *mut FrElement);
         fn create_vec(len: usize) -> Vec<FrElement>;
         fn create_vec_u32(len: usize) -> Vec<u32>;
         fn generate_position_array(
@@ -257,32 +256,6 @@ pub fn build_witness() -> eyre::Result<()> {
     let bytes = postcard::to_stdvec(&(&nodes, &signals, &input_map)).unwrap();
     eprintln!("Graph size: {} bytes", bytes.len());
     std::fs::write("graph.bin", bytes).unwrap();
-
-    // Evaluate the graph.
-    let input_len = (ffi::get_main_input_signal_no() + ffi::get_main_input_signal_start()) as usize; // TODO: fetch from file
-    let mut inputs = vec![U256::from(0); input_len];
-    inputs[0] = U256::from(1);
-    for i in 1..inputs.len() {
-        if let Node::Input(j) = nodes[i] {
-            inputs[j] = get_values()[i];
-        } else {
-            break;
-        }
-    }
-
-    let now = Instant::now();
-    for _ in 0..10 {
-        _ = graph::evaluate(&nodes, &inputs, &signals);
-    }
-    eprintln!("Calculation took: {:?}", now.elapsed() / 10);
-
-    // Print graph
-    // for (i, node) in nodes.iter().enumerate() {
-    //     println!("node[{}] = {:?}", i, node);
-    // }
-    // for (i, j) in signals.iter().enumerate() {
-    //     println!("signal[{}] = node[{}]", i, j);
-    // }
 
     Ok(())
 }

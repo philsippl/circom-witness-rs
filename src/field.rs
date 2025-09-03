@@ -63,7 +63,6 @@ pub fn constant(c: U256) -> FrElement {
     values.push(c);
     constant.push(true);
 
-    println!("DEBUG>> constant: {:?}", nodes.len() - 1);
     FrElement(nodes.len() - 1)
 }
 
@@ -246,20 +245,16 @@ pub unsafe fn Fr_land(to: *mut FrElement, a: *const FrElement, b: *const FrEleme
     binop(Operation::Land, to, a, b);
 }
 
-pub unsafe fn bbf(component_name: String, lvarcall: &Vec<FrElement>, destination: *mut FrElement, index: usize) {
+pub unsafe fn bbf(component_name: String, lvarcall: &Vec<FrElement>, destination: *mut FrElement) {
     let mut nodes = NODES.lock().unwrap();
     let mut values = VALUES.lock().unwrap();
     let mut constant = CONSTANT.lock().unwrap();
     assert_eq!(nodes.len(), values.len());
     assert_eq!(nodes.len(), constant.len());
 
-    let mut params = [0; 10];
-    for i in 0..min(lvarcall.len(), 10) {
-        params[i] = lvarcall[i].0;
-        assert!(params[i] < nodes.len());
-    }
-    nodes.push(Node::BBF(params));
-    let (destination) = unsafe { &mut (*destination).0 };
+    let params = lvarcall.iter().map(|x| x.0).collect();
+    nodes.push(Node::BBF(component_name, params));
+    let destination = unsafe { &mut (*destination).0 };
     *destination = nodes.len() - 1;
 
     let mut rng = rand::thread_rng();
