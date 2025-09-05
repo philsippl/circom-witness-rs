@@ -64,10 +64,10 @@ sed -E \
   -e 's/subcomponents = new uint\[([0-9]+)\]\{0\};/subcomponents = create_vec_u32(\1);/g' \
   -e 's/^uint aux_dimensions\[([0-9]+)\] = \{([^}]+)\};$/rust::Vec<uint> aux_dimensions = rust::Vec<uint32_t>{\2};/' \
   -e ':b
-     # If current line looks like a func call, pull in the next line
-     /^[[:space:]]*[A-Za-z0-9_]+\([^;]*\);[[:space:]]*$/{
+     # Only match function calls containing "bbf"
+     /^[[:space:]]*[A-Za-z0-9_]*bbf[A-Za-z0-9_]*\([^;]*\);[[:space:]]*$/{
        N
-       s/^[[:space:]]*([A-Za-z0-9_]+)\([^,]+, *([^,]+), *[^,]+, *([^,]+), *[^)]*\);\n[[:space:]]*\/\/ end call bucket$/bbf("\1", \2, \3);\n\/\/ end call bucket/
+       s/^[[:space:]]*([A-Za-z0-9_]*bbf[A-Za-z0-9_]*)\([^,]+, *([^,]+), *[^,]+, *([^,]+), *[^)]*\);\n[[:space:]]*\/\/ end call bucket$/bbf("\1", \2, \3);\n\/\/ end call bucket/
        bb
      }' \
   "$filename.new" > "src/circuit.cc"

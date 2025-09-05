@@ -6,10 +6,12 @@ fn main() {
         let circuit_file = Path::new(&witness_cpp);
         let circuit_name = circuit_file.file_stem().unwrap().to_str().unwrap();
 
-        let status = Command::new("circom")
+        let status = Command::new("/Users/ps/scm/github/iden3/circom/target/release/circom")
             .args([
                 fs::canonicalize(circuit_file).unwrap().to_str().unwrap(),
                 "--c",
+                "-l",
+                "/Users/ps/scm/github/philsippl/semaphore-witness-example/src"
             ])
             .status()
             .unwrap();

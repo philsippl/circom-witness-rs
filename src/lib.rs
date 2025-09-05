@@ -1,4 +1,5 @@
 mod field;
+mod arith;
 pub mod graph;
 
 #[cfg(feature = "build-witness")]

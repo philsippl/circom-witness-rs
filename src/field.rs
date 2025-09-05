@@ -245,6 +245,10 @@ pub unsafe fn Fr_land(to: *mut FrElement, a: *const FrElement, b: *const FrEleme
     binop(Operation::Land, to, a, b);
 }
 
+pub unsafe fn Fr_idiv(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
+    binop(Operation::IDiv, to, a, b);
+}
+
 pub unsafe fn bbf(component_name: String, lvarcall: &Vec<FrElement>, destination: *mut FrElement) {
     let mut nodes = NODES.lock().unwrap();
     let mut values = VALUES.lock().unwrap();

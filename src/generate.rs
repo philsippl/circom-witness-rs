@@ -13,14 +13,16 @@ mod ffi {
 
     #[derive(Debug, Default, Clone)]
     pub struct InputOutputList {
-        pub defs: Vec<IODef>,
+        pub defs: Vec<IOFieldDef>,
     }
 
     #[derive(Debug, Clone, Default)]
-    pub struct IODef {
+    pub struct IOFieldDef {
         pub code: usize,
         pub offset: usize,
         pub lengths: Vec<usize>,
+        pub size: u32,
+        pub busId: u32,
     }
 
     #[derive(Debug, Default, Clone)]
@@ -87,7 +89,7 @@ mod ffi {
         unsafe fn Fr_lor(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
         unsafe fn print(a: *mut FrElement);
         unsafe fn Fr_pow(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
-        // fn Fr_idiv(to: &mut FrElement, a: &FrElement, b: &FrElement);
+        unsafe fn Fr_idiv(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
     }
 
     // C++ types and signatures exposed to Rust.
@@ -146,11 +148,12 @@ pub fn get_constants() -> Vec<FrElement> {
         + (ffi::get_size_of_witness() as usize) * 8..];
     let mut constants = vec![field::constant(U256::from(0)); ffi::get_size_of_constants() as usize];
     for i in 0..ffi::get_size_of_constants() as usize {
-        let sv = bytes.read_i32::<LittleEndian>().unwrap() as i32;
+        let sv = bytes.read_u32::<LittleEndian>().unwrap() as u32;
         let typ = bytes.read_u32::<LittleEndian>().unwrap() as u32;
 
         let mut buf = [0; 32];
         bytes.read_exact(&mut buf);
+
 
         if typ & 0x80000000 == 0 {
             constants[i] = field::constant(U256::from(sv));
@@ -188,18 +191,23 @@ pub fn get_iosignals() -> Vec<InputOutputList> {
 
         (0..l32).for_each(|_j| {
             let offset = bytes.read_u32::<LittleEndian>().unwrap() as usize;
-            let len = bytes.read_u32::<LittleEndian>().unwrap() as usize + 1;
+            let len = bytes.read_u32::<LittleEndian>().unwrap() as usize;
 
             let mut lengths = vec![0usize; len];
 
-            (1..len).for_each(|k| {
+            (0..len).for_each(|k| {
                 lengths[k] = bytes.read_u32::<LittleEndian>().unwrap() as usize;
             });
 
-            io_list.defs.push(ffi::IODef {
+            let size = bytes.read_u32::<LittleEndian>().unwrap();
+            let busId = bytes.read_u32::<LittleEndian>().unwrap();
+
+            io_list.defs.push(ffi::IOFieldDef {
                 code: 0,
                 offset,
                 lengths,
+                size,
+                busId,
             });
         });
         map[indices[i] % hashmap_size] = io_list;

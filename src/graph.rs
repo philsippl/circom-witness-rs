@@ -3,13 +3,14 @@ use std::{
     ops::{BitAnd, Shl, Shr},
 };
 
-use crate::{field::M, BlackBoxFunction};
+use crate::{arith::*, field::M, BlackBoxFunction};
 use ark_bn254::Fr;
 use ark_ff::PrimeField;
 use eyre::bail;
 use rand::Rng;
 use ruint::aliases::U256;
 use serde::{Deserialize, Serialize};
+use num_bigint::BigInt;
 
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress, Validate};
 
@@ -53,6 +54,7 @@ pub enum Operation {
     Div,
     Pow,
     Land,
+    IDiv,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,28 +69,33 @@ pub enum Node {
 
 impl Operation {
     pub fn eval(&self, a: U256, b: U256) -> U256 {
+        let m = M.into();
+        let a = a.into();
+        let b = b.into();
         use Operation::*;
-        match self {
-            Add => a.add_mod(b, M),
-            Sub => a.add_mod(M - b, M),
-            Mul => a.mul_mod(b, M),
-            Eq => U256::from(a == b),
-            Neq => U256::from(a != b),
-            Lt => U256::from(a < b),
-            Gt => U256::from(a > b),
-            Leq => U256::from(a <= b),
-            Geq => U256::from(a >= b),
-            Lor => U256::from(a != U256::ZERO || b != U256::ZERO),
-            Shl => compute_shl_uint(a, b),
-            Shr => compute_shr_uint(a, b),
-            Band => a.bitand(b),
-            Neg => U256::from(M - a),
-            Inv => a.inv_mod(M).unwrap(),
-            Div => a * b.inv_mod(M).unwrap(),
-            Pow => a.pow_mod(b, M),
-            Land => U256::from(a != U256::ZERO && b != U256::ZERO),
+        let res = match self {
+            Add => add(&a, &b, &m),
+            Sub => sub(&a, &b, &m),
+            Mul => mul(&a, &b, &m),
+            Eq => eq(&a, &b, &m),
+            Neq => not_eq(&a, &b, &m),
+            Lt => lesser(&a, &b, &m),
+            Gt => greater(&a, &b, &m),
+            Leq => lesser_eq(&a, &b, &m),
+            Geq => greater_eq(&a, &b, &m),
+            Lor => bool_or(&a, &b, &m),
+            Shl => shift_l(&a, &b, &m).unwrap_or(BigInt::from(0)),
+            Shr => shift_r(&a, &b, &m).unwrap_or(BigInt::from(0)),
+            Band => bit_and(&a, &b, &m),
+            Neg => m - &a,
+            Inv => a.modinv(&m).unwrap_or(BigInt::from(0)),
+            Div => div(&a, &b, &m).unwrap_or(BigInt::from(0)),
+            Pow => pow(&a, &b, &m),
+            Land => bool_and(&a, &b, &m),
+            IDiv => idiv(&a, &b, &m).unwrap_or(BigInt::from(0)),
             _ => unimplemented!("operator {:?} not implemented", self),
-        }
+        };
+        res.try_into().unwrap()
     }
 
     pub fn eval_fr(&self, a: Fr, b: Fr) -> Fr {
@@ -99,6 +106,7 @@ impl Operation {
             Mul => a * b,
             Eq => (a == b).into(),
             Neg => -a,
+            Div => a / b,
             _ => unimplemented!("operator {:?} not implemented for Montgomery", self),
         }
     }
@@ -375,8 +383,8 @@ pub fn montgomery_form(nodes: &mut [Node]) {
             Constant(c) => *node = MontConstant(Fr::new((*c).into())),
             MontConstant(..) => (),
             Input(..) => (),
-            Op(Add | Sub | Mul | Neg, ..) => (),
-            Op(..) => unimplemented!("Operators Montgomery form"),
+            Op(Add | Sub | Mul | Neg | Div, ..) => (),
+            Op(op, ..) => {println!("Operator {:?} not implemented for Montgomery form", op); unimplemented!("Operators Montgomery form")},
             BBF(..) => (),
         }
     }
