@@ -148,15 +148,19 @@ pub fn get_constants() -> Vec<FrElement> {
         + (ffi::get_size_of_witness() as usize) * 8..];
     let mut constants = vec![field::constant(U256::from(0)); ffi::get_size_of_constants() as usize];
     for i in 0..ffi::get_size_of_constants() as usize {
-        let sv = bytes.read_u32::<LittleEndian>().unwrap() as u32;
+        let sv = bytes.read_i32::<LittleEndian>().unwrap() as i32;
         let typ = bytes.read_u32::<LittleEndian>().unwrap() as u32;
 
         let mut buf = [0; 32];
         bytes.read_exact(&mut buf);
 
-
         if typ & 0x80000000 == 0 {
-            constants[i] = field::constant(U256::from(sv));
+            let c = if sv < 0 {
+                M-U256::from(sv.abs() as u32)
+            } else {
+                U256::from(sv as u32)
+            };
+            constants[i] = field::constant(c);
         } else {
             constants[i] =
                 field::constant(U256::from_le_bytes(buf).mul_redc(uint!(1_U256), M, INV));
