@@ -1,7 +1,6 @@
 # 🏎️ circom-witness-rs
 
-### Update Sept. 2025
-The probably 
+**Update Sept. 2025:** After a long radio silence, I've added more supported ops, some bug fixes, and *most importantly support for unconstrained control flow* (e.g. allowing the ternary operator `bool ? a : b`), which has been wished for many times and been quite a limitation to this project. See the section about blackbox functions in usage for more details.
 
 ## Description
 
@@ -9,19 +8,19 @@ This crate provides a fast witness generator for Circom circuits, serving as a d
 
 `circom-witness-rs` comes with two modes:
 
-1. Generate the static execution graph required for the witness generation at build time (`--features=build-witness`).
+1. Generate the static execution graph required for the witness generation at build time.
 2. Generate the witness elements at runtime from serialized graph.
 
 In the first mode, it generates the c++ version of the witness generator through circom and links itself against it. The c++ code is made accessible to rust through [`cxx`](https://github.com/dtolnay/cxx). It hooks all field functions (which are x86 assembly in the original generator), such that it can recreate the execution graph through symblic execution. The execution graph is further optimized through constant propagation and dead code elimination. The resulting graph is then serialized to a binary format. At runtime, the graph can be embedded in the binary and interpreted to generate the witness.
 
 ## Usage
 
-1. (One-off) Create and optimize graph:
+**1. (One-off) Create and optimize graph:**
 ```rust
     witness::generate::build_witness().unwrap();
 ```
 
-2. (Runtime) Generate witness:
+**2. (At runtime) Generate witness:**
 ```rust
 const BYTES: &[u8] = include_bytes!("../graph.bin");
 fn main() {
@@ -31,7 +30,8 @@ fn main() {
 }
 ```
 
-**Blackbox functions**
+**📦 Blackbox functions**
+
 Unconstrained control flow is also supported through configurable blackbox functions. This also includes the commonly requested ternary operator. Importantly, any unconstained / dynamic control flow needs to live in circom functions (i.e. cannot live in templates), so requires small modifications to existing circuits. Those functions are currently limited to a single return value. 
 
 ```rust
@@ -39,6 +39,7 @@ Unconstrained control flow is also supported through configurable blackbox funct
     let mut bbfs: HashMap<String, BlackBoxFunction> = HashMap::new();
     // Instead of a closure, this can also be a function
      bbfs.insert("bbf_inv".to_string(), Arc::new(move |args: &[Fr]| -> Fr {
+        // Circom code:
         // function bbf_inv(in) {
         //     return in!=0 ? 1/in : 0;
         // }
