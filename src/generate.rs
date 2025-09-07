@@ -227,11 +227,11 @@ pub fn build_witness() -> eyre::Result<()> {
     }
     signal_values[0] = field::constant(uint!(1_U256));
 
-    let total_input_len =
-        (ffi::get_main_input_signal_no() + ffi::get_main_input_signal_start()) as usize;
+    let main_input_start = ffi::get_main_input_signal_start() as usize;
+    let main_input_len = ffi::get_main_input_signal_no() as usize;
 
-    for i in 0..total_input_len {
-        signal_values[i + 1] = field::input(i + 1, uint!(0_U256));
+    for i in main_input_start..main_input_start + main_input_len {
+        signal_values[i] = field::input(i, uint!(0_U256));
     }
 
     let mut ctx = ffi::Circom_CalcWit {
