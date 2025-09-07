@@ -1,6 +1,6 @@
 # 🏎️ circom-witness-rs
 
-**Update Sept. 2025:** After a long radio silence, I've added more supported ops, some bug fixes, and *most importantly support for unconstrained control flow* (e.g. allowing the ternary operator `bool ? a : b`), which has been wished for many times and been quite a limitation to this project. See the section about blackbox functions in usage for more details.
+**Update Sept. 2025:** After a long radio silence, I've added more supported ops, some bug fixes, and *most importantly support for unconstrained control flow* (e.g. allowing the ternary operator `bool ? a : b`), which has been wished for many times and been quite a limitation to this project. See the section about blackbox functions in the usage section for more details.
 
 ## Description
 
@@ -35,7 +35,6 @@ fn main() {
 Unconstrained control flow is also supported through configurable blackbox functions. This also includes the commonly requested ternary operator. Importantly, any unconstained / dynamic control flow needs to live in circom functions (i.e. cannot live in templates), so requires small modifications to existing circuits. Those functions are currently limited to a single return value. 
 
 ```rust
-    ...
     let mut bbfs: HashMap<String, BlackBoxFunction> = HashMap::new();
     // Instead of a closure, this can also be a function
      bbfs.insert("bbf_inv".to_string(), Arc::new(move |args: &[Fr]| -> Fr {
