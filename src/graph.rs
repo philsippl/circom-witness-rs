@@ -1,13 +1,14 @@
 use std::{
-    collections::HashMap,
-    ops::{BitAnd, Shl, Shr},
+    cmp::Ordering, collections::HashMap, ops::Shr
 };
 
-use crate::field::M;
+use crate::{BlackBoxFunction, M};
 use ark_bn254::Fr;
 use ark_ff::PrimeField;
+use eyre::bail;
 use rand::Rng;
 use ruint::aliases::U256;
+use ruint::uint;
 use serde::{Deserialize, Serialize};
 
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress, Validate};
@@ -47,19 +48,42 @@ pub enum Operation {
     Shl,
     Shr,
     Band,
+    Neg,
+    Inv,
+    Div,
+    Pow,
+    Land,
+    IDiv,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Node {
     Input(usize),
     Constant(U256),
     #[serde(serialize_with = "ark_se", deserialize_with = "ark_de")]
     MontConstant(Fr),
     Op(Operation, usize, usize),
+    BBF(String, Vec<usize>),
+}
+
+fn cmp_balanced(a: U256, b: U256) -> Ordering {
+    match (a > M.shr(1), b > M.shr(1)) {
+        (false, true)  => Ordering::Greater,
+        (true,  false) => Ordering::Less,
+        (false, false) => a.cmp(&b),
+        (true,  true)  => {
+            // both negative: compare reversed
+            let ma = M - a;
+            let mb = M - b;
+            mb.cmp(&ma)
+        }
+    }
 }
 
 impl Operation {
     pub fn eval(&self, a: U256, b: U256) -> U256 {
+        let a = a % M;
+        let b = b % M;
         use Operation::*;
         match self {
             Add => a.add_mod(b, M),
@@ -67,14 +91,20 @@ impl Operation {
             Mul => a.mul_mod(b, M),
             Eq => U256::from(a == b),
             Neq => U256::from(a != b),
-            Lt => U256::from(a < b),
-            Gt => U256::from(a > b),
-            Leq => U256::from(a <= b),
-            Geq => U256::from(a >= b),
+            Lt => U256::from(cmp_balanced(a, b).is_lt()),
+            Gt => U256::from(cmp_balanced(a, b).is_gt()),
+            Leq => U256::from(cmp_balanced(a, b).is_le()),
+            Geq => U256::from(cmp_balanced(a, b).is_ge()),
             Lor => U256::from(a != U256::ZERO || b != U256::ZERO),
-            Shl => compute_shl_uint(a, b),
-            Shr => compute_shr_uint(a, b),
-            Band => a.bitand(b),
+            Shl => compute_shl(a, b),
+            Shr => compute_shr(a, b),
+            Band => a.bitand(b) % M,
+            Land => U256::from(a != U256::ZERO && b != U256::ZERO),
+            Neg => (M - a) % M,
+            Inv => a.inv_mod(M).unwrap(),
+            Div => a.mul_mod(b.inv_mod(M).unwrap(), M),
+            Pow => a.pow_mod(b, M),
+            IDiv => a / b,
             _ => unimplemented!("operator {:?} not implemented", self),
         }
     }
@@ -85,29 +115,33 @@ impl Operation {
             Add => a + b,
             Sub => a - b,
             Mul => a * b,
+            Eq => (a == b).into(),
+            Neg => -a,
+            Div => a / b,
             _ => unimplemented!("operator {:?} not implemented for Montgomery", self),
         }
     }
 }
 
-fn compute_shl_uint(a: U256, b: U256) -> U256 {
-    debug_assert!(b.lt(&U256::from(256)));
-    let ls_limb = b.as_limbs()[0];
-    a.shl(ls_limb as usize)
+fn compute_shl(a: U256, b: U256) -> U256 {
+    assert!(b < uint!(256));
+    let s = b.as_limbs()[0] as usize;
+    let mask = (U256::ONE << 254) - U256::ONE;
+    ((a << s) & mask) % M
 }
 
-fn compute_shr_uint(a: U256, b: U256) -> U256 {
-    debug_assert!(b.lt(&U256::from(256)));
-    let ls_limb = b.as_limbs()[0];
-    a.shr(ls_limb as usize)
+fn compute_shr(a: U256, b: U256) -> U256 {
+    assert!(b < uint!(256));
+    let s = b.as_limbs()[0] as usize;
+    (a >> s) % M
 }
 
 /// All references must be backwards.
 fn assert_valid(nodes: &[Node]) {
-    for (i, &node) in nodes.iter().enumerate() {
+    for (i, node) in nodes.iter().enumerate() {
         if let Node::Op(_, a, b) = node {
-            assert!(a < i);
-            assert!(b < i);
+            assert!(*a < i);
+            assert!(*b < i);
         }
     }
 }
@@ -121,17 +155,46 @@ pub fn optimize(nodes: &mut Vec<Node>, outputs: &mut [usize]) {
     montgomery_form(nodes);
 }
 
-pub fn evaluate(nodes: &[Node], inputs: &[U256], outputs: &[usize]) -> Vec<U256> {
-    // assert_valid(nodes);
+fn strip_suffix_number(s: String) -> String {
+    if let Some(pos) = s.rfind('_') {
+        let (prefix, suffix) = s.split_at(pos);
+        if suffix[1..].chars().all(|c| c.is_ascii_digit()) {
+            return prefix.to_string();
+        }
+    }
+    s
+}
+
+pub fn evaluate(nodes: &[Node], inputs: &[U256], outputs: &[usize], bbfs: Option<&HashMap<String, BlackBoxFunction>>) -> eyre::Result<Vec<U256>> {
+    assert_valid(nodes);
 
     // Evaluate the graph.
     let mut values = Vec::with_capacity(nodes.len());
-    for (_, &node) in nodes.iter().enumerate() {
+    for (_, node) in nodes.iter().enumerate() {
         let value = match node {
             Node::Constant(c) => Fr::new(c.into()),
-            Node::MontConstant(c) => c,
-            Node::Input(i) => Fr::new(inputs[i].into()),
-            Node::Op(op, a, b) => op.eval_fr(values[a], values[b]),
+            Node::MontConstant(c) => *c,
+            Node::Input(i) => {
+                if *i < inputs.len() {
+                    Fr::new(inputs[*i].into())
+                } else {
+                    Fr::new(U256::MAX.into())
+                }
+            }
+            Node::Op(op, a, b) => op.eval_fr(values[*a], values[*b]),
+            Node::BBF(name, params) => {
+                if let Some(bbfs) = bbfs {
+                    let params = params.iter().map(|i| values[*i]).collect::<Vec<_>>();
+                    let name = strip_suffix_number(name.clone());
+                    if let Some(bbf) = bbfs.get(&name) {
+                        bbf(&params)
+                    } else {
+                        bail!("black box function {:?} not found", name);
+                    }
+                } else {
+                    bail!("no black box functions provided");
+                }
+            },
         };
         values.push(value);
     }
@@ -142,7 +205,7 @@ pub fn evaluate(nodes: &[Node], inputs: &[U256], outputs: &[usize]) -> Vec<U256>
         out[i] = U256::try_from(values[outputs[i]].into_bigint()).unwrap();
     }
 
-    out
+    Ok(out)
 }
 
 /// Constant propagation
@@ -151,7 +214,7 @@ pub fn propagate(nodes: &mut [Node]) {
     let mut constants = 0_usize;
     for i in 0..nodes.len() {
         if let Node::Op(op, a, b) = nodes[i] {
-            if let (Node::Constant(va), Node::Constant(vb)) = (nodes[a], nodes[b]) {
+            if let (Node::Constant(va), Node::Constant(vb)) = (nodes[a].clone(), nodes[b].clone()) {
                 nodes[i] = Node::Constant(op.eval(va, vb));
                 constants += 1;
             } else if a == b {
@@ -189,6 +252,11 @@ pub fn tree_shake(nodes: &mut Vec<Node>, outputs: &mut [usize]) {
                 used[a] = true;
                 used[b] = true;
             }
+            if let Node::BBF(_, params) = &nodes[i] {
+                for &param in params.iter() {
+                    used[param] = true;
+                }
+            }
         }
     }
 
@@ -218,6 +286,11 @@ pub fn tree_shake(nodes: &mut Vec<Node>, outputs: &mut [usize]) {
             *a = renumber[*a].unwrap();
             *b = renumber[*b].unwrap();
         }
+        if let Node::BBF(_, params) = node {
+            for param in params.iter_mut() {
+                *param = renumber[*param].unwrap();
+            }
+        }
     }
     for output in outputs.iter_mut() {
         *output = renumber[*output].unwrap();
@@ -235,15 +308,16 @@ fn random_eval(nodes: &mut Vec<Node>) -> Vec<U256> {
     for node in nodes.iter() {
         use Operation::*;
         let value = match node {
+            Node::BBF(_, _) => rng.gen::<U256>() % M,
             // Constants evaluate to themselves
             Node::Constant(c) => *c,
 
-            Node::MontConstant(c) => unimplemented!("should not be used"),
+            Node::MontConstant(_) => unimplemented!("should not be used"),
 
             // Algebraic Ops are evaluated directly
             // Since the field is large, by Swartz-Zippel if
             // two values are the same then they are likely algebraically equal.
-            Node::Op(op @ (Add | Sub | Mul), a, b) => op.eval(values[*a], values[*b]),
+            Node::Op(op @ (Add | Sub | Mul | Neg), a, b) => op.eval(values[*a], values[*b]),
 
             // Input and non-algebraic ops are random functions
             // TODO: https://github.com/recmo/uint/issues/95 and use .gen_range(..M)
@@ -321,8 +395,9 @@ pub fn montgomery_form(nodes: &mut [Node]) {
             Constant(c) => *node = MontConstant(Fr::new((*c).into())),
             MontConstant(..) => (),
             Input(..) => (),
-            Op(Add | Sub | Mul, ..) => (),
-            Op(..) => unimplemented!("Operators Montgomery form"),
+            Op(Add | Sub | Mul | Neg | Div, ..) => (),
+            Op(op, ..) => {println!("Operator {:?} not implemented for Montgomery form", op); unimplemented!("Operators Montgomery form")},
+            BBF(..) => (),
         }
     }
     eprintln!("Converted to Montgomery form");

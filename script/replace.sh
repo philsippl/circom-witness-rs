@@ -59,8 +59,17 @@ sed -e 's/FrElement\* signalValues/rust::Vec<FrElement> \&signalValues/g' \
     -e '/^#include/d' "$1" >> "$filename.new"
 
 
-sed -E -e 's/"([^"]+)"\+ctx->generate_position_array\(([^)]+)\)/generate_position_array("\1", \2)/g' \
-    -e 's/subcomponents = new uint\[([0-9]+)\]\{0\};/subcomponents = create_vec_u32(\1);/g' \
-    -e 's/^uint aux_dimensions\[([0-9]+)\] = \{([^}]+)\};$/rust::Vec<uint> aux_dimensions = rust::Vec<uint32_t>{\2};/' "$filename.new" > "src/circuit.cc"
+sed -E \
+  -e 's/"([^"]+)"\+ctx->generate_position_array\(([^)]+)\)/generate_position_array("\1", \2)/g' \
+  -e 's/subcomponents = new uint\[([0-9]+)\]\{0\};/subcomponents = create_vec_u32(\1);/g' \
+  -e 's/^uint aux_dimensions\[([0-9]+)\] = \{([^}]+)\};$/rust::Vec<uint> aux_dimensions = rust::Vec<uint32_t>{\2};/' \
+  -e ':b
+     # Only match function calls containing "bbf"
+     /^[[:space:]]*[A-Za-z0-9_]*bbf[A-Za-z0-9_]*\([^;]*\);[[:space:]]*$/{
+       N
+       s/^[[:space:]]*([A-Za-z0-9_]*bbf[A-Za-z0-9_]*)\([^,]+, *([^,]+), *[^,]+, *([^,]+), *[^)]*\);\n[[:space:]]*\/\/ end call bucket$/bbf("\1", \2, \3);\n\/\/ end call bucket/
+       bb
+     }' \
+  "$filename.new" > "src/circuit.cc"
 
 cp "$(echo $filename)_cpp/$filename.dat" src/constants.dat

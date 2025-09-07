@@ -1,12 +1,11 @@
 #![allow(non_snake_case)]
 
 use crate::field::{self, *};
-use crate::graph::{self, Node};
+use crate::{graph, M};
 use crate::HashSignalInfo;
 use byteorder::{LittleEndian, ReadBytesExt};
 use ffi::InputOutputList;
 use ruint::{aliases::U256, uint};
-use serde::{Deserialize, Serialize};
 use std::{io::Read, time::Instant};
 
 #[cxx::bridge]
@@ -14,14 +13,16 @@ mod ffi {
 
     #[derive(Debug, Default, Clone)]
     pub struct InputOutputList {
-        pub defs: Vec<IODef>,
+        pub defs: Vec<IOFieldDef>,
     }
 
     #[derive(Debug, Clone, Default)]
-    pub struct IODef {
+    pub struct IOFieldDef {
         pub code: usize,
         pub offset: usize,
         pub lengths: Vec<usize>,
+        pub size: u32,
+        pub busId: u32,
     }
 
     #[derive(Debug, Default, Clone)]
@@ -49,6 +50,7 @@ mod ffi {
     extern "Rust" {
         type FrElement;
 
+        unsafe fn bbf(component_name: String, lvarcall: &Vec<FrElement>, destination: *mut FrElement);
         fn create_vec(len: usize) -> Vec<FrElement>;
         fn create_vec_u32(len: usize) -> Vec<u32>;
         fn generate_position_array(
@@ -64,13 +66,14 @@ mod ffi {
         unsafe fn Fr_sub(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
         unsafe fn Fr_copy(to: *mut FrElement, a: *const FrElement);
         unsafe fn Fr_copyn(to: *mut FrElement, a: *const FrElement, n: usize);
-        // unsafe fn Fr_neg(to: *mut FrElement, a: *const FrElement);
-        // unsafe fn Fr_inv(to: *mut FrElement, a: *const FrElement);
-        // unsafe fn Fr_div(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
+        unsafe fn Fr_neg(to: *mut FrElement, a: *const FrElement);
+        unsafe fn Fr_inv(to: *mut FrElement, a: *const FrElement);
+        unsafe fn Fr_div(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
         // unsafe fn Fr_square(to: *mut FrElement, a: *const FrElement);
         unsafe fn Fr_shl(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
         unsafe fn Fr_shr(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
         unsafe fn Fr_band(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
+        unsafe fn Fr_land(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
         // fn Fr_bor(to: &mut FrElement, a: &FrElement, b: &FrElement);
         // fn Fr_bxor(to: &mut FrElement, a: &FrElement, b: &FrElement);
         // fn Fr_bnot(to: &mut FrElement, a: &FrElement);
@@ -85,8 +88,8 @@ mod ffi {
         unsafe fn Fr_toInt(a: *mut FrElement) -> u64;
         unsafe fn Fr_lor(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
         unsafe fn print(a: *mut FrElement);
-        // fn Fr_pow(to: &mut FrElement, a: &FrElement, b: &FrElement);
-        // fn Fr_idiv(to: &mut FrElement, a: &FrElement, b: &FrElement);
+        unsafe fn Fr_pow(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
+        unsafe fn Fr_idiv(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
     }
 
     // C++ types and signatures exposed to Rust.
@@ -129,7 +132,7 @@ pub fn get_witness_to_signal() -> Vec<usize> {
         ..(ffi::get_size_of_input_hashmap() as usize) * 24
             + (ffi::get_size_of_witness() as usize) * 8];
     let mut signal_list = Vec::with_capacity(ffi::get_size_of_witness() as usize);
-    for i in 0..ffi::get_size_of_witness() as usize {
+    for _ in 0..ffi::get_size_of_witness() as usize {
         signal_list.push(bytes.read_u64::<LittleEndian>().unwrap() as usize);
     }
     signal_list
@@ -149,10 +152,15 @@ pub fn get_constants() -> Vec<FrElement> {
         let typ = bytes.read_u32::<LittleEndian>().unwrap() as u32;
 
         let mut buf = [0; 32];
-        bytes.read_exact(&mut buf);
+        bytes.read_exact(&mut buf).unwrap();
 
         if typ & 0x80000000 == 0 {
-            constants[i] = field::constant(U256::from(sv));
+            let c = if sv < 0 {
+                M-U256::from(sv.abs() as u32)
+            } else {
+                U256::from(sv as u32)
+            };
+            constants[i] = field::constant(c);
         } else {
             constants[i] =
                 field::constant(U256::from_le_bytes(buf).mul_redc(uint!(1_U256), M, INV));
@@ -187,18 +195,23 @@ pub fn get_iosignals() -> Vec<InputOutputList> {
 
         (0..l32).for_each(|_j| {
             let offset = bytes.read_u32::<LittleEndian>().unwrap() as usize;
-            let len = bytes.read_u32::<LittleEndian>().unwrap() as usize + 1;
+            let len = bytes.read_u32::<LittleEndian>().unwrap() as usize;
 
             let mut lengths = vec![0usize; len];
 
-            (1..len).for_each(|k| {
+            (0..len).for_each(|k| {
                 lengths[k] = bytes.read_u32::<LittleEndian>().unwrap() as usize;
             });
 
-            io_list.defs.push(ffi::IODef {
+            let size = bytes.read_u32::<LittleEndian>().unwrap();
+            let busId = bytes.read_u32::<LittleEndian>().unwrap();
+
+            io_list.defs.push(ffi::IOFieldDef {
                 code: 0,
                 offset,
                 lengths,
+                size,
+                busId,
             });
         });
         map[indices[i] % hashmap_size] = io_list;
@@ -208,14 +221,17 @@ pub fn get_iosignals() -> Vec<InputOutputList> {
 
 /// Run cpp witness generator and optimize graph
 pub fn build_witness() -> eyre::Result<()> {
-    let mut signal_values = vec![field::undefined(); ffi::get_total_signal_no() as usize];
+    let mut signal_values = vec![];
+    for i in 0..ffi::get_total_signal_no() as usize {
+        signal_values.push(field::undefined(i));
+    }
     signal_values[0] = field::constant(uint!(1_U256));
 
-    let total_input_len =
-        (ffi::get_main_input_signal_no() + ffi::get_main_input_signal_start()) as usize;
+    let main_input_start = ffi::get_main_input_signal_start() as usize;
+    let main_input_len = ffi::get_main_input_signal_no() as usize;
 
-    for i in 0..total_input_len {
-        signal_values[i + 1] = field::input(i + 1, uint!(0_U256));
+    for i in main_input_start..main_input_start + main_input_len {
+        signal_values[i] = field::input(i, uint!(0_U256));
     }
 
     let mut ctx = ffi::Circom_CalcWit {
@@ -245,39 +261,13 @@ pub fn build_witness() -> eyre::Result<()> {
     eprintln!("Graph with {} nodes", nodes.len());
 
     // Optimize graph
-    graph::optimize(&mut nodes, &mut signals);
+    graph::optimize(&mut nodes, &mut signals); 
 
     // Store graph to file.
     let input_map = get_input_hash_map();
     let bytes = postcard::to_stdvec(&(&nodes, &signals, &input_map)).unwrap();
     eprintln!("Graph size: {} bytes", bytes.len());
     std::fs::write("graph.bin", bytes).unwrap();
-
-    // Evaluate the graph.
-    let input_len = (ffi::get_main_input_signal_no() + ffi::get_main_input_signal_start()) as usize; // TODO: fetch from file
-    let mut inputs = vec![U256::from(0); input_len];
-    inputs[0] = U256::from(1);
-    for i in 1..nodes.len() {
-        if let Node::Input(j) = nodes[i] {
-            inputs[j] = get_values()[i];
-        } else {
-            break;
-        }
-    }
-
-    let now = Instant::now();
-    for _ in 0..10 {
-        _ = graph::evaluate(&nodes, &inputs, &signals);
-    }
-    eprintln!("Calculation took: {:?}", now.elapsed() / 10);
-
-    // Print graph
-    // for (i, node) in nodes.iter().enumerate() {
-    //     println!("node[{}] = {:?}", i, node);
-    // }
-    // for (i, j) in signals.iter().enumerate() {
-    //     println!("signal[{}] = node[{}]", i, j);
-    // }
 
     Ok(())
 }

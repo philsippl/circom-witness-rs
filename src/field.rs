@@ -1,13 +1,9 @@
-use crate::graph::{Node, Operation};
-use ruint::{aliases::U256, uint};
+use crate::{graph::{Node, Operation}, M};
+use rand::Rng;
+use ruint::aliases::U256;
 use std::{ptr, sync::Mutex};
 
-pub const M: U256 =
-    uint!(21888242871839275222246405745257275088548364400416034343698204186575808495617_U256);
-
 pub const INV: u64 = 14042775128853446655;
-
-pub const R: U256 = uint!(0x0e0a77c19a07df2f666ea36f7879462e36fc76959f60cd29ac96341c4ffffffb_U256);
 
 static NODES: Mutex<Vec<Node>> = Mutex::new(Vec::new());
 static VALUES: Mutex<Vec<U256>> = Mutex::new(Vec::new());
@@ -16,6 +12,7 @@ static CONSTANT: Mutex<Vec<bool>> = Mutex::new(Vec::new());
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FrElement(pub usize);
 
+#[allow(warnings)]
 pub fn print_eval() {
     let nodes = NODES.lock().unwrap();
     let values = VALUES.lock().unwrap();
@@ -43,12 +40,8 @@ pub fn get_graph() -> Vec<Node> {
     NODES.lock().unwrap().clone()
 }
 
-pub fn get_values() -> Vec<U256> {
-    VALUES.lock().unwrap().clone()
-}
-
-pub fn undefined() -> FrElement {
-    FrElement(usize::MAX)
+pub fn undefined(i: usize) -> FrElement {
+    FrElement(i)
 }
 
 pub fn constant(c: U256) -> FrElement {
@@ -99,6 +92,7 @@ fn binop(op: Operation, to: *mut FrElement, a: *const FrElement, b: *const FrEle
     constant.push(ca && cb);
 }
 
+#[allow(warnings)]
 pub fn Fr_mul(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
     binop(Operation::Mul, to, a, b);
 }
@@ -129,14 +123,17 @@ pub fn Fr_copyn(to: *mut FrElement, a: *const FrElement, n: usize) {
 
 /// Create a vector of FrElement with length `len`.
 /// Needed because the default constructor of opaque type is not implemented.
+#[allow(warnings)]
 pub fn create_vec(len: usize) -> Vec<FrElement> {
-    vec![FrElement(usize::MAX); len]
+    (0..len).map(|i| FrElement(i)).collect()
 }
 
+#[allow(warnings)]
 pub fn create_vec_u32(len: usize) -> Vec<u32> {
     vec![0; len]
 }
 
+#[allow(warnings)]
 pub fn generate_position_array(
     prefix: String,
     dimensions: Vec<u32>,
@@ -154,6 +151,7 @@ pub fn generate_position_array(
     positions
 }
 
+#[allow(warnings)]
 pub unsafe fn Fr_toInt(a: *const FrElement) -> u64 {
     let nodes = NODES.lock().unwrap();
     let values = VALUES.lock().unwrap();
@@ -167,10 +165,12 @@ pub unsafe fn Fr_toInt(a: *const FrElement) -> u64 {
     values[a].try_into().unwrap()
 }
 
+#[allow(warnings)]
 pub unsafe fn print(a: *const FrElement) {
     println!("DEBUG>> {:?}", (*a).0);
 }
 
+#[allow(warnings)]
 pub fn Fr_isTrue(a: *mut FrElement) -> bool {
     let nodes = NODES.lock().unwrap();
     let values = VALUES.lock().unwrap();
@@ -184,42 +184,101 @@ pub fn Fr_isTrue(a: *mut FrElement) -> bool {
     values[a] != U256::ZERO
 }
 
+#[allow(warnings)]
 pub unsafe fn Fr_eq(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
     binop(Operation::Eq, to, a, b);
 }
 
+#[allow(warnings)]
 pub unsafe fn Fr_neq(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
     binop(Operation::Neq, to, a, b);
 }
 
+#[allow(warnings)]
 pub unsafe fn Fr_lt(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
     binop(Operation::Lt, to, a, b);
 }
 
+#[allow(warnings)]
 pub unsafe fn Fr_gt(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
     binop(Operation::Gt, to, a, b);
 }
 
+#[allow(warnings)]
 pub unsafe fn Fr_leq(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
     binop(Operation::Leq, to, a, b);
 }
 
+#[allow(warnings)]
 pub unsafe fn Fr_geq(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
     binop(Operation::Geq, to, a, b);
 }
 
+#[allow(warnings)]
 pub unsafe fn Fr_lor(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
     binop(Operation::Lor, to, a, b);
 }
 
+#[allow(warnings)]
 pub unsafe fn Fr_shl(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
     binop(Operation::Shl, to, a, b);
 }
 
+#[allow(warnings)]
 pub unsafe fn Fr_shr(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
     binop(Operation::Shr, to, a, b);
 }
 
+#[allow(warnings)]
 pub unsafe fn Fr_band(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
     binop(Operation::Band, to, a, b);
+}
+
+#[allow(warnings)]
+pub unsafe fn Fr_neg(to: *mut FrElement, a: *const FrElement) {
+    binop(Operation::Neg, to, a, a);
+}
+
+#[allow(warnings)]
+pub unsafe fn Fr_inv(to: *mut FrElement, a: *const FrElement) {
+    binop(Operation::Inv, to, a, a);
+}
+
+#[allow(warnings)]
+pub unsafe fn Fr_div(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
+    binop(Operation::Div, to, a, b);
+}
+
+#[allow(warnings)]
+pub unsafe fn Fr_pow(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
+    binop(Operation::Pow, to, a, b);
+}
+
+#[allow(warnings)]
+pub unsafe fn Fr_land(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
+    binop(Operation::Land, to, a, b);
+}
+
+#[allow(warnings)]
+pub unsafe fn Fr_idiv(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
+    binop(Operation::IDiv, to, a, b);
+}
+
+#[allow(warnings)]
+pub unsafe fn bbf(component_name: String, lvarcall: &Vec<FrElement>, destination: *mut FrElement) {
+    let mut nodes = NODES.lock().unwrap();
+    let mut values = VALUES.lock().unwrap();
+    let mut constant = CONSTANT.lock().unwrap();
+    assert_eq!(nodes.len(), values.len());
+    assert_eq!(nodes.len(), constant.len());
+
+    let params = lvarcall.iter().map(|x| x.0).collect();
+    nodes.push(Node::BBF(component_name, params));
+    let destination = unsafe { &mut (*destination).0 };
+    *destination = nodes.len() - 1;
+
+    let mut rng = rand::thread_rng();
+    values.push(rng.gen::<U256>() % M);
+
+    constant.push(false);
 }

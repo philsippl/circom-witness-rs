@@ -1,15 +1,23 @@
-mod field;
 pub mod graph;
 
 #[cfg(feature = "build-witness")]
 pub mod generate;
 
-use std::collections::HashMap;
+#[cfg(feature = "build-witness")]
+mod field;
 
-use ruint::aliases::U256;
+use std::{collections::HashMap, sync::Arc};
+
+use ark_bn254::Fr;
+use ruint::{uint, aliases::U256};
 use serde::{Deserialize, Serialize};
 
 use crate::graph::Node;
+
+pub type BlackBoxFunction = Arc<dyn Fn(&[Fr]) -> Fr + Send + Sync + 'static>;
+
+pub const M: U256 =
+    uint!(21888242871839275222246405745257275088548364400416034343698204186575808495617_U256);
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct HashSignalInfo {
@@ -49,10 +57,10 @@ pub fn init_graph(graph_bytes: &[u8]) -> eyre::Result<Graph> {
 pub fn get_inputs_size(graph: &Graph) -> usize {
     let mut start = false;
     let mut max_index = 0usize;
-    for &node in graph.nodes.iter() {
+    for node in graph.nodes.iter() {
         if let Node::Input(i) = node {
-            if i > max_index {
-                max_index = i;
+            if *i > max_index {
+                max_index = *i;
             }
             start = true
         } else if start {
@@ -102,13 +110,15 @@ pub fn populate_inputs(
 pub fn calculate_witness(
     input_list: HashMap<String, Vec<U256>>,
     graph: &Graph,
+    bbfs: Option<&HashMap<String, BlackBoxFunction>>,
 ) -> eyre::Result<Vec<U256>> {
     let mut inputs_buffer = get_inputs_buffer(get_inputs_size(graph));
     let input_mapping = get_input_mapping(&input_list.keys().cloned().collect(), graph);
     populate_inputs(&input_list, &input_mapping, &mut inputs_buffer);
-    Ok(graph::evaluate(
+    graph::evaluate(
         &graph.nodes,
         &inputs_buffer,
         &graph.signals,
-    ))
+        bbfs,
+    )
 }
