@@ -34,10 +34,12 @@ fn main() {
 
 Unconstrained control flow is also supported through configurable blackbox functions. This also includes the commonly requested ternary operator. Importantly, any unconstained / dynamic control flow needs to live in circom functions (i.e. cannot live in templates), so requires small modifications to existing circuits. Those functions are currently limited to a single return value. 
 
+*Important:* Those functions only get hooked iff you prefix them with `bbf*`.
+
 ```rust
     let mut bbfs: HashMap<String, BlackBoxFunction> = HashMap::new();
     // Instead of a closure, this can also be a function
-     bbfs.insert("bbf_inv".to_string(), Arc::new(move |args: &[Fr]| -> Fr {
+    bbfs.insert("bbf_inv".to_string(), Arc::new(move |args: &[Fr]| -> Fr {
         // Circom code:
         // function bbf_inv(in) {
         //     return in!=0 ? 1/in : 0;
