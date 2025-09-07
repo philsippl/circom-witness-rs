@@ -1,7 +1,7 @@
 #![allow(non_snake_case)]
 
 use crate::field::{self, *};
-use crate::graph::{self, Node};
+use crate::{graph, M};
 use crate::HashSignalInfo;
 use byteorder::{LittleEndian, ReadBytesExt};
 use ffi::InputOutputList;
@@ -132,7 +132,7 @@ pub fn get_witness_to_signal() -> Vec<usize> {
         ..(ffi::get_size_of_input_hashmap() as usize) * 24
             + (ffi::get_size_of_witness() as usize) * 8];
     let mut signal_list = Vec::with_capacity(ffi::get_size_of_witness() as usize);
-    for i in 0..ffi::get_size_of_witness() as usize {
+    for _ in 0..ffi::get_size_of_witness() as usize {
         signal_list.push(bytes.read_u64::<LittleEndian>().unwrap() as usize);
     }
     signal_list
@@ -152,7 +152,7 @@ pub fn get_constants() -> Vec<FrElement> {
         let typ = bytes.read_u32::<LittleEndian>().unwrap() as u32;
 
         let mut buf = [0; 32];
-        bytes.read_exact(&mut buf);
+        bytes.read_exact(&mut buf).unwrap();
 
         if typ & 0x80000000 == 0 {
             let c = if sv < 0 {

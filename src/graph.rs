@@ -1,16 +1,15 @@
 use std::{
-    collections::HashMap,
-    ops::{BitAnd, Shl, Shr},
+    cmp::Ordering, collections::HashMap, ops::Shr
 };
 
-use crate::{arith::*, field::M, BlackBoxFunction};
+use crate::{BlackBoxFunction, M};
 use ark_bn254::Fr;
 use ark_ff::PrimeField;
 use eyre::bail;
 use rand::Rng;
 use ruint::aliases::U256;
+use ruint::uint;
 use serde::{Deserialize, Serialize};
-use num_bigint::BigInt;
 
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress, Validate};
 
@@ -67,35 +66,47 @@ pub enum Node {
     BBF(String, Vec<usize>),
 }
 
+fn cmp_balanced(a: U256, b: U256) -> Ordering {
+    match (a > M.shr(1), b > M.shr(1)) {
+        (false, true)  => Ordering::Greater,
+        (true,  false) => Ordering::Less,
+        (false, false) => a.cmp(&b),
+        (true,  true)  => {
+            // both negative: compare reversed
+            let ma = M - a;
+            let mb = M - b;
+            mb.cmp(&ma)
+        }
+    }
+}
+
 impl Operation {
     pub fn eval(&self, a: U256, b: U256) -> U256 {
-        let m = M.into();
-        let a = a.into();
-        let b = b.into();
+        let a = a % M;
+        let b = b % M;
         use Operation::*;
-        let res = match self {
-            Add => add(&a, &b, &m),
-            Sub => sub(&a, &b, &m),
-            Mul => mul(&a, &b, &m),
-            Eq => eq(&a, &b, &m),
-            Neq => not_eq(&a, &b, &m),
-            Lt => lesser(&a, &b, &m),
-            Gt => greater(&a, &b, &m),
-            Leq => lesser_eq(&a, &b, &m),
-            Geq => greater_eq(&a, &b, &m),
-            Lor => bool_or(&a, &b, &m),
-            Shl => shift_l(&a, &b, &m).unwrap_or(BigInt::from(0)),
-            Shr => shift_r(&a, &b, &m).unwrap_or(BigInt::from(0)),
-            Band => bit_and(&a, &b, &m),
-            Neg => m - &a,
-            Inv => a.modinv(&m).unwrap_or(BigInt::from(0)),
-            Div => div(&a, &b, &m).unwrap_or(BigInt::from(0)),
-            Pow => pow(&a, &b, &m),
-            Land => bool_and(&a, &b, &m),
-            IDiv => idiv(&a, &b, &m).unwrap_or(BigInt::from(0)),
+        match self {
+            Add => a.add_mod(b, M),
+            Sub => a.add_mod(M - b, M),
+            Mul => a.mul_mod(b, M),
+            Eq => U256::from(a == b),
+            Neq => U256::from(a != b),
+            Lt => U256::from(cmp_balanced(a, b).is_lt()),
+            Gt => U256::from(cmp_balanced(a, b).is_gt()),
+            Leq => U256::from(cmp_balanced(a, b).is_le()),
+            Geq => U256::from(cmp_balanced(a, b).is_ge()),
+            Lor => U256::from(a != U256::ZERO || b != U256::ZERO),
+            Shl => compute_shl(a, b),
+            Shr => compute_shr(a, b),
+            Band => a.bitand(b) % M,
+            Land => U256::from(a != U256::ZERO && b != U256::ZERO),
+            Neg => (M - a) % M,
+            Inv => a.inv_mod(M).unwrap(),
+            Div => a.mul_mod(b.inv_mod(M).unwrap(), M),
+            Pow => a.pow_mod(b, M),
+            IDiv => a / b,
             _ => unimplemented!("operator {:?} not implemented", self),
-        };
-        res.try_into().unwrap()
+        }
     }
 
     pub fn eval_fr(&self, a: Fr, b: Fr) -> Fr {
@@ -112,16 +123,17 @@ impl Operation {
     }
 }
 
-fn compute_shl_uint(a: U256, b: U256) -> U256 {
-    debug_assert!(b.lt(&U256::from(256)));
-    let ls_limb = b.as_limbs()[0];
-    a.shl(ls_limb as usize)
+fn compute_shl(a: U256, b: U256) -> U256 {
+    assert!(b < uint!(256));
+    let s = b.as_limbs()[0] as usize;
+    let mask = (U256::ONE << 254) - U256::ONE;
+    ((a << s) & mask) % M
 }
 
-fn compute_shr_uint(a: U256, b: U256) -> U256 {
-    debug_assert!(b.lt(&U256::from(256)));
-    let ls_limb = b.as_limbs()[0];
-    a.shr(ls_limb as usize)
+fn compute_shr(a: U256, b: U256) -> U256 {
+    assert!(b < uint!(256));
+    let s = b.as_limbs()[0] as usize;
+    (a >> s) % M
 }
 
 /// All references must be backwards.
@@ -300,7 +312,7 @@ fn random_eval(nodes: &mut Vec<Node>) -> Vec<U256> {
             // Constants evaluate to themselves
             Node::Constant(c) => *c,
 
-            Node::MontConstant(c) => unimplemented!("should not be used"),
+            Node::MontConstant(_) => unimplemented!("should not be used"),
 
             // Algebraic Ops are evaluated directly
             // Since the field is large, by Swartz-Zippel if

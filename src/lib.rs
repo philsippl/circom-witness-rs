@@ -1,20 +1,23 @@
-mod field;
-mod arith;
 pub mod graph;
 
 #[cfg(feature = "build-witness")]
 pub mod generate;
 
+#[cfg(feature = "build-witness")]
+mod field;
+
 use std::{collections::HashMap, sync::Arc};
 
 use ark_bn254::Fr;
-use ruint::aliases::U256;
+use ruint::{uint, aliases::U256};
 use serde::{Deserialize, Serialize};
 
 use crate::graph::Node;
 
 pub type BlackBoxFunction = Arc<dyn Fn(&[Fr]) -> Fr + Send + Sync + 'static>;
 
+pub const M: U256 =
+    uint!(21888242871839275222246405745257275088548364400416034343698204186575808495617_U256);
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct HashSignalInfo {
