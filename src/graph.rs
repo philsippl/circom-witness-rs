@@ -356,6 +356,12 @@ pub fn value_numbering(nodes: &mut Vec<Node>, outputs: &mut [usize]) {
             *a = renumber[*a];
             *b = renumber[*b];
         }
+
+        if let Node::BBF(_, params) = node {
+            for p in params.iter_mut() {
+                *p = renumber[*p];
+            }
+        }
     }
     for output in outputs.iter_mut() {
         *output = renumber[*output];

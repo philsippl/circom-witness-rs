@@ -182,12 +182,14 @@ pub fn get_iosignals() -> Vec<InputOutputList> {
     let io_size = ffi::get_size_of_io_map() as usize;
     let hashmap_size = ffi::get_size_of_input_hashmap() as usize;
     let mut indices = vec![0usize; io_size];
-    let mut map: Vec<InputOutputList> = vec![InputOutputList::default(); hashmap_size];
 
     (0..io_size).for_each(|i| {
         let t32 = bytes.read_u32::<LittleEndian>().unwrap() as usize;
         indices[i] = t32;
     });
+
+    let max_index = indices.iter().max().unwrap();
+    let mut map: Vec<InputOutputList> = vec![InputOutputList::default(); *max_index + 1];
 
     (0..io_size).for_each(|i| {
         let l32 = bytes.read_u32::<LittleEndian>().unwrap() as usize;
@@ -214,7 +216,7 @@ pub fn get_iosignals() -> Vec<InputOutputList> {
                 busId,
             });
         });
-        map[indices[i] % hashmap_size] = io_list;
+        map[indices[i]] = io_list;
     });
     map
 }
