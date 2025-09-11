@@ -23,7 +23,7 @@ public:
       : calcWitContext(calcWit) {}
   auto operator[](size_t index) const -> decltype(auto) {
     return (calcWitContext
-                ->templateInsId2IOSignalInfoList)[index % get_size_of_input_hashmap()];
+                ->templateInsId2IOSignalInfoList)[index];
   }
 };
 
