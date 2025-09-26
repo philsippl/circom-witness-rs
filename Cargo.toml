@@ -14,7 +14,7 @@ eyre = "0.6.5"
 hex = "0.4.3"
 postcard = { version = "1.0.8", features = ["use-std"], default-features = false }
 rand = "0.8.5"
-ruint = { git = "https://github.com/recmo/uint.git", rev = "92e277f", features = ["rand", "serde", "ark-ff-05", "num-bigint"] } # use git until ark-ff-05 support is released
+ruint = { version = "1.17.0", features = ["rand", "serde", "ark-ff-05", "num-bigint"] }
 serde = { version = "1.0.190", features = ["derive"] }
 serde_json = "1.0.64"
 num-bigint = "0.4"
