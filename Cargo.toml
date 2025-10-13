@@ -6,6 +6,10 @@ edition = "2021"
 license = "MIT"
 keywords = ["cryptography", "ZK", "circom"]
 categories = ["cryptography"]
+repository = "https://github.com/philsippl/circom-witness-rs"
+authors = [
+  "Philipp Sippl <philipp@worldcoin.org>",
+]
 
 [dependencies]
 ark-bn254 = { version = "0.5", features = ["std"] }
