@@ -1,6 +1,4 @@
-use std::{
-    cmp::Ordering, collections::HashMap, ops::Shr
-};
+use std::{cmp::Ordering, collections::HashMap, ops::Shr};
 
 use crate::{BlackBoxFunction, M};
 use ark_bn254::Fr;
@@ -68,10 +66,10 @@ pub enum Node {
 
 fn cmp_balanced(a: U256, b: U256) -> Ordering {
     match (a > M.shr(1), b > M.shr(1)) {
-        (false, true)  => Ordering::Greater,
-        (true,  false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (true, false) => Ordering::Less,
         (false, false) => a.cmp(&b),
-        (true,  true)  => {
+        (true, true) => {
             // both negative: compare reversed
             let ma = M - a;
             let mb = M - b;
@@ -165,12 +163,17 @@ fn strip_suffix_number(s: String) -> String {
     s
 }
 
-pub fn evaluate(nodes: &[Node], inputs: &[U256], outputs: &[usize], bbfs: Option<&HashMap<String, BlackBoxFunction>>) -> eyre::Result<Vec<U256>> {
+pub fn evaluate(
+    nodes: &[Node],
+    inputs: &[U256],
+    outputs: &[usize],
+    bbfs: Option<&HashMap<String, BlackBoxFunction>>,
+) -> eyre::Result<Vec<U256>> {
     assert_valid(nodes);
 
     // Evaluate the graph.
     let mut values = Vec::with_capacity(nodes.len());
-    for (_, node) in nodes.iter().enumerate() {
+    for node in nodes.iter() {
         let value = match node {
             Node::Constant(c) => Fr::new(c.into()),
             Node::MontConstant(c) => *c,
@@ -194,7 +197,7 @@ pub fn evaluate(nodes: &[Node], inputs: &[U256], outputs: &[usize], bbfs: Option
                 } else {
                     bail!("no black box functions provided");
                 }
-            },
+            }
         };
         values.push(value);
     }
@@ -300,7 +303,7 @@ pub fn tree_shake(nodes: &mut Vec<Node>, outputs: &mut [usize]) {
 }
 
 /// Randomly evaluate the graph
-fn random_eval(nodes: &mut Vec<Node>) -> Vec<U256> {
+fn random_eval(nodes: &mut [Node]) -> Vec<U256> {
     let mut rng = rand::thread_rng();
     let mut values = Vec::with_capacity(nodes.len());
     let mut inputs = HashMap::new();
@@ -332,7 +335,7 @@ fn random_eval(nodes: &mut Vec<Node>) -> Vec<U256> {
 }
 
 /// Value numbering
-pub fn value_numbering(nodes: &mut Vec<Node>, outputs: &mut [usize]) {
+pub fn value_numbering(nodes: &mut [Node], outputs: &mut [usize]) {
     assert_valid(nodes);
 
     // Evaluate the graph in random field elements.
@@ -371,7 +374,7 @@ pub fn value_numbering(nodes: &mut Vec<Node>, outputs: &mut [usize]) {
 }
 
 /// Probabilistic constant determination
-pub fn constants(nodes: &mut Vec<Node>) {
+pub fn constants(nodes: &mut [Node]) {
     assert_valid(nodes);
 
     // Evaluate the graph in random field elements.
@@ -389,7 +392,7 @@ pub fn constants(nodes: &mut Vec<Node>) {
             constants += 1;
         }
     }
-    eprintln!("Found {} constants", constants);
+    eprintln!("Found {constants} constants");
 }
 
 /// Convert to Montgomery form
@@ -402,7 +405,10 @@ pub fn montgomery_form(nodes: &mut [Node]) {
             MontConstant(..) => (),
             Input(..) => (),
             Op(Add | Sub | Mul | Neg | Div, ..) => (),
-            Op(op, ..) => {println!("Operator {:?} not implemented for Montgomery form", op); unimplemented!("Operators Montgomery form")},
+            Op(op, ..) => {
+                println!("Operator {op:?} not implemented for Montgomery form");
+                unimplemented!("Operators Montgomery form")
+            }
             BBF(..) => (),
         }
     }
