@@ -73,6 +73,7 @@ mod ffi {
         unsafe fn Fr_neg(to: *mut FrElement, a: *const FrElement);
         unsafe fn Fr_inv(to: *mut FrElement, a: *const FrElement);
         unsafe fn Fr_div(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
+        unsafe fn Fr_mod(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
         // unsafe fn Fr_square(to: *mut FrElement, a: *const FrElement);
         unsafe fn Fr_shl(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
         unsafe fn Fr_shr(to: *mut FrElement, a: *const FrElement, b: *const FrElement);
