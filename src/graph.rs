@@ -2,7 +2,6 @@ use std::{cmp::Ordering, collections::HashMap, ops::Shr};
 
 use crate::{BlackBoxFunction, M};
 use ark_bn254::Fr;
-use ark_ff::PrimeField;
 use eyre::bail;
 use rand::Rng;
 use ruint::aliases::U256;
@@ -173,7 +172,7 @@ pub fn evaluate(
 
     // Evaluate the graph.
     let mut values = Vec::with_capacity(nodes.len());
-    for (_, node) in nodes.iter().enumerate() {
+    for node in nodes.iter() {
         let value = match node {
             Node::Constant(c) => Fr::new(c.into()),
             Node::MontConstant(c) => *c,
@@ -205,7 +204,7 @@ pub fn evaluate(
     // Convert from Montgomery form and return the outputs.
     let mut out = vec![U256::ZERO; outputs.len()];
     for i in 0..outputs.len() {
-        out[i] = U256::try_from(values[outputs[i]].into_bigint()).unwrap();
+        out[i] = values[outputs[i]].into();
     }
 
     Ok(out)
@@ -303,7 +302,7 @@ pub fn tree_shake(nodes: &mut Vec<Node>, outputs: &mut [usize]) {
 }
 
 /// Randomly evaluate the graph
-fn random_eval(nodes: &mut Vec<Node>) -> Vec<U256> {
+fn random_eval(nodes: &mut [Node]) -> Vec<U256> {
     let mut rng = rand::thread_rng();
     let mut values = Vec::with_capacity(nodes.len());
     let mut inputs = HashMap::new();
@@ -335,7 +334,7 @@ fn random_eval(nodes: &mut Vec<Node>) -> Vec<U256> {
 }
 
 /// Value numbering
-pub fn value_numbering(nodes: &mut Vec<Node>, outputs: &mut [usize]) {
+pub fn value_numbering(nodes: &mut [Node], outputs: &mut [usize]) {
     assert_valid(nodes);
 
     // Evaluate the graph in random field elements.
@@ -374,7 +373,7 @@ pub fn value_numbering(nodes: &mut Vec<Node>, outputs: &mut [usize]) {
 }
 
 /// Probabilistic constant determination
-pub fn constants(nodes: &mut Vec<Node>) {
+pub fn constants(nodes: &mut [Node]) {
     assert_valid(nodes);
 
     // Evaluate the graph in random field elements.

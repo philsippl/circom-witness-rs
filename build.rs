@@ -9,9 +9,8 @@ fn main() {
 
         let mut cmd = Command::new("circom");
         cmd.arg(fs::canonicalize(circuit_file).unwrap()).arg("--c");
-        if library_path.is_ok() {
-            cmd.arg("-l")
-                .arg(fs::canonicalize(library_path.unwrap()).unwrap());
+        if let Ok(library_path) = library_path {
+            cmd.arg("-l").arg(fs::canonicalize(library_path).unwrap());
         }
         let status = cmd.status().unwrap();
         assert!(status.success());

@@ -97,7 +97,7 @@ pub fn get_input_mapping(input_list: &Vec<String>, graph: &Graph) -> HashMap<Str
 pub fn populate_inputs(
     input_list: &HashMap<String, Vec<U256>>,
     input_mapping: &HashMap<String, usize>,
-    input_buffer: &mut Vec<U256>,
+    input_buffer: &mut [U256],
 ) {
     for (key, value) in input_list {
         let start = input_mapping[key];
