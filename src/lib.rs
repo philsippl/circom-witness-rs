@@ -9,7 +9,7 @@ mod field;
 use std::{collections::HashMap, sync::Arc};
 
 use ark_bn254::Fr;
-use ruint::{uint, aliases::U256};
+use ruint::{aliases::U256, uint};
 use serde::{Deserialize, Serialize};
 
 use crate::graph::Node;
@@ -97,7 +97,7 @@ pub fn get_input_mapping(input_list: &Vec<String>, graph: &Graph) -> HashMap<Str
 pub fn populate_inputs(
     input_list: &HashMap<String, Vec<U256>>,
     input_mapping: &HashMap<String, usize>,
-    input_buffer: &mut Vec<U256>,
+    input_buffer: &mut [U256],
 ) {
     for (key, value) in input_list {
         let start = input_mapping[key];
@@ -115,10 +115,5 @@ pub fn calculate_witness(
     let mut inputs_buffer = get_inputs_buffer(get_inputs_size(graph));
     let input_mapping = get_input_mapping(&input_list.keys().cloned().collect(), graph);
     populate_inputs(&input_list, &input_mapping, &mut inputs_buffer);
-    graph::evaluate(
-        &graph.nodes,
-        &inputs_buffer,
-        &graph.signals,
-        bbfs,
-    )
+    graph::evaluate(&graph.nodes, &inputs_buffer, &graph.signals, bbfs)
 }

@@ -1,8 +1,8 @@
 #![allow(non_snake_case)]
 
 use crate::field::{self, *};
-use crate::{graph, M};
 use crate::HashSignalInfo;
+use crate::{graph, M};
 use byteorder::{LittleEndian, ReadBytesExt};
 use ffi::InputOutputList;
 use ruint::{aliases::U256, uint};
@@ -50,7 +50,11 @@ mod ffi {
     extern "Rust" {
         type FrElement;
 
-        unsafe fn bbf(component_name: String, lvarcall: &Vec<FrElement>, destination: *mut FrElement);
+        unsafe fn bbf(
+            component_name: String,
+            lvarcall: &Vec<FrElement>,
+            destination: *mut FrElement,
+        );
         fn create_vec(len: usize) -> Vec<FrElement>;
         fn create_vec_u32(len: usize) -> Vec<u32>;
         fn generate_position_array(
@@ -156,7 +160,7 @@ pub fn get_constants() -> Vec<FrElement> {
 
         if typ & 0x80000000 == 0 {
             let c = if sv < 0 {
-                M-U256::from(sv.abs() as u32)
+                M - U256::from(sv.abs() as u32)
             } else {
                 U256::from(sv as u32)
             };
@@ -263,7 +267,7 @@ pub fn build_witness() -> eyre::Result<()> {
     eprintln!("Graph with {} nodes", nodes.len());
 
     // Optimize graph
-    graph::optimize(&mut nodes, &mut signals); 
+    graph::optimize(&mut nodes, &mut signals);
 
     // Store graph to file.
     let input_map = get_input_hash_map();
