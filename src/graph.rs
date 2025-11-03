@@ -1,6 +1,4 @@
-use std::{
-    cmp::Ordering, collections::HashMap, ops::Shr
-};
+use std::{cmp::Ordering, collections::HashMap, ops::Shr};
 
 use crate::{BlackBoxFunction, M};
 use ark_bn254::Fr;
@@ -68,10 +66,10 @@ pub enum Node {
 
 fn cmp_balanced(a: U256, b: U256) -> Ordering {
     match (a > M.shr(1), b > M.shr(1)) {
-        (false, true)  => Ordering::Greater,
-        (true,  false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (true, false) => Ordering::Less,
         (false, false) => a.cmp(&b),
-        (true,  true)  => {
+        (true, true) => {
             // both negative: compare reversed
             let ma = M - a;
             let mb = M - b;
@@ -165,7 +163,12 @@ fn strip_suffix_number(s: String) -> String {
     s
 }
 
-pub fn evaluate(nodes: &[Node], inputs: &[U256], outputs: &[usize], bbfs: Option<&HashMap<String, BlackBoxFunction>>) -> eyre::Result<Vec<U256>> {
+pub fn evaluate(
+    nodes: &[Node],
+    inputs: &[U256],
+    outputs: &[usize],
+    bbfs: Option<&HashMap<String, BlackBoxFunction>>,
+) -> eyre::Result<Vec<U256>> {
     assert_valid(nodes);
 
     // Evaluate the graph.
@@ -194,7 +197,7 @@ pub fn evaluate(nodes: &[Node], inputs: &[U256], outputs: &[usize], bbfs: Option
                 } else {
                     bail!("no black box functions provided");
                 }
-            },
+            }
         };
         values.push(value);
     }
@@ -402,7 +405,10 @@ pub fn montgomery_form(nodes: &mut [Node]) {
             MontConstant(..) => (),
             Input(..) => (),
             Op(Add | Sub | Mul | Neg | Div, ..) => (),
-            Op(op, ..) => {println!("Operator {:?} not implemented for Montgomery form", op); unimplemented!("Operators Montgomery form")},
+            Op(op, ..) => {
+                println!("Operator {:?} not implemented for Montgomery form", op);
+                unimplemented!("Operators Montgomery form")
+            }
             BBF(..) => (),
         }
     }

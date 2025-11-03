@@ -1,4 +1,7 @@
-use crate::{graph::{Node, Operation}, M};
+use crate::{
+    graph::{Node, Operation},
+    M,
+};
 use rand::Rng;
 use ruint::aliases::U256;
 use std::{ptr, sync::Mutex};
