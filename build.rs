@@ -8,7 +8,9 @@ fn main() {
         let circuit_name = circuit_file.file_stem().unwrap().to_str().unwrap();
 
         let mut cmd = Command::new("circom");
-        cmd.arg(fs::canonicalize(circuit_file).unwrap()).arg("--c");
+        cmd.arg(fs::canonicalize(circuit_file).unwrap())
+            .arg("--c")
+            .arg("--O2");
         if let Ok(library_path) = library_path {
             cmd.arg("-l").arg(fs::canonicalize(library_path).unwrap());
         }

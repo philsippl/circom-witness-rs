@@ -7,3 +7,4 @@ constants.dat
 .idea
 Cargo.lock
 .claude
+*.bin

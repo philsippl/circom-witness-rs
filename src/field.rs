@@ -1,4 +1,7 @@
-use crate::{graph::{Node, Operation}, M};
+use crate::{
+    graph::{Node, Operation},
+    M,
+};
 use rand::Rng;
 use ruint::aliases::U256;
 use std::{ptr, sync::Mutex};
@@ -247,6 +250,11 @@ pub unsafe fn Fr_inv(to: *mut FrElement, a: *const FrElement) {
 #[allow(warnings)]
 pub unsafe fn Fr_div(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
     binop(Operation::Div, to, a, b);
+}
+
+#[allow(warnings)]
+pub unsafe fn Fr_mod(to: *mut FrElement, a: *const FrElement, b: *const FrElement) {
+    binop(Operation::Mod, to, a, b);
 }
 
 #[allow(warnings)]
