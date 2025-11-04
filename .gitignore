@@ -6,4 +6,5 @@ circuit.cc
 constants.dat
 .idea
 Cargo.lock
+.claude
 *.bin

@@ -404,7 +404,7 @@ pub fn constants(nodes: &mut [Node]) {
             constants += 1;
         }
     }
-    eprintln!("Found {} constants", constants);
+    eprintln!("Found {constants} constants");
 }
 
 /// Convert to Montgomery form
