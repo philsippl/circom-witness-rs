@@ -35,7 +35,7 @@ fn main() {
             .flag_if_supported("-w")
             .flag_if_supported("-d")
             .flag_if_supported("-g")
-            .compile("witness");
+            .compile("circom-witness-rs");
 
         println!("cargo:rerun-if-changed=src/main.rs");
         println!("cargo:rerun-if-changed=src/circuit.cc");

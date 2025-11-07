@@ -99,7 +99,7 @@ mod ffi {
 
     // C++ types and signatures exposed to Rust.
     unsafe extern "C++" {
-        include!("witness/include/witness.h");
+        include!("circom-witness-rs/include/witness.h");
 
         unsafe fn run(ctx: *mut Circom_CalcWit);
         fn get_size_of_io_map() -> u32;
