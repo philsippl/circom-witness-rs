@@ -10,8 +10,8 @@ filename=$(basename "$1" .cpp)
 
 # Add header
 cat <<EOT > "$filename.new"
-#include "witness/include/witness.h"
-#include "witness/src/generate.rs.h"
+#include "circom-witness-rs/include/witness.h"
+#include "circom-witness-rs/src/generate.rs.h"
 
 /// We need this accessor since cxx doesn't support hashmaps yet
 class IOSignalInfoAccessor {
