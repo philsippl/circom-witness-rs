@@ -16,7 +16,7 @@ ark-bn254 = { version = "0.5", features = ["std"] }
 ark-ff = { version = "0.5", features = ["std"] }
 ark-serialize = { version = "0.5", features = ["derive"] }
 byteorder = "1"
-cxx = "1"
+cxx = { version = "1", optional = true }
 eyre = "0.6"
 hex = "0.4"
 postcard = { version = "1", features = ["use-std"], default-features = false }
@@ -37,4 +37,4 @@ codegen-units = 1
 debug = true
 
 [features]
-build-witness = []
+build-witness = ["dep:cxx"]
