@@ -1,0 +1,5 @@
+[workspace]
+git_release_enable = true # Automatically create GitHub releases
+git_release_type = "auto"
+changelog_update = true
+changelog_path = "CHANGELOG.md"
