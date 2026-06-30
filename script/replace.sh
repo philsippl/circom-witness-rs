@@ -1,17 +1,26 @@
 #!/bin/sh
 
 # Check for input file
-if [ "$#" -ne 1 ]; then
-    echo "Usage: $0 <filename>"
+if [ "$#" -lt 1 ]; then
+    echo "Usage: $0 <filename> [circuit_name]"
     exit 1
 fi
 
 filename=$(basename "$1" .cpp)
+# Circuit name (defaults to the cpp basename). Used to namespace the generated
+# code so multiple circuits can be linked into one binary without clashing.
+name="${2:-$filename}"
+ns="wit_${name}"
+out="src/circuit_${name}.cc"
 
-# Add header
+# Add header. The circuit body is wrapped in a `wit_<name>` namespace so its
+# globals don't collide with other circuits. The shared cxx symbols (Fr_*, create_vec, bbf) stay in
+# the global namespace and resolve from inside the namespace.
 cat <<EOT > "$filename.new"
 #include "circom-witness-rs/include/witness.h"
 #include "circom-witness-rs/src/generate.rs.h"
+
+namespace ${ns} {
 
 /// We need this accessor since cxx doesn't support hashmaps yet
 class IOSignalInfoAccessor {
@@ -70,6 +79,9 @@ sed -E \
        s/^[[:space:]]*([A-Za-z0-9_]*bbf[A-Za-z0-9_]*)\([^,]+, *([^,]+), *[^,]+, *([^,]+), *[^)]*\);\n[[:space:]]*\/\/ end call bucket$/bbf("\1", \2, \3);\n\/\/ end call bucket/
        bb
      }' \
-  "$filename.new" > "src/circuit.cc"
+  "$filename.new" > "$out"
 
-cp "$(echo $filename)_cpp/$filename.dat" src/constants.dat
+# Close the `wit_<name>` namespace
+echo "}  // namespace ${ns}" >> "$out"
+
+cp "$(echo $filename)_cpp/$filename.dat" "src/constants_${name}.dat"

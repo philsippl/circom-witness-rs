@@ -15,10 +15,17 @@ In the first mode, it generates the c++ version of the witness generator through
 
 ## Usage
 
+The circuits to compile are selected with the `WITNESS_CPP` environment
+variable, read by the build script.
+
 **1. (One-off) Create and optimize graph:**
 ```rust
     witness::generate::build_witness().unwrap();
 ```
+
+`build_witness()` processes every circuit listed in `WITNESS_CPP` and writes one
+`graph_<name>.bin` per circuit (`<name>` is the circuit file stem). When a single
+circuit is configured it also writes `graph.bin` for backwards compatibility.
 
 **2. (At runtime) Generate witness:**
 ```rust
@@ -29,6 +36,31 @@ fn main() {
     let witness = witness::calculate_witness(inputs, &graph, None).unwrap();
 }
 ```
+
+**Multiple circuits**
+
+`WITNESS_CPP` accepts a `:`-separated list of circuits. Each is compiled by
+circom, wrapped in its own C++ namespace (so symbols don't clash), and linked
+into the same binary; you get one optimized graph per circuit:
+
+```sh
+WITNESS_CPP="circuits/foo.circom:circuits/bar.circom" \
+  cargo build --features build-witness
+# -> graph_foo.bin, graph_bar.bin
+```
+
+**Setting `WITNESS_CPP` from a dependent crate**
+
+Because `circom-witness-rs` is compiled *before* any crate that depends on it, a
+dependent crate's `build.rs` cannot set `WITNESS_CPP` for it. Set it for the
+whole build instead, via `.cargo/config.toml` in the consuming project:
+
+```toml
+[env]
+WITNESS_CPP = "circuits/foo.circom:circuits/bar.circom"
+```
+
+Relative paths resolve against the config file's location.
 
 **📦 Blackbox functions**
 

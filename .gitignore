@@ -3,7 +3,10 @@
 *.new
 .DS_Store
 circuit.cc
+circuit_*.cc
+dispatch.cc
 constants.dat
+constants_*.dat
 .idea
 Cargo.lock
 .claude

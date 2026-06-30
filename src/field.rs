@@ -43,6 +43,14 @@ pub fn get_graph() -> Vec<Node> {
     NODES.lock().unwrap().clone()
 }
 
+/// Reset the symbolic execution state so a fresh circuit can be traced.
+/// Required when generating witnesses for several circuits in one process.
+pub fn reset_graph() {
+    NODES.lock().unwrap().clear();
+    VALUES.lock().unwrap().clear();
+    CONSTANT.lock().unwrap().clear();
+}
+
 pub fn undefined(i: usize) -> FrElement {
     FrElement(i)
 }
