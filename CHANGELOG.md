@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.1](https://github.com/philsippl/circom-witness-rs/compare/v0.3.0...v0.3.1) - 2026-08-07
+
+### Other
+
+- compare Circom WASM and Rust witnesses ([#38](https://github.com/philsippl/circom-witness-rs/pull/38))
+
 ## [0.3.0](https://github.com/philsippl/circom-witness-rs/compare/v0.2.3...v0.3.0) - 2026-08-07
 
 ### Other
