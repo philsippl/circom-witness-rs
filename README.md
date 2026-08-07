@@ -11,7 +11,7 @@ The repository contains two crates with a graph file as their boundary:
 1. `circom-witness-graph-builder` compiles a circuit into a static execution graph as a one-off operation.
 2. `circom-witness-rs` loads that graph and generates witness elements at runtime.
 
-In the first mode, it compiles the circuit in-process with Circom 2.2.2 and symbolically executes the compiler's typed witness IR to build an execution graph. No generated C++, native compiler, or Rust/C++ bridge is involved. The graph is further optimized through constant propagation and dead code elimination, then serialized with backward-delta references and Zstandard compression. At runtime, independent field divisions are scheduled into batches so they share a single inversion. The graph can be embedded in the binary and interpreted to generate the witness. Legacy uncompressed Postcard graphs remain readable.
+In the first mode, it compiles the circuit in-process with Circom 2.2.2 and symbolically executes the compiler's typed witness IR to build an execution graph. No generated C++, native compiler, or Rust/C++ bridge is involved. The graph is optimized through constant propagation and dead code elimination, then lowered into a compact execution program with fused linear combinations, squaring, and multi-output power-of-five instructions. Constants and coefficients are pooled, references are backward-delta encoded, and the result is compressed with Zstandard. At runtime, independent field divisions are scheduled into batches that use one fast modular inversion per batch. The graph can be embedded in the binary and interpreted to generate the witness. Legacy compressed and uncompressed Postcard graphs remain readable.
 
 ## Usage
 

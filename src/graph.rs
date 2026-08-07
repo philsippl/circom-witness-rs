@@ -2,7 +2,6 @@ use std::{cmp::Ordering, collections::HashMap, ops::Range, ops::Shr};
 
 use crate::{BlackBoxFunction, M};
 use ark_bn254::Fr;
-use ark_ff::batch_inversion;
 use eyre::bail;
 use num_bigint::BigUint;
 use rand::Rng;
@@ -74,6 +73,12 @@ pub enum Node {
 #[derive(Debug, Default, Clone)]
 pub(crate) struct EvaluationPlan {
     division_batches: Vec<Range<usize>>,
+}
+
+impl EvaluationPlan {
+    pub(crate) fn division_batches(&self) -> &[Range<usize>] {
+        &self.division_batches
+    }
 }
 
 /// Reorders independent nodes into division-depth layers. Each division block can then use one
@@ -335,6 +340,7 @@ pub(crate) fn evaluate_with_plan(
     // Evaluate the graph.
     let mut values = Vec::with_capacity(nodes.len());
     let mut inverses = Vec::new();
+    let mut inversion_scratch = Vec::new();
     let mut batches = plan.division_batches.iter().peekable();
     let mut index = 0;
     while index < nodes.len() {
@@ -345,11 +351,9 @@ pub(crate) fn evaluate_with_plan(
                 let Node::Op(Operation::Div, _, divisor) = node else {
                     unreachable!("division batch contains a non-division node")
                 };
-                let divisor = values[*divisor];
-                assert!(divisor != Fr::from(0_u64), "attempt to divide by zero");
-                inverses.push(divisor);
+                inverses.push(values[*divisor]);
             }
-            batch_inversion(&mut inverses);
+            batch_inversion_u256(&mut inverses, &mut inversion_scratch);
             for (node, inverse) in nodes[batch.clone()].iter().zip(&inverses) {
                 let Node::Op(Operation::Div, numerator, _) = node else {
                     unreachable!("division batch contains a non-division node")
@@ -397,6 +401,39 @@ pub(crate) fn evaluate_with_plan(
     }
 
     Ok(out)
+}
+
+/// Invert a set of non-zero field elements with a single modular inversion.
+///
+/// Multiplication remains in Montgomery form. Only the accumulated product takes the round trip
+/// through canonical `U256`, where `ruint`'s modular inverse is substantially faster than the
+/// generic field inversion. `scratch` is retained by the caller and reused across division batches.
+pub(crate) fn batch_inversion_u256(values: &mut [Fr], scratch: &mut Vec<Fr>) {
+    scratch.clear();
+    scratch.reserve(values.len());
+
+    let mut product = Fr::from(1_u64);
+    for &value in values.iter() {
+        assert!(value != Fr::from(0_u64), "attempt to divide by zero");
+        scratch.push(product);
+        product *= value;
+    }
+
+    if values.is_empty() {
+        return;
+    }
+
+    let product: U256 = product.into();
+    let product_inverse = product
+        .inv_mod(M)
+        .expect("a product of non-zero field elements must be invertible");
+    let mut inverse = Fr::new(product_inverse.into());
+
+    for (value, prefix) in values.iter_mut().zip(scratch.iter()).rev() {
+        let original = *value;
+        *value = inverse * prefix;
+        inverse *= original;
+    }
 }
 
 /// Constant propagation
@@ -601,6 +638,8 @@ pub fn montgomery_form(nodes: &mut [Node]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ark_ff::batch_inversion;
+    use rand::{rngs::StdRng, SeedableRng};
 
     #[test]
     fn bitwise_complement_uses_the_field_bit_width() {
@@ -656,5 +695,37 @@ mod tests {
         let actual =
             evaluate_with_plan(&reordered, &inputs, &reordered_outputs, None, &plan).unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn u256_batch_inversion_matches_ark_for_varying_batch_sizes() {
+        let mut rng = StdRng::seed_from_u64(0x7869_3262_6174_6368);
+        let mut scratch = Vec::new();
+
+        for size in [0, 1, 2, 3, 7, 32, 127, 256] {
+            let mut actual = (0..size)
+                .map(|_| {
+                    let mut value = rng.gen::<U256>() % M;
+                    if value == U256::ZERO {
+                        value = U256::ONE;
+                    }
+                    Fr::new(value.into())
+                })
+                .collect::<Vec<_>>();
+            let mut expected = actual.clone();
+
+            batch_inversion(&mut expected);
+            batch_inversion_u256(&mut actual, &mut scratch);
+
+            assert_eq!(actual, expected, "batch size {size}");
+            assert_eq!(scratch.len(), size);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to divide by zero")]
+    fn u256_batch_inversion_rejects_zero() {
+        let mut values = [Fr::from(3_u64), Fr::from(0_u64), Fr::from(7_u64)];
+        batch_inversion_u256(&mut values, &mut Vec::new());
     }
 }

@@ -1,6 +1,10 @@
 pub mod graph;
+mod program;
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+};
 
 use ark_bn254::Fr;
 use eyre::{eyre, Context as _};
@@ -14,7 +18,8 @@ pub type BlackBoxFunction = Arc<dyn Fn(&[Fr]) -> Fr + Send + Sync + 'static>;
 pub const M: U256 =
     uint!(21888242871839275222246405745257275088548364400416034343698204186575808495617_U256);
 
-const GRAPH_HEADER: &[u8; 8] = b"CWGR\x01DZ\0";
+const LEGACY_GRAPH_HEADER: &[u8; 8] = b"CWGR\x01DZ\0";
+const GRAPH_HEADER: &[u8; 8] = b"CWGR\x02FZ\0";
 const GRAPH_MAGIC: &[u8; 4] = b"CWGR";
 const GRAPH_COMPRESSION_LEVEL: i32 = 19;
 
@@ -27,29 +32,58 @@ pub struct HashSignalInfo {
 
 #[derive(Clone)]
 pub struct Graph {
-    pub nodes: Vec<Node>,
-    pub signals: Vec<usize>,
+    // The program is the executable source of truth. Fused graphs construct the semantically
+    // equivalent node view only if the compatibility accessors are actually used.
+    compatibility: OnceLock<CompatibilityGraph>,
     pub input_mapping: Vec<HashSignalInfo>,
-    evaluation_plan: graph::EvaluationPlan,
+    program: program::Program,
+}
+
+#[derive(Debug, Clone)]
+struct CompatibilityGraph {
+    nodes: Vec<Node>,
+    signals: Vec<usize>,
 }
 
 impl Graph {
+    fn compatibility(&self) -> &CompatibilityGraph {
+        self.compatibility.get_or_init(|| {
+            let (nodes, signals) = self
+                .program
+                .to_nodes()
+                .expect("a validated witness program must expand into a valid node graph");
+            CompatibilityGraph { nodes, signals }
+        })
+    }
+
+    /// Returns the prepared node DAG. For fused graph files this is a semantically equivalent
+    /// expansion and is not guaranteed to use the builder's original node indices.
+    pub fn nodes(&self) -> &[Node] {
+        &self.compatibility().nodes
+    }
+
+    /// Returns witness outputs as indices into [`Graph::nodes`].
+    pub fn signals(&self) -> &[usize] {
+        &self.compatibility().signals
+    }
+
     /// Evaluates a graph using an already populated positional input buffer.
     pub fn evaluate(
         &self,
         inputs: &[U256],
         bbfs: Option<&HashMap<String, BlackBoxFunction>>,
     ) -> eyre::Result<Vec<U256>> {
-        graph::evaluate_with_plan(
-            &self.nodes,
-            inputs,
-            &self.signals,
-            bbfs,
-            &self.evaluation_plan,
-        )
+        self.program.evaluate(inputs, bbfs)
+    }
+
+    /// Returns the number of compact runtime instructions after graph preparation and fusion.
+    #[doc(hidden)]
+    pub fn runtime_instruction_count(&self) -> usize {
+        self.program.instruction_count()
     }
 }
 
+#[cfg(test)]
 fn encode_backward_reference(node: usize, reference: usize) -> eyre::Result<usize> {
     node.checked_sub(reference)
         .and_then(|distance| distance.checked_sub(1))
@@ -65,6 +99,7 @@ fn decode_backward_reference(node: usize, distance: usize) -> eyre::Result<usize
     .ok_or_else(|| eyre!("graph reference distance {distance} is invalid at node {node}"))
 }
 
+#[cfg(test)]
 fn encode_output_delta(output: usize, previous: usize) -> eyre::Result<usize> {
     if output >= previous {
         (output - previous)
@@ -92,33 +127,14 @@ fn decode_output_delta(encoded: usize, previous: usize) -> eyre::Result<usize> {
 
 #[doc(hidden)]
 pub fn serialize_graph(
-    mut nodes: Vec<Node>,
-    mut signals: Vec<usize>,
+    nodes: Vec<Node>,
+    signals: Vec<usize>,
     input_mapping: Vec<HashSignalInfo>,
 ) -> eyre::Result<Vec<u8>> {
-    for (index, node) in nodes.iter_mut().enumerate() {
-        match node {
-            Node::Op(_, left, right) => {
-                *left = encode_backward_reference(index, *left)?;
-                *right = encode_backward_reference(index, *right)?;
-            }
-            Node::BBF(_, parameters) => {
-                for parameter in parameters {
-                    *parameter = encode_backward_reference(index, *parameter)?;
-                }
-            }
-            Node::Input(_) | Node::Constant(_) | Node::MontConstant(_) => {}
-        }
-    }
-
-    let mut previous = 0;
-    for output in &mut signals {
-        let absolute = *output;
-        *output = encode_output_delta(absolute, previous)?;
-        previous = absolute;
-    }
-
-    let postcard = postcard::to_stdvec(&(&nodes, &signals, &input_mapping))?;
+    // Preserve the builder's topological order on disk. Division-depth reordering improves runtime
+    // but measurably hurts compression on large graphs, so it is deliberately done only at load.
+    let encoded_program = program::compile(&nodes, &signals, &[])?.encode()?;
+    let postcard = postcard::to_stdvec(&(&encoded_program, &input_mapping))?;
     let compressed = zstd::stream::encode_all(postcard.as_slice(), GRAPH_COMPRESSION_LEVEL)
         .wrap_err("failed to compress witness graph")?;
     let mut encoded = Vec::with_capacity(GRAPH_HEADER.len() + compressed.len());
@@ -165,57 +181,80 @@ fn fnv1a(s: &str) -> u64 {
 
 /// Loads the graph from bytes
 pub fn init_graph(graph_bytes: &[u8]) -> eyre::Result<Graph> {
-    let compressed = if graph_bytes.starts_with(GRAPH_MAGIC) {
+    #[derive(Clone, Copy)]
+    enum Format {
+        Fused,
+        LegacyCompressed,
+        LegacyRaw,
+    }
+
+    let (format, payload) = if graph_bytes.starts_with(GRAPH_MAGIC) {
         let header = graph_bytes
             .get(..GRAPH_HEADER.len())
             .ok_or_else(|| eyre!("witness graph header is truncated"))?;
-        if header != GRAPH_HEADER {
+        if header == GRAPH_HEADER {
+            (Format::Fused, &graph_bytes[GRAPH_HEADER.len()..])
+        } else if header == LEGACY_GRAPH_HEADER {
+            (
+                Format::LegacyCompressed,
+                &graph_bytes[LEGACY_GRAPH_HEADER.len()..],
+            )
+        } else {
             return Err(eyre!("unsupported witness graph format"));
         }
-        Some(&graph_bytes[GRAPH_HEADER.len()..])
     } else {
-        None
+        (Format::LegacyRaw, graph_bytes)
     };
-    let postcard;
-    let graph_bytes = if let Some(compressed) = compressed {
-        postcard =
-            zstd::stream::decode_all(compressed).wrap_err("failed to decompress witness graph")?;
-        postcard.as_slice()
-    } else {
-        graph_bytes
-    };
-    let (mut nodes, mut signals, input_mapping): (Vec<Node>, Vec<usize>, Vec<HashSignalInfo>) =
-        postcard::from_bytes(graph_bytes)?;
 
-    if compressed.is_some() {
-        restore_absolute_references(&mut nodes, &mut signals)?;
+    let decompressed;
+    let payload = if matches!(format, Format::LegacyRaw) {
+        payload
+    } else {
+        decompressed =
+            zstd::stream::decode_all(payload).wrap_err("failed to decompress witness graph")?;
+        decompressed.as_slice()
+    };
+
+    if matches!(format, Format::Fused) {
+        let (encoded, input_mapping): (program::EncodedProgram, Vec<HashSignalInfo>) =
+            postcard::from_bytes(payload).wrap_err("failed to decode fused witness graph")?;
+        let program = program::Program::decode(encoded)?.prepare_evaluation()?;
+        return Ok(Graph {
+            compatibility: OnceLock::new(),
+            input_mapping,
+            program,
+        });
     }
 
+    let (mut nodes, mut signals, input_mapping) = match format {
+        Format::Fused => unreachable!(),
+        Format::LegacyCompressed => {
+            let (mut nodes, mut signals, input_mapping): (
+                Vec<Node>,
+                Vec<usize>,
+                Vec<HashSignalInfo>,
+            ) = postcard::from_bytes(payload).wrap_err("failed to decode legacy witness graph")?;
+            restore_absolute_references(&mut nodes, &mut signals)?;
+            (nodes, signals, input_mapping)
+        }
+        Format::LegacyRaw => {
+            postcard::from_bytes(payload).wrap_err("failed to decode legacy witness graph")?
+        }
+    };
+
     let evaluation_plan = graph::prepare_evaluation(&mut nodes, &mut signals)?;
+    let program = program::compile(&nodes, &signals, evaluation_plan.division_batches())?;
 
     Ok(Graph {
-        nodes,
-        signals,
+        compatibility: OnceLock::from(CompatibilityGraph { nodes, signals }),
         input_mapping,
-        evaluation_plan,
+        program,
     })
 }
 
 /// Calculates the number of needed inputs
 pub fn get_inputs_size(graph: &Graph) -> usize {
-    let mut start = false;
-    let mut max_index = 0usize;
-    for node in graph.nodes.iter() {
-        if let Node::Input(i) = node {
-            if *i > max_index {
-                max_index = *i;
-            }
-            start = true
-        } else if start {
-            break;
-        }
-    }
-    max_index + 1
+    graph.program.input_count()
 }
 
 /// Allocates inputs vec with position 0 set to 1
@@ -289,16 +328,87 @@ mod tests {
     }
 
     #[test]
-    fn compressed_delta_graph_round_trips() {
+    fn fused_graph_round_trips_semantically() {
         let (nodes, signals, input_mapping) = graph_parts();
         let encoded =
             serialize_graph(nodes.clone(), signals.clone(), input_mapping.clone()).unwrap();
         assert!(encoded.starts_with(GRAPH_HEADER));
 
         let graph = init_graph(&encoded).unwrap();
-        assert_eq!(graph.nodes, nodes);
-        assert_eq!(graph.signals, signals);
         assert_eq!(graph.input_mapping, input_mapping);
+        assert!(graph.compatibility.get().is_none());
+
+        let mut bbfs = HashMap::<String, BlackBoxFunction>::new();
+        bbfs.insert(
+            "bbf_test".to_owned(),
+            Arc::new(|parameters: &[Fr]| parameters.iter().copied().sum()),
+        );
+        let inputs = [U256::from(3_u64), U256::from(5_u64)];
+        assert_eq!(
+            graph::evaluate(&nodes, &inputs, &signals, Some(&bbfs)).unwrap(),
+            graph.evaluate(&inputs, Some(&bbfs)).unwrap()
+        );
+        assert!(graph.compatibility.get().is_none());
+        assert_eq!(
+            graph::evaluate(graph.nodes(), &inputs, graph.signals(), Some(&bbfs)).unwrap(),
+            graph.evaluate(&inputs, Some(&bbfs)).unwrap()
+        );
+        assert!(graph.compatibility.get().is_some());
+    }
+
+    #[test]
+    fn legacy_compressed_graphs_remain_supported() {
+        let (mut nodes, mut signals, input_mapping) = graph_parts();
+        for (index, node) in nodes.iter_mut().enumerate() {
+            match node {
+                Node::Op(_, left, right) => {
+                    *left = encode_backward_reference(index, *left).unwrap();
+                    *right = encode_backward_reference(index, *right).unwrap();
+                }
+                Node::BBF(_, parameters) => {
+                    for parameter in parameters {
+                        *parameter = encode_backward_reference(index, *parameter).unwrap();
+                    }
+                }
+                Node::Input(_) | Node::Constant(_) | Node::MontConstant(_) => {}
+            }
+        }
+        let mut previous = 0;
+        for signal in &mut signals {
+            let absolute = *signal;
+            *signal = encode_output_delta(absolute, previous).unwrap();
+            previous = absolute;
+        }
+        let postcard = postcard::to_stdvec(&(&nodes, &signals, &input_mapping)).unwrap();
+        let compressed = zstd::stream::encode_all(postcard.as_slice(), 19).unwrap();
+        let mut encoded = LEGACY_GRAPH_HEADER.to_vec();
+        encoded.extend(compressed);
+
+        let graph = init_graph(&encoded).unwrap();
+        let (nodes, signals, _) = graph_parts();
+        assert_eq!(graph.nodes(), nodes);
+        assert_eq!(graph.signals(), signals);
+    }
+
+    #[test]
+    fn fused_graph_batches_independent_divisions() {
+        let nodes = vec![
+            Node::Input(0),
+            Node::Input(1),
+            Node::Input(2),
+            Node::Op(Operation::Add, 0, 1),
+            Node::Op(Operation::Sub, 1, 2),
+            Node::Op(Operation::Div, 0, 3),
+            Node::Op(Operation::Div, 2, 4),
+            Node::Op(Operation::Add, 5, 6),
+            Node::Op(Operation::Div, 7, 1),
+        ];
+        let outputs = vec![5, 6, 7, 8];
+        let inputs = [U256::from(6_u64), U256::from(5_u64), U256::from(2_u64)];
+        let expected = graph::evaluate(&nodes, &inputs, &outputs, None).unwrap();
+        let encoded = serialize_graph(nodes, outputs, Vec::new()).unwrap();
+        let graph = init_graph(&encoded).unwrap();
+        assert_eq!(graph.evaluate(&inputs, None).unwrap(), expected);
     }
 
     #[test]
@@ -307,8 +417,8 @@ mod tests {
         let encoded = postcard::to_stdvec(&(&nodes, &signals, &input_mapping)).unwrap();
 
         let graph = init_graph(&encoded).unwrap();
-        assert_eq!(graph.nodes, nodes);
-        assert_eq!(graph.signals, signals);
+        assert_eq!(graph.nodes(), nodes);
+        assert_eq!(graph.signals(), signals);
         assert_eq!(graph.input_mapping, input_mapping);
     }
 
