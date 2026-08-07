@@ -1,7 +1,8 @@
-use std::{cmp::Ordering, collections::HashMap, ops::Shr};
+use std::{cmp::Ordering, collections::HashMap, ops::Range, ops::Shr};
 
 use crate::{BlackBoxFunction, M};
 use ark_bn254::Fr;
+use ark_ff::batch_inversion;
 use eyre::bail;
 use num_bigint::BigUint;
 use rand::Rng;
@@ -68,6 +69,109 @@ pub enum Node {
     MontConstant(Fr),
     Op(Operation, usize, usize),
     BBF(String, Vec<usize>),
+}
+
+#[derive(Debug, Default, Clone)]
+pub(crate) struct EvaluationPlan {
+    division_batches: Vec<Range<usize>>,
+}
+
+/// Reorders independent nodes into division-depth layers. Each division block can then use one
+/// field inversion for the whole block, while all node references remain backwards.
+pub(crate) fn prepare_evaluation(
+    nodes: &mut Vec<Node>,
+    outputs: &mut [usize],
+) -> eyre::Result<EvaluationPlan> {
+    let mut depths = Vec::<usize>::with_capacity(nodes.len());
+    let mut division_count = 0;
+    for (index, node) in nodes.iter().enumerate() {
+        let referenced_depth = |reference: usize| -> eyre::Result<usize> {
+            if reference >= index {
+                bail!("graph node {index} references non-earlier node {reference}");
+            }
+            Ok(depths[reference])
+        };
+        let depth = match node {
+            Node::Input(_) | Node::Constant(_) | Node::MontConstant(_) => 0,
+            Node::Op(operation, left, right) => {
+                let depth = referenced_depth(*left)?.max(referenced_depth(*right)?);
+                if *operation == Operation::Div {
+                    division_count += 1;
+                    depth + 1
+                } else {
+                    depth
+                }
+            }
+            Node::BBF(_, parameters) => {
+                let mut depth = 0;
+                for parameter in parameters {
+                    depth = depth.max(referenced_depth(*parameter)?);
+                }
+                depth
+            }
+        };
+        depths.push(depth);
+    }
+
+    if division_count == 0 {
+        return Ok(EvaluationPlan::default());
+    }
+
+    let layer_count = depths.iter().copied().max().unwrap_or(0) + 1;
+    let mut regular = vec![Vec::new(); layer_count];
+    let mut divisions = vec![Vec::new(); layer_count];
+    for (index, (&depth, node)) in depths.iter().zip(nodes.iter()).enumerate() {
+        if matches!(node, Node::Op(Operation::Div, _, _)) {
+            divisions[depth].push(index);
+        } else {
+            regular[depth].push(index);
+        }
+    }
+
+    let mut order = Vec::with_capacity(nodes.len());
+    let mut division_batches = Vec::with_capacity(layer_count);
+    for depth in 0..layer_count {
+        if !divisions[depth].is_empty() {
+            let start = order.len();
+            order.extend_from_slice(&divisions[depth]);
+            division_batches.push(start..order.len());
+        }
+        order.extend_from_slice(&regular[depth]);
+    }
+    debug_assert_eq!(order.len(), nodes.len());
+
+    let mut renumber = vec![0; nodes.len()];
+    for (new, &old) in order.iter().enumerate() {
+        renumber[old] = new;
+    }
+    let mut reordered = order
+        .into_iter()
+        .map(|index| nodes[index].clone())
+        .collect::<Vec<_>>();
+    for node in &mut reordered {
+        match node {
+            Node::Op(_, left, right) => {
+                *left = renumber[*left];
+                *right = renumber[*right];
+            }
+            Node::BBF(_, parameters) => {
+                for parameter in parameters {
+                    *parameter = renumber[*parameter];
+                }
+            }
+            Node::Input(_) | Node::Constant(_) | Node::MontConstant(_) => {}
+        }
+    }
+    for output in outputs {
+        if *output >= renumber.len() {
+            bail!("graph output node {output} is out of bounds");
+        }
+        *output = renumber[*output];
+    }
+    *nodes = reordered;
+    assert_valid(nodes);
+
+    Ok(EvaluationPlan { division_batches })
 }
 
 fn cmp_balanced(a: U256, b: U256) -> Ordering {
@@ -218,10 +322,45 @@ pub fn evaluate(
     bbfs: Option<&HashMap<String, BlackBoxFunction>>,
 ) -> eyre::Result<Vec<U256>> {
     assert_valid(nodes);
+    evaluate_with_plan(nodes, inputs, outputs, bbfs, &EvaluationPlan::default())
+}
 
+pub(crate) fn evaluate_with_plan(
+    nodes: &[Node],
+    inputs: &[U256],
+    outputs: &[usize],
+    bbfs: Option<&HashMap<String, BlackBoxFunction>>,
+    plan: &EvaluationPlan,
+) -> eyre::Result<Vec<U256>> {
     // Evaluate the graph.
     let mut values = Vec::with_capacity(nodes.len());
-    for node in nodes.iter() {
+    let mut inverses = Vec::new();
+    let mut batches = plan.division_batches.iter().peekable();
+    let mut index = 0;
+    while index < nodes.len() {
+        if batches.peek().is_some_and(|batch| batch.start == index) {
+            let batch = batches.next().unwrap().clone();
+            inverses.clear();
+            for node in &nodes[batch.clone()] {
+                let Node::Op(Operation::Div, _, divisor) = node else {
+                    unreachable!("division batch contains a non-division node")
+                };
+                let divisor = values[*divisor];
+                assert!(divisor != Fr::from(0_u64), "attempt to divide by zero");
+                inverses.push(divisor);
+            }
+            batch_inversion(&mut inverses);
+            for (node, inverse) in nodes[batch.clone()].iter().zip(&inverses) {
+                let Node::Op(Operation::Div, numerator, _) = node else {
+                    unreachable!("division batch contains a non-division node")
+                };
+                values.push(values[*numerator] * inverse);
+            }
+            index = batch.end;
+            continue;
+        }
+
+        let node = &nodes[index];
         let value = match node {
             Node::Constant(c) => Fr::new(c.into()),
             Node::MontConstant(c) => *c,
@@ -248,6 +387,7 @@ pub fn evaluate(
             }
         };
         values.push(value);
+        index += 1;
     }
 
     // Convert from Montgomery form and return the outputs.
@@ -487,5 +627,34 @@ mod tests {
             Operation::Shr.eval(uint!(8_U256), uint!(254_U256)),
             U256::ZERO
         );
+    }
+
+    #[test]
+    fn independent_divisions_are_batched_without_changing_results() {
+        let nodes = vec![
+            Node::Input(0),
+            Node::Input(1),
+            Node::Input(2),
+            Node::Op(Operation::Add, 0, 1),
+            Node::Op(Operation::Sub, 1, 2),
+            Node::Op(Operation::Div, 0, 3),
+            Node::Op(Operation::Div, 2, 4),
+            Node::Op(Operation::Add, 5, 6),
+            Node::Op(Operation::Div, 7, 1),
+        ];
+        let outputs = vec![5, 6, 7, 8];
+        let inputs = vec![U256::from(6), U256::from(5), U256::from(2)];
+        let expected = evaluate(&nodes, &inputs, &outputs, None).unwrap();
+
+        let mut reordered = nodes;
+        let mut reordered_outputs = outputs;
+        let plan = prepare_evaluation(&mut reordered, &mut reordered_outputs).unwrap();
+        assert_eq!(plan.division_batches.len(), 2);
+        assert_eq!(plan.division_batches[0].len(), 2);
+        assert_eq!(plan.division_batches[1].len(), 1);
+
+        let actual =
+            evaluate_with_plan(&reordered, &inputs, &reordered_outputs, None, &plan).unwrap();
+        assert_eq!(actual, expected);
     }
 }

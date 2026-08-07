@@ -15,7 +15,7 @@ use ruint::aliases::U256;
 
 use crate::{
     graph::{self, Node, Operation},
-    HashSignalInfo, M,
+    serialize_graph, HashSignalInfo, M,
 };
 
 const CIRCOM_VERSION: &str = "2.2.2";
@@ -915,7 +915,7 @@ pub fn generate_witness_graph_from_file(
     eprintln!("Graph with {} nodes", nodes.len());
     graph::optimize(&mut nodes, &mut signals);
 
-    let bytes = postcard::to_stdvec(&(&nodes, &signals, &input_map))?;
+    let bytes = serialize_graph(nodes, signals, input_map)?;
     eprintln!("Graph size: {} bytes", bytes.len());
     Ok(bytes)
 }

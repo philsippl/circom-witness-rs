@@ -11,7 +11,7 @@ This crate provides a fast witness generator for Circom circuits, serving as a d
 1. Generate the static execution graph required for the witness generation at build time.
 2. Generate the witness elements at runtime from serialized graph.
 
-In the first mode, it compiles the circuit in-process with Circom 2.2.2 and symbolically executes the compiler's typed witness IR to build an execution graph. No generated C++, native compiler, or Rust/C++ bridge is involved. The graph is further optimized through constant propagation and dead code elimination, then serialized to a binary format. At runtime, the graph can be embedded in the binary and interpreted to generate the witness.
+In the first mode, it compiles the circuit in-process with Circom 2.2.2 and symbolically executes the compiler's typed witness IR to build an execution graph. No generated C++, native compiler, or Rust/C++ bridge is involved. The graph is further optimized through constant propagation and dead code elimination, then serialized with backward-delta references and Zstandard compression. At runtime, independent field divisions are scheduled into batches so they share a single inversion. The graph can be embedded in the binary and interpreted to generate the witness. Legacy uncompressed Postcard graphs remain readable.
 
 ## Usage
 
