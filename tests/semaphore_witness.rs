@@ -46,7 +46,9 @@ fn semaphore_wasm_and_rust_witnesses_are_identical() {
 
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let circuit = root.join("tests/fixtures/semaphore/semaphore.circom");
-    if let Some(configured_circuit) = env::var_os("WITNESS_CPP") {
+    if let Some(configured_circuit) =
+        env::var_os("CIRCOM_WITNESS").or_else(|| env::var_os("WITNESS_CPP"))
+    {
         assert_eq!(
             fs::canonicalize(configured_circuit).unwrap(),
             fs::canonicalize(&circuit).unwrap(),

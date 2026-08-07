@@ -15,20 +15,17 @@ authors = [
 ark-bn254 = { version = "0.6", features = ["std"] }
 ark-ff = { version = "0.6", features = ["std"] }
 ark-serialize = { version = "0.6", features = ["derive"] }
-byteorder = "1"
-cxx = { version = "1", optional = true }
+circom-compiler = { package = "compiler", git = "https://github.com/iden3/circom.git", rev = "e410b0d5cd2948a15931df0bc50d79ce56fa8c32", optional = true }
+circom-constraint-generation = { package = "constraint_generation", git = "https://github.com/iden3/circom.git", rev = "e410b0d5cd2948a15931df0bc50d79ce56fa8c32", optional = true }
+circom-parser = { package = "parser", git = "https://github.com/iden3/circom.git", rev = "e410b0d5cd2948a15931df0bc50d79ce56fa8c32", optional = true }
+circom-type-analysis = { package = "type_analysis", git = "https://github.com/iden3/circom.git", rev = "e410b0d5cd2948a15931df0bc50d79ce56fa8c32", optional = true }
 eyre = "0.6"
-hex = "0.4"
 postcard = { version = "1", features = ["use-std"], default-features = false }
 rand = "0.8"
 ruint = { version = "1.19", features = ["rand", "serde", "ark-ff-06", "num-bigint"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 num-bigint = "0.4"
-num-traits = "0.2"
-
-[build-dependencies]
-cxx-build = "1"
 
 [profile.release]
 opt-level = 3
@@ -37,7 +34,12 @@ codegen-units = 1
 debug = true
 
 [features]
-build-witness = ["dep:cxx"]
+build-witness = [
+  "dep:circom-compiler",
+  "dep:circom-constraint-generation",
+  "dep:circom-parser",
+  "dep:circom-type-analysis",
+]
 test-semaphore = ["build-witness"]
 test-world-id = ["build-witness"]
 test-world-id-query = ["build-witness"]

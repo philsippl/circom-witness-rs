@@ -27,7 +27,9 @@ fn world_id_oprf_query_wasm_and_rust_witnesses_are_identical() {
         circuit.is_file(),
         "World ID fixture is missing; run `git submodule update --init`"
     );
-    if let Some(configured_circuit) = env::var_os("WITNESS_CPP") {
+    if let Some(configured_circuit) =
+        env::var_os("CIRCOM_WITNESS").or_else(|| env::var_os("WITNESS_CPP"))
+    {
         assert_eq!(
             fs::canonicalize(configured_circuit).unwrap(),
             fs::canonicalize(&circuit).unwrap(),

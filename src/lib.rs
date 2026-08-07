@@ -3,9 +3,6 @@ pub mod graph;
 #[cfg(feature = "build-witness")]
 pub mod generate;
 
-#[cfg(feature = "build-witness")]
-mod field;
-
 use std::{collections::HashMap, sync::Arc};
 
 use ark_bn254::Fr;

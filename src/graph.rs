@@ -53,6 +53,11 @@ pub enum Operation {
     Pow,
     Land,
     IDiv,
+    // Keep new variants at the end so existing postcard graph files remain compatible.
+    Bor,
+    Bxor,
+    Bnot,
+    Lnot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,7 +102,11 @@ impl Operation {
             Lor => U256::from(a != U256::ZERO || b != U256::ZERO),
             Shl => compute_shl(a, b),
             Shr => compute_shr(a, b),
+            Bor => a.bitor(b) % M,
             Band => a.bitand(b) % M,
+            Bxor => a.bitxor(b) % M,
+            Bnot => (bit_mask() ^ a) % M,
+            Lnot => U256::from(a == U256::ZERO),
             Land => U256::from(a != U256::ZERO && b != U256::ZERO),
             Neg => (M - a) % M,
             Inv => a.inv_mod(M).unwrap(),
@@ -128,22 +137,49 @@ impl Operation {
                 let b: BigUint = b.into();
                 Fr::from(a % b)
             }
-            _ => unimplemented!("operator {:?} not implemented for Montgomery", self),
+            _ => {
+                let a: U256 = a.into();
+                let b: U256 = b.into();
+                Fr::new(self.eval(a, b).into())
+            }
         }
     }
 }
 
 fn compute_shl(a: U256, b: U256) -> U256 {
-    assert!(b < uint!(256));
-    let s = b.as_limbs()[0] as usize;
-    let mask = (U256::ONE << 254) - U256::ONE;
-    ((a << s) & mask) % M
+    if b > M.shr(1) {
+        shift_right(a, M - b)
+    } else {
+        shift_left(a, b)
+    }
 }
 
 fn compute_shr(a: U256, b: U256) -> U256 {
-    assert!(b < uint!(256));
-    let s = b.as_limbs()[0] as usize;
-    (a >> s) % M
+    if b > M.shr(1) {
+        shift_left(a, M - b)
+    } else {
+        shift_right(a, b)
+    }
+}
+
+fn bit_mask() -> U256 {
+    (U256::ONE << M.bit_len()) - U256::ONE
+}
+
+fn shift_left(a: U256, amount: U256) -> U256 {
+    if amount >= uint!(254) {
+        U256::ZERO
+    } else {
+        ((a << amount.as_limbs()[0]) & bit_mask()) % M
+    }
+}
+
+fn shift_right(a: U256, amount: U256) -> U256 {
+    if amount >= uint!(254) {
+        U256::ZERO
+    } else {
+        (a >> amount.as_limbs()[0]) % M
+    }
 }
 
 /// All references must be backwards.
@@ -411,18 +447,45 @@ pub fn constants(nodes: &mut [Node]) {
 pub fn montgomery_form(nodes: &mut [Node]) {
     for node in nodes.iter_mut() {
         use Node::*;
-        use Operation::*;
         match node {
             Constant(c) => *node = MontConstant(Fr::new((*c).into())),
             MontConstant(..) => (),
             Input(..) => (),
-            Op(Add | Sub | Mul | Neg | Div | Mod | IDiv, ..) => (),
-            Op(op, ..) => {
-                println!("Operator {:?} not implemented for Montgomery form", op);
-                unimplemented!("Operators Montgomery form")
-            }
+            Op(..) => (),
             BBF(..) => (),
         }
     }
     eprintln!("Converted to Montgomery form");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bitwise_complement_uses_the_field_bit_width() {
+        assert_eq!(Operation::Bnot.eval(U256::ZERO, U256::ZERO), bit_mask() % M);
+        assert_eq!(Operation::Bnot.eval(bit_mask(), U256::ZERO), U256::ZERO);
+    }
+
+    #[test]
+    fn shifts_follow_circoms_signed_field_semantics() {
+        let negative_one = M - U256::ONE;
+        assert_eq!(
+            Operation::Shl.eval(uint!(8_U256), negative_one),
+            uint!(4_U256)
+        );
+        assert_eq!(
+            Operation::Shr.eval(uint!(8_U256), negative_one),
+            uint!(16_U256)
+        );
+        assert_eq!(
+            Operation::Shl.eval(uint!(8_U256), uint!(254_U256)),
+            U256::ZERO
+        );
+        assert_eq!(
+            Operation::Shr.eval(uint!(8_U256), uint!(254_U256)),
+            U256::ZERO
+        );
+    }
 }

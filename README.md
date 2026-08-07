@@ -11,7 +11,7 @@ This crate provides a fast witness generator for Circom circuits, serving as a d
 1. Generate the static execution graph required for the witness generation at build time.
 2. Generate the witness elements at runtime from serialized graph.
 
-In the first mode, it generates the c++ version of the witness generator through circom and links itself against it. The c++ code is made accessible to rust through [`cxx`](https://github.com/dtolnay/cxx). It hooks all field functions (which are x86 assembly in the original generator), such that it can recreate the execution graph through symblic execution. The execution graph is further optimized through constant propagation and dead code elimination. The resulting graph is then serialized to a binary format. At runtime, the graph can be embedded in the binary and interpreted to generate the witness.
+In the first mode, it compiles the circuit in-process with Circom 2.2.2 and symbolically executes the compiler's typed witness IR to build an execution graph. No generated C++, native compiler, or Rust/C++ bridge is involved. The graph is further optimized through constant propagation and dead code elimination, then serialized to a binary format. At runtime, the graph can be embedded in the binary and interpreted to generate the witness.
 
 ## Usage
 
@@ -19,6 +19,8 @@ In the first mode, it generates the c++ version of the witness generator through
 ```rust
     witness::generate::build_witness().unwrap();
 ```
+
+Enable the `build-witness` feature and point `CIRCOM_WITNESS` at the circuit. Includes outside the circuit's directory can be resolved with `CIRCOM_LIBRARY_PATH`. The old `WITNESS_CPP` variable remains available as a compatibility alias.
 
 **2. (At runtime) Generate witness:**
 ```rust
@@ -54,7 +56,7 @@ See this [example project](https://github.com/philsippl/semaphore-witness-exampl
 
 See `semaphore-rs` for an [example at runtime](https://github.com/worldcoin/semaphore-rs/blob/62f556bdc1a2a25021dcccc97af4dfa522ab5789/src/protocol/mod.rs#L161-L163).
 
-All of those example were used with `circom compiler 2.2.2` ([6f782d7](https://github.com/iden3/circom/tree/6f782d7)). Using a different version of circom might cause issues due to different c++ code being generated.
+Graph construction is pinned to the [Circom 2.2.2 compiler source](https://github.com/iden3/circom/tree/v2.2.2), so it does not depend on whichever `circom` executable happens to be installed on the host.
 
 ## Benchmarks
 
