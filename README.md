@@ -52,6 +52,17 @@ Unconstrained control flow is also supported through configurable blackbox funct
     let witness = witness::calculate_witness(inputs.clone(), &graph, Some(&bbfs)).unwrap();
 ```
 
+For repeated witnesses from the same graph, create a stateful evaluator after populating a
+positional input buffer with `get_input_mapping` and `populate_inputs`:
+
+```rust
+let mut evaluator = graph.evaluator(Some(&bbfs)).unwrap();
+let witness: &[U256] = evaluator.evaluate(&inputs_buffer).unwrap();
+```
+
+The evaluator resolves black-box callbacks once and reuses its execution and output buffers. The
+returned witness slice is overwritten by the next call to `evaluate` on that evaluator.
+
 See this [example project](https://github.com/philsippl/semaphore-witness-example) for Semaphore with an example. 
 
 See `semaphore-rs` for an [example at runtime](https://github.com/worldcoin/semaphore-rs/blob/62f556bdc1a2a25021dcccc97af4dfa522ab5789/src/protocol/mod.rs#L161-L163).

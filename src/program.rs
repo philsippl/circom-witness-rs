@@ -32,6 +32,25 @@ pub(crate) struct Program {
     input_count: usize,
 }
 
+#[derive(Default)]
+pub(crate) struct EvaluationWorkspace {
+    values: Vec<Fr>,
+    inverses: Vec<Fr>,
+    inversion_scratch: Vec<Fr>,
+    black_box_parameters: Vec<Fr>,
+    outputs: Vec<U256>,
+}
+
+impl EvaluationWorkspace {
+    pub(crate) fn outputs(&self) -> &[U256] {
+        &self.outputs
+    }
+}
+
+pub(crate) struct BoundBlackBoxes {
+    functions: Vec<BlackBoxFunction>,
+}
+
 #[derive(Debug, Clone)]
 enum Instruction {
     Input(usize),
@@ -532,6 +551,28 @@ impl Program {
         self.input_count.max(1)
     }
 
+    pub(crate) fn bind_black_boxes(
+        &self,
+        bbfs: Option<&HashMap<String, BlackBoxFunction>>,
+    ) -> eyre::Result<BoundBlackBoxes> {
+        if self.black_boxes.is_empty() {
+            return Ok(BoundBlackBoxes {
+                functions: Vec::new(),
+            });
+        }
+        let bbfs = bbfs.ok_or_else(|| eyre!("no black box functions provided"))?;
+        let functions = self
+            .black_boxes
+            .iter()
+            .map(|black_box| {
+                bbfs.get(&black_box.name)
+                    .cloned()
+                    .ok_or_else(|| eyre!("black box function {:?} not found", black_box.name))
+            })
+            .collect::<eyre::Result<Vec<_>>>()?;
+        Ok(BoundBlackBoxes { functions })
+    }
+
     /// Reorders the already-fused program into division-depth layers without expanding it back
     /// into a [`Node`] DAG. Programs produced by `compile` and `decode` are validated, so this pass
     /// only needs to calculate depths, renumber values, and build the division batch ranges.
@@ -748,10 +789,40 @@ impl Program {
         inputs: &[U256],
         bbfs: Option<&HashMap<String, BlackBoxFunction>>,
     ) -> eyre::Result<Vec<U256>> {
-        let mut values = Vec::with_capacity(self.value_count);
-        let mut inverses = Vec::new();
-        let mut inversion_scratch = Vec::new();
-        let mut black_box_parameters = Vec::new();
+        let mut workspace = EvaluationWorkspace::default();
+        self.evaluate_with_workspace(inputs, bbfs, None, &mut workspace)?;
+        Ok(workspace.outputs)
+    }
+
+    pub(crate) fn evaluate_prepared(
+        &self,
+        inputs: &[U256],
+        black_boxes: &BoundBlackBoxes,
+        workspace: &mut EvaluationWorkspace,
+    ) -> eyre::Result<()> {
+        self.evaluate_with_workspace(inputs, None, Some(black_boxes), workspace)
+    }
+
+    fn evaluate_with_workspace(
+        &self,
+        inputs: &[U256],
+        bbfs: Option<&HashMap<String, BlackBoxFunction>>,
+        bound_black_boxes: Option<&BoundBlackBoxes>,
+        workspace: &mut EvaluationWorkspace,
+    ) -> eyre::Result<()> {
+        let EvaluationWorkspace {
+            values,
+            inverses,
+            inversion_scratch,
+            black_box_parameters,
+            outputs,
+        } = workspace;
+        values.clear();
+        values.reserve(self.value_count);
+        inverses.clear();
+        black_box_parameters.clear();
+        outputs.clear();
+        outputs.reserve(self.outputs.len());
         let mut batches = self.division_batches.iter().peekable();
         let mut instruction_index = 0;
 
@@ -768,8 +839,9 @@ impl Program {
                     };
                     inverses.push(values[*divisor as usize]);
                 }
-                crate::graph::batch_inversion_u256(&mut inverses, &mut inversion_scratch);
-                for (instruction, inverse) in self.instructions[batch.clone()].iter().zip(&inverses)
+                crate::graph::batch_inversion_u256(inverses, inversion_scratch);
+                for (instruction, inverse) in
+                    self.instructions[batch.clone()].iter().zip(inverses.iter())
                 {
                     let Instruction::Op(Operation::Div, numerator, _) = instruction else {
                         unreachable!();
@@ -843,11 +915,16 @@ impl Program {
                     ));
                 }
                 Instruction::BlackBox(black_box) => {
-                    let black_box = &self.black_boxes[*black_box as usize];
-                    let bbfs = bbfs.ok_or_else(|| eyre!("no black box functions provided"))?;
-                    let function = bbfs.get(&black_box.name).ok_or_else(|| {
-                        eyre!("black box function {:?} not found", black_box.name)
-                    })?;
+                    let black_box_index = *black_box as usize;
+                    let black_box = &self.black_boxes[black_box_index];
+                    let function = if let Some(bound) = bound_black_boxes {
+                        &bound.functions[black_box_index]
+                    } else {
+                        let bbfs = bbfs.ok_or_else(|| eyre!("no black box functions provided"))?;
+                        bbfs.get(&black_box.name).ok_or_else(|| {
+                            eyre!("black box function {:?} not found", black_box.name)
+                        })?
+                    };
                     black_box_parameters.clear();
                     black_box_parameters.extend(
                         black_box
@@ -855,17 +932,18 @@ impl Program {
                             .iter()
                             .map(|&value| values[value as usize]),
                     );
-                    values.push(function(&black_box_parameters));
+                    values.push(function(black_box_parameters));
                 }
             }
             instruction_index += 1;
         }
 
-        Ok(self
-            .outputs
-            .iter()
-            .map(|&output| values[output].into())
-            .collect())
+        outputs.extend(
+            self.outputs
+                .iter()
+                .map(|&output| -> U256 { values[output].into() }),
+        );
+        Ok(())
     }
 
     fn validate(&self) -> eyre::Result<()> {

@@ -39,6 +39,17 @@ pub struct Graph {
     program: program::Program,
 }
 
+/// Stateful evaluator for repeated witnesses from the same graph.
+///
+/// Black-box callbacks are resolved when this is constructed, and execution buffers are retained
+/// between calls. The witness returned by [`WitnessEvaluator::evaluate`] remains valid only until
+/// the next evaluation on this object.
+pub struct WitnessEvaluator<'graph> {
+    graph: &'graph Graph,
+    black_boxes: program::BoundBlackBoxes,
+    workspace: program::EvaluationWorkspace,
+}
+
 #[derive(Debug, Clone)]
 struct CompatibilityGraph {
     nodes: Vec<Node>,
@@ -76,10 +87,34 @@ impl Graph {
         self.program.evaluate(inputs, bbfs)
     }
 
+    /// Prepares a stateful evaluator that reuses allocations and resolves black-box callbacks once.
+    pub fn evaluator(
+        &self,
+        bbfs: Option<&HashMap<String, BlackBoxFunction>>,
+    ) -> eyre::Result<WitnessEvaluator<'_>> {
+        Ok(WitnessEvaluator {
+            graph: self,
+            black_boxes: self.program.bind_black_boxes(bbfs)?,
+            workspace: program::EvaluationWorkspace::default(),
+        })
+    }
+
     /// Returns the number of compact runtime instructions after graph preparation and fusion.
     #[doc(hidden)]
     pub fn runtime_instruction_count(&self) -> usize {
         self.program.instruction_count()
+    }
+}
+
+impl WitnessEvaluator<'_> {
+    /// Evaluates one witness, reusing buffers retained from previous calls.
+    ///
+    /// The returned slice is backed by this evaluator and is overwritten by its next evaluation.
+    pub fn evaluate(&mut self, inputs: &[U256]) -> eyre::Result<&[U256]> {
+        self.graph
+            .program
+            .evaluate_prepared(inputs, &self.black_boxes, &mut self.workspace)?;
+        Ok(self.workspace.outputs())
     }
 }
 
@@ -354,6 +389,21 @@ mod tests {
             graph.evaluate(&inputs, Some(&bbfs)).unwrap()
         );
         assert!(graph.compatibility.get().is_some());
+
+        let expected = graph.evaluate(&inputs, Some(&bbfs)).unwrap();
+        let error = graph.evaluator(None).err().unwrap();
+        assert!(error
+            .to_string()
+            .contains("no black box functions provided"));
+        let mut evaluator = graph.evaluator(Some(&bbfs)).unwrap();
+        drop(bbfs);
+
+        let first = evaluator.evaluate(&inputs).unwrap();
+        assert_eq!(first, expected);
+        let output_allocation = first.as_ptr();
+        let second = evaluator.evaluate(&inputs).unwrap();
+        assert_eq!(second, expected);
+        assert_eq!(second.as_ptr(), output_allocation);
     }
 
     #[test]
@@ -409,6 +459,8 @@ mod tests {
         let encoded = serialize_graph(nodes, outputs, Vec::new()).unwrap();
         let graph = init_graph(&encoded).unwrap();
         assert_eq!(graph.evaluate(&inputs, None).unwrap(), expected);
+        let mut evaluator = graph.evaluator(None).unwrap();
+        assert_eq!(evaluator.evaluate(&inputs).unwrap(), expected);
     }
 
     #[test]
