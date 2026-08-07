@@ -119,11 +119,11 @@ pub fn get_input_hash_map() -> Vec<HashSignalInfo> {
     let mut bytes = &DAT_BYTES[..(ffi::get_size_of_input_hashmap() as usize) * 24];
     let mut input_hash_map =
         vec![HashSignalInfo::default(); ffi::get_size_of_input_hashmap() as usize];
-    for i in 0..ffi::get_size_of_input_hashmap() as usize {
+    for info in &mut input_hash_map {
         let hash = bytes.read_u64::<LittleEndian>().unwrap();
         let signalid = bytes.read_u64::<LittleEndian>().unwrap();
         let signalsize = bytes.read_u64::<LittleEndian>().unwrap();
-        input_hash_map[i] = HashSignalInfo {
+        *info = HashSignalInfo {
             hash,
             signalid,
             signalsize,
@@ -152,27 +152,26 @@ pub fn get_constants() -> Vec<FrElement> {
     let mut bytes = &DAT_BYTES[(ffi::get_size_of_input_hashmap() as usize) * 24
         + (ffi::get_size_of_witness() as usize) * 8..];
     let mut constants = vec![field::constant(U256::from(0)); ffi::get_size_of_constants() as usize];
-    for i in 0..ffi::get_size_of_constants() as usize {
-        let sv = bytes.read_i32::<LittleEndian>().unwrap() as i32;
-        let typ = bytes.read_u32::<LittleEndian>().unwrap() as u32;
+    for constant in &mut constants {
+        let sv = bytes.read_i32::<LittleEndian>().unwrap();
+        let typ = bytes.read_u32::<LittleEndian>().unwrap();
 
         let mut buf = [0; 32];
         bytes.read_exact(&mut buf).unwrap();
 
         if typ & 0x80000000 == 0 {
             let c = if sv < 0 {
-                M - U256::from(sv.abs() as u32)
+                M - U256::from(sv.unsigned_abs())
             } else {
                 U256::from(sv as u32)
             };
-            constants[i] = field::constant(c);
+            *constant = field::constant(c);
         } else {
-            constants[i] =
-                field::constant(U256::from_le_bytes(buf).mul_redc(uint!(1_U256), M, INV));
+            *constant = field::constant(U256::from_le_bytes(buf).mul_redc(uint!(1_U256), M, INV));
         }
     }
 
-    return constants;
+    constants
 }
 
 pub fn get_iosignals() -> Vec<InputOutputList> {
@@ -185,7 +184,6 @@ pub fn get_iosignals() -> Vec<InputOutputList> {
         + (ffi::get_size_of_witness() as usize) * 8
         + (ffi::get_size_of_constants() as usize * 40)..];
     let io_size = ffi::get_size_of_io_map() as usize;
-    let hashmap_size = ffi::get_size_of_input_hashmap() as usize;
     let mut indices = vec![0usize; io_size];
 
     (0..io_size).for_each(|i| {
@@ -226,8 +224,8 @@ pub fn get_iosignals() -> Vec<InputOutputList> {
     map
 }
 
-/// Run cpp witness generator and optimize graph
-pub fn build_witness() -> eyre::Result<()> {
+/// Run the C++ witness generator and return the optimized, serialized graph.
+pub fn generate_witness_graph() -> eyre::Result<Vec<u8>> {
     let mut signal_values = vec![];
     for i in 0..ffi::get_total_signal_no() as usize {
         signal_values.push(field::undefined(i));
@@ -237,8 +235,13 @@ pub fn build_witness() -> eyre::Result<()> {
     let main_input_start = ffi::get_main_input_signal_start() as usize;
     let main_input_len = ffi::get_main_input_signal_no() as usize;
 
-    for i in main_input_start..main_input_start + main_input_len {
-        signal_values[i] = field::input(i, uint!(0_U256));
+    for (i, signal) in signal_values
+        .iter_mut()
+        .enumerate()
+        .skip(main_input_start)
+        .take(main_input_len)
+    {
+        *signal = field::input(i, uint!(0_U256));
     }
 
     let mut ctx = ffi::Circom_CalcWit {
@@ -270,11 +273,16 @@ pub fn build_witness() -> eyre::Result<()> {
     // Optimize graph
     graph::optimize(&mut nodes, &mut signals);
 
-    // Store graph to file.
+    // Serialize the graph for the runtime witness generator.
     let input_map = get_input_hash_map();
     let bytes = postcard::to_stdvec(&(&nodes, &signals, &input_map)).unwrap();
     eprintln!("Graph size: {} bytes", bytes.len());
-    std::fs::write("graph.bin", bytes).unwrap();
 
+    Ok(bytes)
+}
+
+/// Run the C++ witness generator and write the optimized graph to `graph.bin`.
+pub fn build_witness() -> eyre::Result<()> {
+    std::fs::write("graph.bin", generate_witness_graph()?)?;
     Ok(())
 }

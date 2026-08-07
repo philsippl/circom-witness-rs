@@ -1,0 +1,4 @@
+[submodule "tests/fixtures/world-id-protocol"]
+	path = tests/fixtures/world-id-protocol
+	url = https://github.com/worldcoin/world-id-protocol.git
+	shallow = true
