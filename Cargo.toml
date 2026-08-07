@@ -38,3 +38,21 @@ debug = true
 
 [features]
 build-witness = ["dep:cxx"]
+test-semaphore = ["build-witness"]
+test-world-id = ["build-witness"]
+test-world-id-query = ["build-witness"]
+
+[[test]]
+name = "semaphore_witness"
+path = "tests/semaphore_witness.rs"
+required-features = ["test-semaphore"]
+
+[[test]]
+name = "world_id_witness"
+path = "tests/world_id_witness.rs"
+required-features = ["test-world-id"]
+
+[[test]]
+name = "world_id_query_witness"
+path = "tests/world_id_query_witness.rs"
+required-features = ["test-world-id-query"]

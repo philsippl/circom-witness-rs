@@ -21,6 +21,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
+        with:
+          submodules: true
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -34,3 +36,25 @@ jobs:
 
       - name: Build
         run: cargo build
+
+      - name: Install Circom 2.2.2
+        run: |
+          curl --fail --location \
+            https://github.com/iden3/circom/releases/download/v2.2.2/circom-linux-amd64 \
+            --output "$RUNNER_TEMP/circom"
+          chmod +x "$RUNNER_TEMP/circom"
+
+      - name: Compare Semaphore WASM and Rust witnesses
+        env:
+          CIRCOM: ${{ runner.temp }}/circom
+        run: cargo test --release --features test-semaphore --test semaphore_witness
+
+      - name: Compare World ID nullifier WASM and Rust witnesses
+        env:
+          CIRCOM: ${{ runner.temp }}/circom
+        run: cargo test --release --features test-world-id --test world_id_witness
+
+      - name: Compare World ID query WASM and Rust witnesses
+        env:
+          CIRCOM: ${{ runner.temp }}/circom
+        run: cargo test --release --features test-world-id-query --test world_id_query_witness
