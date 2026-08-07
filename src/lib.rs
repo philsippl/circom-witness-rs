@@ -1,8 +1,5 @@
 pub mod graph;
 
-#[cfg(feature = "build-witness")]
-pub mod generate;
-
 use std::{collections::HashMap, sync::Arc};
 
 use ark_bn254::Fr;
@@ -19,7 +16,6 @@ pub const M: U256 =
 
 const GRAPH_HEADER: &[u8; 8] = b"CWGR\x01DZ\0";
 const GRAPH_MAGIC: &[u8; 4] = b"CWGR";
-#[cfg(any(feature = "build-witness", test))]
 const GRAPH_COMPRESSION_LEVEL: i32 = 19;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,7 +50,6 @@ impl Graph {
     }
 }
 
-#[cfg(any(feature = "build-witness", test))]
 fn encode_backward_reference(node: usize, reference: usize) -> eyre::Result<usize> {
     node.checked_sub(reference)
         .and_then(|distance| distance.checked_sub(1))
@@ -70,7 +65,6 @@ fn decode_backward_reference(node: usize, distance: usize) -> eyre::Result<usize
     .ok_or_else(|| eyre!("graph reference distance {distance} is invalid at node {node}"))
 }
 
-#[cfg(any(feature = "build-witness", test))]
 fn encode_output_delta(output: usize, previous: usize) -> eyre::Result<usize> {
     if output >= previous {
         (output - previous)
@@ -96,8 +90,8 @@ fn decode_output_delta(encoded: usize, previous: usize) -> eyre::Result<usize> {
     }
 }
 
-#[cfg(any(feature = "build-witness", test))]
-pub(crate) fn serialize_graph(
+#[doc(hidden)]
+pub fn serialize_graph(
     mut nodes: Vec<Node>,
     mut signals: Vec<usize>,
     input_mapping: Vec<HashSignalInfo>,

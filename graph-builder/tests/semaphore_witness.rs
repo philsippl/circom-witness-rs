@@ -1,8 +1,11 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 mod common;
 
-use std::{env, fs, path::PathBuf};
+use std::path::PathBuf;
 
-use circom_witness_rs::{calculate_witness, generate::generate_witness_graph, init_graph};
+use circom_witness_graph_builder::generate_witness_graph_from_file;
+use circom_witness_rs::{calculate_witness, init_graph};
 
 use common::{assert_witnesses_equal, circom_inputs, wasm_witness};
 
@@ -39,26 +42,15 @@ const INPUT_JSON: &str = r#"
 
 #[test]
 fn semaphore_wasm_and_rust_witnesses_are_identical() {
-    if option_env!("CIRCOM_WITNESS_TEST_CIRCUIT") != Some("semaphore") {
-        eprintln!("skipping Semaphore parity test because a different test circuit was built");
-        return;
-    }
-
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_owned();
     let circuit = root.join("tests/fixtures/semaphore/semaphore.circom");
-    if let Some(configured_circuit) =
-        env::var_os("CIRCOM_WITNESS").or_else(|| env::var_os("WITNESS_CPP"))
-    {
-        assert_eq!(
-            fs::canonicalize(configured_circuit).unwrap(),
-            fs::canonicalize(&circuit).unwrap(),
-            "the test feature must be built against its Semaphore fixture"
-        );
-    }
 
     let wasm_witness = wasm_witness(&circuit, "semaphore", INPUT_JSON, &[]);
 
-    let graph_bytes = generate_witness_graph().unwrap();
+    let graph_bytes = generate_witness_graph_from_file(&circuit, &[]).unwrap();
     let graph = init_graph(&graph_bytes).unwrap();
     let rust_witness = calculate_witness(circom_inputs(INPUT_JSON), &graph, None).unwrap();
 

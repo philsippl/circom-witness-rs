@@ -29,13 +29,13 @@ jobs:
           toolchain: stable
 
       - name: Check code formatting
-        run: cargo fmt -- --check
+        run: cargo fmt --all -- --check
 
       - name: Run clippy
-        run: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Build
-        run: cargo build
+        run: cargo build --workspace
 
       - name: Install Circom 2.2.2
         run: |
@@ -47,14 +47,14 @@ jobs:
       - name: Compare Semaphore WASM and Rust witnesses
         env:
           CIRCOM: ${{ runner.temp }}/circom
-        run: cargo test --release --features test-semaphore --test semaphore_witness
+        run: cargo test -p circom-witness-graph-builder --release --features test-semaphore --test semaphore_witness
 
       - name: Compare World ID nullifier WASM and Rust witnesses
         env:
           CIRCOM: ${{ runner.temp }}/circom
-        run: cargo test --release --features test-world-id --test world_id_witness
+        run: cargo test -p circom-witness-graph-builder --release --features test-world-id --test world_id_witness
 
       - name: Compare World ID query WASM and Rust witnesses
         env:
           CIRCOM: ${{ runner.temp }}/circom
-        run: cargo test --release --features test-world-id-query --test world_id_query_witness
+        run: cargo test -p circom-witness-graph-builder --release --features test-world-id-query --test world_id_query_witness

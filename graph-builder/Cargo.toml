@@ -1,0 +1,46 @@
+[package]
+name = "circom-witness-graph-builder"
+description = "GPL-licensed Circom compiler frontend for circom-witness-rs graphs"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+publish = false
+repository = "https://github.com/philsippl/circom-witness-rs"
+authors = [
+  "Philipp Sippl <philsippl@users.noreply.github.com>",
+]
+
+[dependencies]
+circom-witness-rs = { path = "..", version = "0.3.0" }
+circom-compiler = { package = "compiler", git = "https://github.com/iden3/circom.git", rev = "e410b0d5cd2948a15931df0bc50d79ce56fa8c32" }
+circom-constraint-generation = { package = "constraint_generation", git = "https://github.com/iden3/circom.git", rev = "e410b0d5cd2948a15931df0bc50d79ce56fa8c32" }
+circom-parser = { package = "parser", git = "https://github.com/iden3/circom.git", rev = "e410b0d5cd2948a15931df0bc50d79ce56fa8c32" }
+circom-type-analysis = { package = "type_analysis", git = "https://github.com/iden3/circom.git", rev = "e410b0d5cd2948a15931df0bc50d79ce56fa8c32" }
+eyre = "0.6"
+rand = "0.8"
+ruint = { version = "1.19", features = ["rand", "ark-ff-06"] }
+
+[dev-dependencies]
+ark-bn254 = { version = "0.6", features = ["std"] }
+ark-ff = { version = "0.6", features = ["std"] }
+serde_json = "1"
+
+[features]
+test-semaphore = []
+test-world-id = []
+test-world-id-query = []
+
+[[test]]
+name = "semaphore_witness"
+path = "tests/semaphore_witness.rs"
+required-features = ["test-semaphore"]
+
+[[test]]
+name = "world_id_witness"
+path = "tests/world_id_witness.rs"
+required-features = ["test-world-id"]
+
+[[test]]
+name = "world_id_query_witness"
+path = "tests/world_id_query_witness.rs"
+required-features = ["test-world-id-query"]

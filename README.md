@@ -6,21 +6,21 @@
 
 This crate provides a fast witness generator for Circom circuits, serving as a drop-in replacement for Circom's witness generator. It was created in response to the slow performance of Circom's WASM generator for larger circuits, which also necessitates a WASM runtime, often a cumbersome requirement. The native C++ generator, though faster, depends on x86 assembly for field operations, rendering it impractical for use on other platforms (e.g., cross-compiling to ARM for mobile devices).
 
-`circom-witness-rs` comes with two modes:
+The repository contains two crates with a graph file as their boundary:
 
-1. Generate the static execution graph required for the witness generation at build time.
-2. Generate the witness elements at runtime from serialized graph.
+1. `circom-witness-graph-builder` compiles a circuit into a static execution graph as a one-off operation.
+2. `circom-witness-rs` loads that graph and generates witness elements at runtime.
 
 In the first mode, it compiles the circuit in-process with Circom 2.2.2 and symbolically executes the compiler's typed witness IR to build an execution graph. No generated C++, native compiler, or Rust/C++ bridge is involved. The graph is further optimized through constant propagation and dead code elimination, then serialized with backward-delta references and Zstandard compression. At runtime, independent field divisions are scheduled into batches so they share a single inversion. The graph can be embedded in the binary and interpreted to generate the witness. Legacy uncompressed Postcard graphs remain readable.
 
 ## Usage
 
-**1. (One-off) Create and optimize graph:**
-```rust
-    witness::generate::build_witness().unwrap();
+**1. (One-off) Create and optimize a graph:**
+```shell
+cargo run --release -p circom-witness-graph-builder -- circuit.circom graph.bin
 ```
 
-Enable the `build-witness` feature and point `CIRCOM_WITNESS` at the circuit. Includes outside the circuit's directory can be resolved with `CIRCOM_LIBRARY_PATH`. The old `WITNESS_CPP` variable remains available as a compatibility alias.
+Additional arguments are treated as Circom library search paths.
 
 **2. (At runtime) Generate witness:**
 ```rust
@@ -57,6 +57,10 @@ See this [example project](https://github.com/philsippl/semaphore-witness-exampl
 See `semaphore-rs` for an [example at runtime](https://github.com/worldcoin/semaphore-rs/blob/62f556bdc1a2a25021dcccc97af4dfa522ab5789/src/protocol/mod.rs#L161-L163).
 
 Graph construction is pinned to the [Circom 2.2.2 compiler source](https://github.com/iden3/circom/tree/v2.2.2), so it does not depend on whichever `circom` executable happens to be installed on the host.
+
+## Licensing
+
+The runtime crate `circom-witness-rs` is licensed under MIT and has no Circom compiler dependency. The separate `circom-witness-graph-builder` crate links to Circom's GPLv3 compiler crates and is licensed under `GPL-3.0-only`. Generated graph files are consumed by the MIT runtime without linking the builder or Circom into runtime applications.
 
 ## Benchmarks
 

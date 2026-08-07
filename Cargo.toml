@@ -1,3 +1,7 @@
+[workspace]
+members = ["graph-builder"]
+resolver = "2"
+
 [package]
 name = "circom-witness-rs"
 description = "Fast witness generator for Circom circuits"
@@ -15,16 +19,11 @@ authors = [
 ark-bn254 = { version = "0.6", features = ["std"] }
 ark-ff = { version = "0.6", features = ["std"] }
 ark-serialize = { version = "0.6", features = ["derive"] }
-circom-compiler = { package = "compiler", git = "https://github.com/iden3/circom.git", rev = "e410b0d5cd2948a15931df0bc50d79ce56fa8c32", optional = true }
-circom-constraint-generation = { package = "constraint_generation", git = "https://github.com/iden3/circom.git", rev = "e410b0d5cd2948a15931df0bc50d79ce56fa8c32", optional = true }
-circom-parser = { package = "parser", git = "https://github.com/iden3/circom.git", rev = "e410b0d5cd2948a15931df0bc50d79ce56fa8c32", optional = true }
-circom-type-analysis = { package = "type_analysis", git = "https://github.com/iden3/circom.git", rev = "e410b0d5cd2948a15931df0bc50d79ce56fa8c32", optional = true }
 eyre = "0.6"
 postcard = { version = "1", features = ["use-std"], default-features = false }
 rand = "0.8"
 ruint = { version = "1.19", features = ["rand", "serde", "ark-ff-06", "num-bigint"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 num-bigint = "0.4"
 zstd = { version = "0.13", default-features = false }
 
@@ -33,29 +32,3 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 debug = true
-
-[features]
-build-witness = [
-  "dep:circom-compiler",
-  "dep:circom-constraint-generation",
-  "dep:circom-parser",
-  "dep:circom-type-analysis",
-]
-test-semaphore = ["build-witness"]
-test-world-id = ["build-witness"]
-test-world-id-query = ["build-witness"]
-
-[[test]]
-name = "semaphore_witness"
-path = "tests/semaphore_witness.rs"
-required-features = ["test-semaphore"]
-
-[[test]]
-name = "world_id_witness"
-path = "tests/world_id_witness.rs"
-required-features = ["test-world-id"]
-
-[[test]]
-name = "world_id_query_witness"
-path = "tests/world_id_query_witness.rs"
-required-features = ["test-world-id-query"]

@@ -1,4 +1,9 @@
-use std::path::{Path, PathBuf};
+// SPDX-License-Identifier: GPL-3.0-only
+
+use std::{
+    env,
+    path::{Path, PathBuf},
+};
 
 use circom_compiler::{
     compiler_interface::{self, Circuit, Config},
@@ -13,7 +18,7 @@ use eyre::{bail, eyre, Context as _, Result};
 use rand::Rng as _;
 use ruint::aliases::U256;
 
-use crate::{
+use circom_witness_rs::{
     graph::{self, Node, Operation},
     serialize_graph, HashSignalInfo, M,
 };
@@ -920,14 +925,17 @@ pub fn generate_witness_graph_from_file(
     Ok(bytes)
 }
 
-/// Compile the circuit selected at build time and return its serialized witness graph.
+/// Compile the circuit selected through `CIRCOM_WITNESS` and return its serialized witness graph.
 pub fn generate_witness_graph() -> Result<Vec<u8>> {
-    let circuit_path = Path::new(env!("CIRCOM_WITNESS_CIRCUIT"));
-    let library_paths = option_env!("CIRCOM_WITNESS_LIBRARY_PATH")
+    let circuit_path = env::var_os("CIRCOM_WITNESS")
+        .or_else(|| env::var_os("WITNESS_CPP"))
+        .map(PathBuf::from)
+        .ok_or_else(|| eyre!("CIRCOM_WITNESS must point to the Circom circuit to compile"))?;
+    let library_paths = env::var_os("CIRCOM_LIBRARY_PATH")
         .map(PathBuf::from)
         .into_iter()
         .collect::<Vec<_>>();
-    generate_witness_graph_from_file(circuit_path, &library_paths)
+    generate_witness_graph_from_file(&circuit_path, &library_paths)
 }
 
 /// Compile the selected circuit and write its optimized graph to `graph.bin`.
