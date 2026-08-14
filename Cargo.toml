@@ -1,7 +1,11 @@
+[workspace]
+members = ["graph-builder"]
+resolver = "2"
+
 [package]
 name = "circom-witness-rs"
 description = "Fast witness generator for Circom circuits"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "MIT"
 keywords = ["cryptography", "ZK", "circom"]
@@ -15,44 +19,16 @@ authors = [
 ark-bn254 = { version = "0.6", features = ["std"] }
 ark-ff = { version = "0.6", features = ["std"] }
 ark-serialize = { version = "0.6", features = ["derive"] }
-byteorder = "1"
-cxx = { version = "1", optional = true }
 eyre = "0.6"
-hex = "0.4"
 postcard = { version = "1", features = ["use-std"], default-features = false }
 rand = "0.8"
 ruint = { version = "1.19", features = ["rand", "serde", "ark-ff-06", "num-bigint"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 num-bigint = "0.4"
-num-traits = "0.2"
-
-[build-dependencies]
-cxx-build = "1"
+zstd = { version = "0.13", default-features = false }
 
 [profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
 debug = true
-
-[features]
-build-witness = ["dep:cxx"]
-test-semaphore = ["build-witness"]
-test-world-id = ["build-witness"]
-test-world-id-query = ["build-witness"]
-
-[[test]]
-name = "semaphore_witness"
-path = "tests/semaphore_witness.rs"
-required-features = ["test-semaphore"]
-
-[[test]]
-name = "world_id_witness"
-path = "tests/world_id_witness.rs"
-required-features = ["test-world-id"]
-
-[[test]]
-name = "world_id_query_witness"
-path = "tests/world_id_query_witness.rs"
-required-features = ["test-world-id-query"]

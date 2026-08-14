@@ -2,3 +2,7 @@
 	path = tests/fixtures/world-id-protocol
 	url = https://github.com/worldcoin/world-id-protocol.git
 	shallow = true
+[submodule "graph-builder/tests/fixtures/circomlib"]
+	path = graph-builder/tests/fixtures/circomlib
+	url = https://github.com/iden3/circomlib.git
+	shallow = true
