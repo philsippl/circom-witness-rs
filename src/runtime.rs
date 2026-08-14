@@ -133,6 +133,11 @@ impl<'a> Interpreter<'a> {
                 return result;
             }
         }
+        if function_name_matches(&function.name, "long_sub_mod") {
+            if let Some(result) = evaluate_long_sub_mod(arguments, result_size) {
+                return result;
+            }
+        }
         for (name, specialization) in [
             (
                 "long_gt",
@@ -393,6 +398,15 @@ fn compose_limbs(limbs: &[Fr], n: usize) -> Option<BigUint> {
         })
 }
 
+fn u64_limb(value: Fr, n: usize) -> Option<u64> {
+    if n > 64 {
+        return None;
+    }
+    let value: U256 = value.into();
+    let value = u64::try_from(value).ok()?;
+    (n == 64 || value < (1_u64 << n)).then_some(value)
+}
+
 /// Recover the two array operands used by the fixed-width bigint helpers. Nested calls retain
 /// their exact Circom argument boundaries. Top-level graph calls currently retain only flattened
 /// parameters, so accept only the library's two unambiguous layouts: two `k`-limb values or two
@@ -427,6 +441,46 @@ fn two_array_operands<'a>(
         &arguments[left_start..left_start + k],
         &arguments[right_start..right_start + k],
     ))
+}
+
+fn padded_operand(arguments: &[Fr], start: usize, width: usize, k: usize) -> Option<&[Fr]> {
+    let operand = arguments.get(start..start + width)?;
+    (width >= k && operand[k..].iter().all(|value| *value == Fr::from(0_u64)))
+        .then_some(&operand[..k])
+}
+
+/// Recover three bigint operands when a top-level graph call has flattened their argument
+/// boundaries. Standard circom-pairing call sites use either `k` slots or a zero-padded 50-slot
+/// scratch array. Requiring exactly one valid partition avoids guessing when a different circuit
+/// uses another layout.
+fn three_array_operands(arguments: &[Fr], k: usize) -> Option<(&[Fr], &[Fr], &[Fr])> {
+    let widths = [k, 50];
+    let width_count = if k == 50 { 1 } else { 2 };
+    let mut match_ = None;
+    for &left_width in &widths[..width_count] {
+        for &right_width in &widths[..width_count] {
+            for &modulus_width in &widths[..width_count] {
+                if 2 + left_width + right_width + modulus_width != arguments.len() {
+                    continue;
+                }
+                let Some(left) = padded_operand(arguments, 2, left_width, k) else {
+                    continue;
+                };
+                let Some(right) = padded_operand(arguments, 2 + left_width, right_width, k) else {
+                    continue;
+                };
+                let Some(modulus) =
+                    padded_operand(arguments, 2 + left_width + right_width, modulus_width, k)
+                else {
+                    continue;
+                };
+                if match_.replace((left, right, modulus)).is_some() {
+                    return None;
+                }
+            }
+        }
+    }
+    match_
 }
 
 fn write_limbs(value: &BigUint, n: usize, output: &mut [Fr]) {
@@ -532,6 +586,16 @@ fn evaluate_long_gt(
         return None;
     }
     let (left, right) = two_array_operands(arguments, argument_layout, k)?;
+    if n <= 64 {
+        for (left, right) in left.iter().zip(right).rev() {
+            let left = u64_limb(*left, n)?;
+            let right = u64_limb(*right, n)?;
+            if left != right {
+                return Some(Ok(vec![Fr::from(left > right)]));
+            }
+        }
+        return Some(Ok(vec![Fr::from(0_u64)]));
+    }
     let left = compose_limbs(left, n)?;
     let right = compose_limbs(right, n)?;
     Some(Ok(vec![Fr::from(left > right)]))
@@ -547,6 +611,23 @@ fn evaluate_long_sub(
         return None;
     }
     let (left, right) = two_array_operands(arguments, argument_layout, k)?;
+    if n <= 64 {
+        let mut output = vec![Fr::from(0_u64); result_size];
+        let base = 1_u128 << n;
+        let mut borrow = 0_u128;
+        for ((left, right), destination) in left.iter().zip(right).zip(output[..k].iter_mut()) {
+            let left = u128::from(u64_limb(*left, n)?);
+            let right = u128::from(u64_limb(*right, n)?) + borrow;
+            let (difference, next_borrow) = if left >= right {
+                (left - right, 0)
+            } else {
+                (base + left - right, 1)
+            };
+            *destination = Fr::from(difference as u64);
+            borrow = next_borrow;
+        }
+        return Some(Ok(output));
+    }
     let left = compose_limbs(left, n)?;
     let right = compose_limbs(right, n)?;
     let modulus = BigUint::from(1_u8) << (n * k);
@@ -570,9 +651,43 @@ fn evaluate_long_add(
         return None;
     }
     let (left, right) = two_array_operands(arguments, argument_layout, k)?;
+    if n <= 64 {
+        let mut output = vec![Fr::from(0_u64); result_size];
+        let mask = (1_u128 << n) - 1;
+        let mut carry = 0_u128;
+        for ((left, right), destination) in left.iter().zip(right).zip(output[..k].iter_mut()) {
+            let sum = u128::from(u64_limb(*left, n)?) + u128::from(u64_limb(*right, n)?) + carry;
+            *destination = Fr::from((sum & mask) as u64);
+            carry = sum >> n;
+        }
+        output[k] = Fr::from(carry as u64);
+        return Some(Ok(output));
+    }
     let sum = compose_limbs(left, n)? + compose_limbs(right, n)?;
     let mut output = vec![Fr::from(0_u64); result_size];
     write_limbs(&sum, n, &mut output[..k + 1]);
+    Some(Ok(output))
+}
+
+fn evaluate_long_sub_mod(arguments: &[Fr], result_size: usize) -> Option<eyre::Result<Vec<Fr>>> {
+    let (n, k) = limb_width(arguments)?;
+    if result_size <= k {
+        return None;
+    }
+    let (left, right, modulus) = three_array_operands(arguments, k)?;
+    let left = compose_limbs(left, n)?;
+    let right = compose_limbs(right, n)?;
+    let modulus = compose_limbs(modulus, n)?;
+    let limb_modulus = BigUint::from(1_u8) << (n * k);
+    let difference = if right > left {
+        let modulus_minus_right = (modulus + &limb_modulus - right) % &limb_modulus;
+        left + modulus_minus_right
+    } else {
+        left - right
+    };
+
+    let mut output = vec![Fr::from(0_u64); result_size];
+    write_limbs(&difference, n, &mut output[..k + 1]);
     Some(Ok(output))
 }
 
@@ -608,6 +723,69 @@ fn evaluate_short_div_norm(arguments: &[Fr], result_size: usize) -> Option<eyre:
     };
     let right_start = 2 + left_width;
     debug_assert_eq!(right_start + right_width, arguments.len());
+    if n <= 64 {
+        let mut dividend_limbs = [0_u64; 51];
+        for (source, destination) in arguments[2..2 + k + 1].iter().zip(&mut dividend_limbs) {
+            *destination = u64_limb(*source, n)?;
+        }
+        let mut divisor_limbs = [0_u64; 50];
+        for (source, destination) in arguments[right_start..right_start + k]
+            .iter()
+            .zip(&mut divisor_limbs)
+        {
+            *destination = u64_limb(*source, n)?;
+        }
+        if divisor_limbs[k - 1] == 0
+            || (right_width > k && arguments[right_start + k] != Fr::from(0_u64))
+        {
+            return None;
+        }
+
+        let base = 1_u128 << n;
+        let mask = base - 1;
+        let numerator = u128::from(dividend_limbs[k]) * base + u128::from(dividend_limbs[k - 1]);
+        let mut quotient = (numerator / u128::from(divisor_limbs[k - 1])).min(mask) as u64;
+        let mut product = [0_u64; 51];
+        let mut carry = 0_u128;
+        for index in 0..k {
+            let value = u128::from(divisor_limbs[index]) * u128::from(quotient) + carry;
+            product[index] = (value & mask) as u64;
+            carry = value >> n;
+        }
+        product[k] = carry as u64;
+
+        let greater_than_dividend = |value: &[u64]| {
+            value[..k + 1]
+                .iter()
+                .zip(&dividend_limbs[..k + 1])
+                .rev()
+                .find_map(|(left, right)| (left != right).then_some(left > right))
+                .unwrap_or(false)
+        };
+        if greater_than_dividend(&product) {
+            quotient = quotient.checked_sub(1)?;
+            let mut borrow = 0_u128;
+            for index in 0..=k {
+                let left = u128::from(product[index]);
+                let right = if index < k {
+                    u128::from(divisor_limbs[index])
+                } else {
+                    0
+                } + borrow;
+                let (difference, next_borrow) = if left >= right {
+                    (left - right, 0)
+                } else {
+                    (base + left - right, 1)
+                };
+                product[index] = difference as u64;
+                borrow = next_borrow;
+            }
+            if greater_than_dividend(&product) {
+                quotient = quotient.checked_sub(1)?;
+            }
+        }
+        return Some(Ok(vec![Fr::from(quotient)]));
+    }
     let dividend = compose_limbs(&arguments[2..2 + k + 1], n)?;
     let divisor = compose_limbs(&arguments[right_start..right_start + k], n)?;
     if divisor == BigUint::from(0_u8) {
@@ -627,6 +805,19 @@ fn evaluate_long_scalar_mult(
     let (n, k) = limb_width(arguments)?;
     if arguments.len() < 3 + k || result_size < k + 1 {
         return None;
+    }
+    if n <= 64 {
+        let scalar = u128::from(u64_limb(arguments[2], n)?);
+        let mask = (1_u128 << n) - 1;
+        let mut output = vec![Fr::from(0_u64); result_size];
+        let mut carry = 0_u128;
+        for (operand, destination) in arguments[3..3 + k].iter().zip(output[..k].iter_mut()) {
+            let product = u128::from(u64_limb(*operand, n)?) * scalar + carry;
+            *destination = Fr::from((product & mask) as u64);
+            carry = product >> n;
+        }
+        output[k] = Fr::from(carry as u64);
+        return Some(Ok(output));
     }
     let scalar = BigUint::from(arguments[2]);
     let limb_bound = BigUint::from(1_u8) << n;
@@ -944,6 +1135,66 @@ mod tests {
             [Fr::from(0_u64), Fr::from(4_u64), Fr::from(0_u64)]
         );
         assert!(sum[3..].iter().all(|value| *value == Fr::from(0_u64)));
+    }
+
+    #[test]
+    fn modular_subtraction_recovers_zero_padded_operand_layouts() {
+        let function = RuntimeFunction {
+            name: "long_sub_mod_10".to_owned(),
+            variable_count: 0,
+            body: Vec::new(),
+        };
+
+        for widths in [[2, 2, 2], [50, 2, 2], [2, 50, 2], [50, 50, 2]] {
+            let mut arguments = vec![Fr::from(4_u64), Fr::from(2_u64)];
+            for (limbs, width) in [
+                ([5_u64, 0], widths[0]),
+                ([9, 0], widths[1]),
+                ([13, 0], widths[2]),
+            ] {
+                arguments.extend(limbs.map(Fr::from));
+                arguments.resize(arguments.len() + width - limbs.len(), Fr::from(0_u64));
+            }
+
+            let result = evaluate(std::slice::from_ref(&function), 0, &arguments, 0, 50).unwrap();
+            assert_eq!(result[0], Fr::from(9_u64), "widths {widths:?}");
+            assert!(result[1..].iter().all(|value| *value == Fr::from(0_u64)));
+        }
+    }
+
+    #[test]
+    fn short_division_matches_normalized_integer_quotients() {
+        let function = RuntimeFunction {
+            name: "short_div_norm_60".to_owned(),
+            variable_count: 0,
+            body: Vec::new(),
+        };
+        let base = 16_u64;
+
+        for divisor in [0x81_u64, 0x8f, 0x9a, 0xff] {
+            for quotient in 0..base {
+                for remainder in [0, 1, divisor / 2, divisor - 1] {
+                    let dividend = quotient * divisor + remainder;
+                    let mut arguments = vec![Fr::from(4_u64), Fr::from(2_u64)];
+                    arguments.extend(
+                        [
+                            dividend % base,
+                            (dividend / base) % base,
+                            dividend / (base * base),
+                        ]
+                        .map(Fr::from),
+                    );
+                    arguments.resize(52, Fr::from(0_u64));
+                    arguments.extend([divisor % base, divisor / base].map(Fr::from));
+                    arguments.resize(102, Fr::from(0_u64));
+
+                    assert_eq!(
+                        evaluate(std::slice::from_ref(&function), 0, &arguments, 0, 1).unwrap(),
+                        vec![Fr::from(quotient)]
+                    );
+                }
+            }
+        }
     }
 
     #[test]

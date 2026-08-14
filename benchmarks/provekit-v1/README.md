@@ -36,7 +36,7 @@ sample set. Only witness generation was run; proving was not run.
 | Self RSA-4096 register | 967,666 | 4,548,709 B | 403.400 ms | 2,851.167 ms (`rust-witness`) | 7.07x | 3,406.359 ms | 8.44x |
 | Self VC disclose | 145,722 | 405,473 B | 3.313 ms | 73.320 ms (`rust-witness`) | 22.13x | 116.092 ms | 35.04x |
 | Passport P1 | 965,282 | 4,549,230 B | 430.186 ms | 2,989.547 ms (`rust-witness`) | 6.95x | 3,415.550 ms | 7.94x |
-| WebAuthn | 3,413,073 | 27,175,055 B | 379.277 ms | 47,061.531 ms (`rust-witness`) | 124.08x | 53,456.554 ms | 140.94x |
+| WebAuthn | 3,413,073 | 27,175,055 B | 228.089 ms | 47,061.531 ms (`rust-witness`) | 206.33x | 53,456.554 ms | 234.37x |
 | World ID OPRF query | 34,155 | 173,558 B | 0.958 ms | 514.669 ms (`wasmi`) | 537.23x | 36.905 ms | 38.52x |
 | World ID OPRF nullifier | 73,756 | 231,061 B | 2.337 ms | 1,734.262 ms (`wasmi`) | 742.09x | 105.855 ms | 45.30x |
 
@@ -59,15 +59,22 @@ after warm-up.
 Profiling showed that interpreted `circom-pairing` bigint helpers consumed most of the remaining
 WebAuthn runtime. The witness runtime now recognizes Circom's numeric function specializations and
 executes `long_div2`, `short_div_norm`, `long_scalar_mult`, `long_gt`, `long_sub`, `long_add`,
-`signed_long_to_short`, `get_signed_Fp_carry_witness`, and `SplitFn` with native bigint arithmetic.
-Nested calls retain their exact argument boundaries; flattened top-level calls are accepted only
-for the bigint library's exact symmetric layouts. Unsupported signatures still fall back to the
-portable IR interpreter, and the constraint graph and witness signal ordering are unchanged.
+`long_sub_mod`, `signed_long_to_short`, `get_signed_Fp_carry_witness`, and `SplitFn` with native
+bigint arithmetic. Nested calls retain their exact argument boundaries; flattened top-level calls
+are accepted only when their `k`- or 50-limb zero-padded layout can be recovered unambiguously.
+Unsupported signatures still fall back to the portable IR interpreter, and the constraint graph
+and witness signal ordering are unchanged.
 
-On the same machine and graph, the final 25-sample hot median was 379.277 ms. That is an 82.4% time
-reduction (5.68x speedup) from the original 2,155.110 ms hybrid path, and a further 56.0% reduction
-(2.27x speedup) from the earlier 862.136 ms native-bigint result. Graph loading remained a separate
-cold-start cost (1,173.885 ms in the final run).
+The 43-bit WebAuthn helpers use direct `u64` limbs and `u128` carry/borrow arithmetic. The general
+graph evaluator also avoids heap-allocating bigint conversions for integer division and modulo,
+skips redundant field normalization for already-canonical values, and reduces 254-bit masked
+operations with at most one subtraction instead of general 256-bit division.
+
+On the same machine and graph, the final 25-sample hot median was 228.089 ms. That is an 89.4% time
+reduction (9.45x speedup) from the original 2,155.110 ms hybrid path, and a further 73.5% reduction
+(3.78x speedup) from the earlier 862.136 ms native-bigint result. This continuation alone reduced
+the preceding 379.277 ms result by 39.9% (1.66x). Graph loading remained a separate cold-start cost
+(1,184.350 ms in the final run).
 
 ## Correctness
 
