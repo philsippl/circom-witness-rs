@@ -18,6 +18,12 @@ struct Fixture {
 // These use circomlib's own entrypoint circuits and representative inputs from its upstream tests.
 // Keep the list focused: the purpose is broad witness-IR parity, not retesting circomlib itself.
 const FIXTURES: &[Fixture] = &[
+    // IsZero's inverse hint uses an input-dependent ternary.
+    Fixture {
+        circuit: "iszero.circom",
+        name: "iszero",
+        inputs: &[r#"{"in":111}"#, r#"{"in":0}"#],
+    },
     Fixture {
         circuit: "lessthan.circom",
         name: "lessthan",
@@ -59,6 +65,20 @@ const FIXTURES: &[Fixture] = &[
         circuit: "sha256_2_test.circom",
         name: "sha256_2_test",
         inputs: &[r#"{"a":"1","b":"2"}"#],
+    },
+    // Point2Bits_Strict calls sqrt, whose input-dependent branches and nested loops run at runtime.
+    Fixture {
+        circuit: "pointbits_loopback.circom",
+        name: "pointbits_loopback",
+        inputs: &[
+            r#"{
+                "in":[
+                    "5299619240641551281634865583518297030282874472190772894086521144482721001553",
+                    "16950150798460657717958625567821834550301663161624707787222815936182638968203"
+                ]
+            }"#,
+            r#"{"in":[0,1]}"#,
+        ],
     },
 ];
 
