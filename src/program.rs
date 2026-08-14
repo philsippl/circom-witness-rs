@@ -1,6 +1,7 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ops::Range,
+    sync::OnceLock,
 };
 
 use ark_bn254::Fr;
@@ -10,7 +11,11 @@ use ruint::aliases::U256;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    custom::{NativeRuntimeFunction, NativeSubgraphFunction, ResolvedNativeSubgraph},
     graph::{Node, Operation},
+    profile::{
+        ProfileCollector, ProfileFrame, SourceNodeRange, StructuralHotspot, StructuralOccurrence,
+    },
     runtime::RuntimeFunction,
     BlackBoxFunction, M,
 };
@@ -27,13 +32,27 @@ pub(crate) struct Program {
     linear3: Vec<[(u32, u32); 3]>,
     linear4: Vec<[(u32, u32); 4]>,
     black_boxes: Vec<BlackBoxInstruction>,
+    native_subgraphs: Vec<NativeInstruction>,
     runtime_functions: Vec<RuntimeFunction>,
+    native_runtime_functions: Vec<NativeRuntimeFunction>,
     runtime_calls: Vec<RuntimeCallInstruction>,
     runtime_call_count: usize,
     outputs: Vec<usize>,
     division_batches: Vec<Range<usize>>,
     value_count: usize,
     input_count: usize,
+    source_map: OnceLock<ProgramSourceMap>,
+}
+
+#[derive(Debug, Clone)]
+struct ProgramSourceMap {
+    /// Public [`Graph::nodes`](crate::Graph::nodes) IDs represented by each compact instruction.
+    instruction_sources: Vec<Vec<usize>>,
+    /// Public node IDs read by each instruction but represented by another instruction or pool.
+    instruction_boundary_sources: Vec<Vec<usize>>,
+    /// Public node ID that materializes each compact value.
+    value_sources: Vec<usize>,
+    node_count: usize,
 }
 
 #[derive(Default)]
@@ -42,6 +61,8 @@ pub(crate) struct EvaluationWorkspace {
     inverses: Vec<Fr>,
     inversion_scratch: Vec<Fr>,
     black_box_parameters: Vec<Fr>,
+    native_inputs: Vec<Fr>,
+    native_outputs: Vec<Fr>,
     runtime_parameters: Vec<Fr>,
     runtime_results: Vec<Vec<Fr>>,
     runtime_ready: Vec<bool>,
@@ -72,6 +93,7 @@ enum Instruction {
     Linear3(u32),
     Linear4(u32),
     BlackBox(u32),
+    Native(u32),
     RuntimeCall(u32),
 }
 
@@ -81,6 +103,25 @@ struct BlackBoxInstruction {
     parameters: Vec<u32>,
 }
 
+#[derive(Clone)]
+struct NativeInstruction {
+    name: String,
+    inputs: Vec<u32>,
+    output_count: usize,
+    function: NativeSubgraphFunction,
+}
+
+impl std::fmt::Debug for NativeInstruction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeInstruction")
+            .field("name", &self.name)
+            .field("inputs", &self.inputs)
+            .field("output_count", &self.output_count)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimeCallInstruction {
     function: usize,
@@ -88,6 +129,7 @@ struct RuntimeCallInstruction {
     output: usize,
     output_count: usize,
     arena_size: usize,
+    argument_sizes: Vec<usize>,
     parameters: Vec<u32>,
 }
 
@@ -119,6 +161,7 @@ enum EncodedInstruction {
         output: usize,
         output_count: usize,
         arena_size: usize,
+        argument_sizes: Vec<usize>,
         parameters: Vec<usize>,
     },
 }
@@ -127,6 +170,50 @@ enum EncodedInstruction {
 struct LinearSpec {
     terms: Vec<(usize, Fr)>,
     skip: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct StructuralShape {
+    fingerprint: [u8; 16],
+    compact_instructions: usize,
+    graph_nodes: usize,
+    boundary_values: usize,
+}
+
+#[derive(Clone, Copy)]
+struct StableShapeHasher {
+    left: u64,
+    right: u64,
+}
+
+impl StableShapeHasher {
+    fn new() -> Self {
+        Self {
+            left: 0xcbf29ce484222325,
+            right: 0x84222325cbf29ce4,
+        }
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.left ^= u64::from(byte);
+            self.left = self.left.wrapping_mul(0x100000001b3);
+            self.right ^= u64::from(byte);
+            self.right = self.right.wrapping_mul(0x100000001b3);
+            self.right ^= self.right.rotate_left(23);
+        }
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.write(&(value as u64).to_le_bytes());
+    }
+
+    fn finish(self) -> [u8; 16] {
+        let mut output = [0_u8; 16];
+        output[..8].copy_from_slice(&self.left.to_le_bytes());
+        output[8..].copy_from_slice(&self.right.to_le_bytes());
+        output
+    }
 }
 
 fn strip_suffix_number(name: &str) -> String {
@@ -180,13 +267,14 @@ fn add_linear_terms(
     nodes: &[Node],
     uses: &[usize],
     outputs: &HashSet<usize>,
+    opaque: &[bool],
     spec: &mut LinearSpec,
 ) {
     // Large generated graphs can contain very deep single-use addition chains. Keep this traversal
     // iterative so valid legacy or fused input cannot overflow the Rust call stack during init.
     let mut pending = vec![(index, sign, true)];
     while let Some((index, sign, flatten)) = pending.pop() {
-        let children = if flatten {
+        let children = if flatten && !opaque[index] {
             match nodes[index] {
                 Node::Op(Operation::Add, left, right) => Some([(left, sign), (right, sign)]),
                 Node::Op(Operation::Sub, left, right) => Some([(left, sign), (right, -sign)]),
@@ -203,14 +291,15 @@ fn add_linear_terms(
                     nodes[child],
                     Node::Op(Operation::Add | Operation::Sub, _, _)
                 ) && uses[child] == 1
-                    && !outputs.contains(&child);
+                    && !outputs.contains(&child)
+                    && !opaque[child];
                 if inline {
                     spec.skip.push(child);
                 }
                 pending.push((child, child_sign, inline));
             }
         } else {
-            add_linear_leaf(index, sign, nodes, uses, outputs, spec);
+            add_linear_leaf(index, sign, nodes, uses, outputs, opaque, spec);
         }
     }
 }
@@ -221,9 +310,10 @@ fn add_linear_leaf(
     nodes: &[Node],
     uses: &[usize],
     outputs: &HashSet<usize>,
+    opaque: &[bool],
     spec: &mut LinearSpec,
 ) {
-    if uses[index] == 1 && !outputs.contains(&index) {
+    if !opaque[index] && uses[index] == 1 && !outputs.contains(&index) {
         if let Node::Op(Operation::Mul, left, right) = nodes[index] {
             match (&nodes[left], &nodes[right]) {
                 (Node::MontConstant(coefficient), _) => {
@@ -259,6 +349,7 @@ fn linear_specs(
     nodes: &[Node],
     outputs: &[usize],
     uses: &[usize],
+    opaque: &[bool],
 ) -> (Vec<Option<LinearSpec>>, Vec<bool>) {
     let output_set = outputs.iter().copied().collect::<HashSet<_>>();
     let mut sole_user = vec![None; nodes.len()];
@@ -285,20 +376,30 @@ fn linear_specs(
     let mut specs = (0..nodes.len()).map(|_| None).collect::<Vec<_>>();
     let mut skip = vec![false; nodes.len()];
     for (index, node) in nodes.iter().enumerate() {
-        if !matches!(node, Node::Op(Operation::Add | Operation::Sub, _, _)) {
+        if opaque[index] || !matches!(node, Node::Op(Operation::Add | Operation::Sub, _, _)) {
             continue;
         }
         let is_inline_child = uses[index] == 1
             && !output_set.contains(&index)
+            && !opaque[index]
             && sole_user[index].is_some_and(|user| {
-                matches!(nodes[user], Node::Op(Operation::Add | Operation::Sub, _, _))
+                !opaque[user]
+                    && matches!(nodes[user], Node::Op(Operation::Add | Operation::Sub, _, _))
             });
         if is_inline_child {
             continue;
         }
 
         let mut spec = LinearSpec::default();
-        add_linear_terms(index, Fr::from(1_u64), nodes, uses, &output_set, &mut spec);
+        add_linear_terms(
+            index,
+            Fr::from(1_u64),
+            nodes,
+            uses,
+            &output_set,
+            opaque,
+            &mut spec,
+        );
         if (3..=4).contains(&spec.terms.len()) && !spec.skip.is_empty() {
             for &skipped in &spec.skip {
                 skip[skipped] = true;
@@ -337,7 +438,61 @@ pub(crate) fn compile(
     division_node_batches: &[Range<usize>],
     runtime_functions: Vec<RuntimeFunction>,
 ) -> eyre::Result<Program> {
+    compile_internal(
+        nodes,
+        outputs,
+        division_node_batches,
+        runtime_functions,
+        &[],
+        true,
+    )
+}
+
+/// Compiles directly to the on-disk form without retaining process-local profiling provenance.
+pub(crate) fn compile_for_serialization(
+    nodes: &[Node],
+    outputs: &[usize],
+    runtime_functions: Vec<RuntimeFunction>,
+) -> eyre::Result<Program> {
+    compile_internal(nodes, outputs, &[], runtime_functions, &[], false)
+}
+
+pub(crate) fn compile_with_native(
+    nodes: &[Node],
+    outputs: &[usize],
+    division_node_batches: &[Range<usize>],
+    runtime_functions: Vec<RuntimeFunction>,
+    replacements: &[ResolvedNativeSubgraph],
+) -> eyre::Result<Program> {
+    compile_internal(
+        nodes,
+        outputs,
+        division_node_batches,
+        runtime_functions,
+        replacements,
+        true,
+    )
+}
+
+fn compile_internal(
+    nodes: &[Node],
+    outputs: &[usize],
+    division_node_batches: &[Range<usize>],
+    runtime_functions: Vec<RuntimeFunction>,
+    replacements: &[ResolvedNativeSubgraph],
+    retain_source_map: bool,
+) -> eyre::Result<Program> {
     validate_graph(nodes, outputs)?;
+
+    let mut native_owner = vec![None; nodes.len()];
+    let mut native_activation = vec![None; nodes.len()];
+    for (replacement, subgraph) in replacements.iter().enumerate() {
+        for &node in &subgraph.covered {
+            native_owner[node] = Some(replacement);
+        }
+        native_activation[*subgraph.outputs.iter().min().unwrap()] = Some(replacement);
+    }
+    let opaque = native_owner.iter().map(Option::is_some).collect::<Vec<_>>();
 
     let mut uses = vec![0_usize; nodes.len()];
     for node in nodes {
@@ -361,7 +516,7 @@ pub(crate) fn compile(
             _ => {}
         }
     }
-    let (linear_specs, linear_skip) = linear_specs(nodes, outputs, &uses);
+    let (linear_specs, linear_skip) = linear_specs(nodes, outputs, &uses, &opaque);
     let output_set = outputs.iter().copied().collect::<HashSet<_>>();
     let mut coefficient_uses = vec![0_usize; nodes.len()];
     for (user, node) in nodes.iter().enumerate() {
@@ -390,20 +545,32 @@ pub(crate) fn compile(
         .iter()
         .enumerate()
         .map(|(index, &coefficient_uses)| {
-            coefficient_uses != 0 && coefficient_uses == uses[index] && !output_set.contains(&index)
+            !opaque[index]
+                && coefficient_uses != 0
+                && coefficient_uses == uses[index]
+                && !output_set.contains(&index)
         })
         .collect::<Vec<_>>();
 
     let mut pow5 = vec![None; nodes.len()];
     let mut pow5_skip = vec![false; nodes.len()];
     for (index, node) in nodes.iter().enumerate() {
+        if opaque[index] {
+            continue;
+        }
         let Node::Op(Operation::Mul, left, right) = node else {
             continue;
         };
         for (fourth, base) in [(*left, *right), (*right, *left)] {
+            if opaque[fourth] || opaque[base] {
+                continue;
+            }
             let Node::Op(Operation::Mul, square, same_square) = nodes[fourth] else {
                 continue;
             };
+            if opaque[square] || opaque[same_square] {
+                continue;
+            }
             if square != same_square {
                 continue;
             }
@@ -432,6 +599,7 @@ pub(crate) fn compile(
     let mut linear3 = Vec::new();
     let mut linear4 = Vec::new();
     let mut black_boxes = Vec::new();
+    let mut native_subgraphs = Vec::new();
     let mut runtime_calls = Vec::new();
     let mut runtime_call_count = 0_usize;
     let mut node_to_value = vec![None; nodes.len()];
@@ -440,6 +608,43 @@ pub(crate) fn compile(
     let mut input_count = 0_usize;
 
     for (node_index, node) in nodes.iter().enumerate() {
+        if let Some(replacement) = native_activation[node_index] {
+            let subgraph = &replacements[replacement];
+            let inputs = subgraph
+                .inputs
+                .iter()
+                .map(|&input| {
+                    node_to_value[input]
+                        .ok_or_else(|| {
+                            eyre!(
+                                "native subgraph {:?} input node {input} was not compiled before its first output",
+                                subgraph.name
+                            )
+                        })
+                        .and_then(|value| narrow_id(value, "value ID"))
+                })
+                .collect::<eyre::Result<Vec<_>>>()?;
+            let native = narrow_id(native_subgraphs.len(), "native subgraph ID")?;
+            native_subgraphs.push(NativeInstruction {
+                name: subgraph.name.clone(),
+                inputs,
+                output_count: subgraph.outputs.len(),
+                function: subgraph.function.clone(),
+            });
+            for (offset, &output) in subgraph.outputs.iter().enumerate() {
+                node_to_value[output] = Some(value_count + offset);
+            }
+            let instruction_index = instructions.len();
+            for &covered in &subgraph.covered {
+                node_to_instruction[covered] = Some(instruction_index);
+            }
+            instructions.push(Instruction::Native(native));
+            value_count += subgraph.outputs.len();
+            continue;
+        }
+        if native_owner[node_index].is_some() {
+            continue;
+        }
         if linear_skip[node_index] || coefficient_skip[node_index] || pow5_skip[node_index] {
             continue;
         }
@@ -539,6 +744,7 @@ pub(crate) fn compile(
                         output,
                         output_count,
                         arena_size,
+                        argument_sizes,
                         parameters,
                     } => {
                         let index = narrow_id(runtime_calls.len(), "runtime-call ID")?;
@@ -552,6 +758,7 @@ pub(crate) fn compile(
                             output: *output,
                             output_count: *output_count,
                             arena_size: *arena_size,
+                            argument_sizes: argument_sizes.clone(),
                             parameters: parameters
                                 .iter()
                                 .map(|parameter| {
@@ -568,7 +775,72 @@ pub(crate) fn compile(
             instruction
         };
         node_to_instruction[node_index] = Some(instruction_index);
+        if let Some((_, square, fourth)) = pow5[node_index] {
+            node_to_instruction[square] = Some(instruction_index);
+            node_to_instruction[fourth] = Some(instruction_index);
+        }
+        if let Some(spec) = &linear_specs[node_index] {
+            for &skipped in &spec.skip {
+                node_to_instruction[skipped] = Some(instruction_index);
+            }
+        }
         instructions.push(instruction);
+    }
+
+    let source_map = retain_source_map.then(|| {
+        let mut instruction_sources = vec![Vec::new(); instructions.len()];
+        for (node, instruction) in node_to_instruction.iter().enumerate() {
+            if let Some(instruction) = instruction {
+                instruction_sources[*instruction].push(node);
+            }
+        }
+        let instruction_boundary_sources = instruction_sources
+            .iter()
+            .map(|sources| {
+                let covered = sources.iter().copied().collect::<HashSet<_>>();
+                let mut boundaries = BTreeSet::new();
+                for &source in sources {
+                    match &nodes[source] {
+                        Node::Op(_, left, right) => {
+                            if !covered.contains(left) {
+                                boundaries.insert(*left);
+                            }
+                            if !covered.contains(right) {
+                                boundaries.insert(*right);
+                            }
+                        }
+                        Node::BBF(_, parameters) | Node::RuntimeCall { parameters, .. } => {
+                            boundaries.extend(
+                                parameters
+                                    .iter()
+                                    .copied()
+                                    .filter(|parameter| !covered.contains(parameter)),
+                            );
+                        }
+                        Node::Input(_) | Node::Constant(_) | Node::MontConstant(_) => {}
+                    }
+                }
+                boundaries.into_iter().collect()
+            })
+            .collect();
+        let mut value_sources = vec![usize::MAX; value_count];
+        for (node, value) in node_to_value.iter().enumerate() {
+            if let Some(value) = value {
+                value_sources[*value] = node;
+            }
+        }
+        ProgramSourceMap {
+            instruction_sources,
+            instruction_boundary_sources,
+            value_sources,
+            node_count: nodes.len(),
+        }
+    });
+    if source_map
+        .as_ref()
+        .is_some_and(|source_map| source_map.value_sources.contains(&usize::MAX))
+    {
+        bail!("compiled program value is missing graph-node provenance");
     }
 
     let outputs = outputs
@@ -605,21 +877,436 @@ pub(crate) fn compile(
         linear3,
         linear4,
         black_boxes,
+        native_subgraphs,
         runtime_functions,
+        native_runtime_functions: Vec::new(),
         runtime_calls,
         runtime_call_count,
         outputs,
         division_batches,
         value_count,
         input_count,
+        source_map: source_map.map_or_else(OnceLock::new, OnceLock::from),
     };
     program.validate()?;
     Ok(program)
 }
 
 impl Program {
+    fn instruction_output_count(&self, instruction: &Instruction) -> usize {
+        match instruction {
+            Instruction::Pow5(_) => 3,
+            Instruction::Native(native) => self.native_subgraphs[*native as usize].output_count,
+            _ => 1,
+        }
+    }
+
     pub(crate) fn instruction_count(&self) -> usize {
         self.instructions.len()
+    }
+
+    pub(crate) fn has_customizations(&self) -> bool {
+        !self.native_subgraphs.is_empty() || !self.native_runtime_functions.is_empty()
+    }
+
+    pub(crate) fn runtime_functions(&self) -> &[RuntimeFunction] {
+        &self.runtime_functions
+    }
+
+    pub(crate) fn instruction_mix(&self) -> Vec<(String, usize)> {
+        let mut counts = BTreeMap::<String, usize>::new();
+        for instruction in &self.instructions {
+            let operation = match instruction {
+                Instruction::Input(_) => "input".to_owned(),
+                Instruction::Constant(_) => "constant".to_owned(),
+                Instruction::Mul(_, _) => "mul".to_owned(),
+                Instruction::Add(_, _) => "add".to_owned(),
+                Instruction::Sub(_, _) => "sub".to_owned(),
+                Instruction::Op(operation, _, _) => format!("op:{operation:?}"),
+                Instruction::Square(_) => "square".to_owned(),
+                Instruction::Pow5(_) => "pow5".to_owned(),
+                Instruction::Linear3(_) => "linear3".to_owned(),
+                Instruction::Linear4(_) => "linear4".to_owned(),
+                Instruction::BlackBox(black_box) => {
+                    format!("black_box:{}", self.black_boxes[*black_box as usize].name)
+                }
+                Instruction::Native(native) => format!(
+                    "native_subgraph:{}",
+                    self.native_subgraphs[*native as usize].name
+                ),
+                Instruction::RuntimeCall(runtime_call) => {
+                    let runtime_call = &self.runtime_calls[*runtime_call as usize];
+                    format!(
+                        "runtime_call:{}",
+                        self.runtime_functions[runtime_call.function].name
+                    )
+                }
+            };
+            *counts.entry(operation).or_default() += 1;
+        }
+        counts.into_iter().collect()
+    }
+
+    pub(crate) fn has_source_provenance(&self) -> bool {
+        self.source_map.get().is_some()
+    }
+
+    pub(crate) fn source_node_ranges(&self, instructions: Range<usize>) -> Vec<SourceNodeRange> {
+        let Some(source_map) = self.source_map.get() else {
+            return Vec::new();
+        };
+        let end = instructions.end.min(source_map.instruction_sources.len());
+        if instructions.start >= end {
+            return Vec::new();
+        }
+        source_ranges(
+            source_map.instruction_sources[instructions.start..end]
+                .iter()
+                .flatten()
+                .copied(),
+        )
+    }
+
+    fn instruction_operands(&self, instruction: &Instruction) -> Vec<usize> {
+        match instruction {
+            Instruction::Input(_) | Instruction::Constant(_) => Vec::new(),
+            Instruction::Mul(left, right)
+            | Instruction::Add(left, right)
+            | Instruction::Sub(left, right)
+            | Instruction::Op(_, left, right) => vec![*left as usize, *right as usize],
+            Instruction::Square(value) | Instruction::Pow5(value) => vec![*value as usize],
+            Instruction::Linear3(linear) => self.linear3[*linear as usize]
+                .iter()
+                .map(|&(value, _)| value as usize)
+                .collect(),
+            Instruction::Linear4(linear) => self.linear4[*linear as usize]
+                .iter()
+                .map(|&(value, _)| value as usize)
+                .collect(),
+            Instruction::BlackBox(black_box) => self.black_boxes[*black_box as usize]
+                .parameters
+                .iter()
+                .map(|&value| value as usize)
+                .collect(),
+            Instruction::Native(native) => self.native_subgraphs[*native as usize]
+                .inputs
+                .iter()
+                .map(|&value| value as usize)
+                .collect(),
+            Instruction::RuntimeCall(runtime_call) => self.runtime_calls[*runtime_call as usize]
+                .parameters
+                .iter()
+                .map(|&value| value as usize)
+                .collect(),
+        }
+    }
+
+    fn instruction_operation_label(&self, instruction: &Instruction) -> String {
+        match instruction {
+            Instruction::Input(_) => "input".to_owned(),
+            Instruction::Constant(_) => "constant".to_owned(),
+            Instruction::Mul(_, _) => "mul".to_owned(),
+            Instruction::Add(_, _) => "add".to_owned(),
+            Instruction::Sub(_, _) => "sub".to_owned(),
+            Instruction::Op(operation, _, _) => format!("op:{operation:?}"),
+            Instruction::Square(_) => "square".to_owned(),
+            Instruction::Pow5(_) => "pow5".to_owned(),
+            Instruction::Linear3(_) => "linear3".to_owned(),
+            Instruction::Linear4(_) => "linear4".to_owned(),
+            Instruction::BlackBox(black_box) => {
+                format!("black_box:{}", self.black_boxes[*black_box as usize].name)
+            }
+            Instruction::Native(native) => format!(
+                "native_subgraph:{}",
+                self.native_subgraphs[*native as usize].name
+            ),
+            Instruction::RuntimeCall(runtime_call) => {
+                let runtime_call = &self.runtime_calls[*runtime_call as usize];
+                format!(
+                    "runtime_call:{}",
+                    self.runtime_functions[runtime_call.function].name
+                )
+            }
+        }
+    }
+
+    fn is_structural_instruction(instruction: &Instruction) -> bool {
+        !matches!(
+            instruction,
+            Instruction::Input(_)
+                | Instruction::Constant(_)
+                | Instruction::BlackBox(_)
+                | Instruction::Native(_)
+                | Instruction::RuntimeCall(_)
+        )
+    }
+
+    fn hash_instruction_semantics(
+        &self,
+        instruction: &Instruction,
+        hasher: &mut StableShapeHasher,
+    ) {
+        let label = self.instruction_operation_label(instruction);
+        hasher.write(label.as_bytes());
+        match instruction {
+            Instruction::Linear3(linear) => {
+                for &(_, coefficient) in &self.linear3[*linear as usize] {
+                    hasher.write(&fr_bytes(self.coefficients[coefficient as usize]));
+                }
+            }
+            Instruction::Linear4(linear) => {
+                for &(_, coefficient) in &self.linear4[*linear as usize] {
+                    hasher.write(&fr_bytes(self.coefficients[coefficient as usize]));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn structural_hotspots(
+        &self,
+        instruction_costs: &[u64],
+        trace_total_ns: u64,
+        maximum: usize,
+    ) -> Vec<StructuralHotspot> {
+        let Some(source_map) = self.source_map.get() else {
+            return Vec::new();
+        };
+        if instruction_costs.len() != self.instructions.len() {
+            return Vec::new();
+        }
+
+        let mut instruction_values = Vec::with_capacity(self.instructions.len());
+        let mut value_producers = vec![usize::MAX; self.value_count];
+        let mut next_value = 0_usize;
+        for (instruction, operation) in self.instructions.iter().enumerate() {
+            let start = next_value;
+            next_value += self.instruction_output_count(operation);
+            for producer in &mut value_producers[start..next_value] {
+                *producer = instruction;
+            }
+            instruction_values.push(start..next_value);
+        }
+
+        let mut value_users = vec![0_usize; self.value_count];
+        for instruction in &self.instructions {
+            let mut operands = self.instruction_operands(instruction);
+            operands.sort_unstable();
+            operands.dedup();
+            for operand in operands {
+                value_users[operand] += 1;
+            }
+        }
+        let output_values = self.outputs.iter().copied().collect::<HashSet<_>>();
+
+        let mut shapes = Vec::<StructuralShape>::with_capacity(self.instructions.len());
+        let mut children = Vec::<Vec<usize>>::with_capacity(self.instructions.len());
+        let mut groups = BTreeMap::<(StructuralShape, String), Vec<usize>>::new();
+        for (instruction_index, instruction) in self.instructions.iter().enumerate() {
+            let operands = self.instruction_operands(instruction);
+            let mut hasher = StableShapeHasher::new();
+            self.hash_instruction_semantics(instruction, &mut hasher);
+            let mut boundary_ordinals = BTreeMap::<usize, usize>::new();
+            let mut instruction_children = BTreeSet::new();
+            for operand in operands {
+                let producer = value_producers[operand];
+                let producer_is_owned = producer < instruction_index
+                    && Self::is_structural_instruction(&self.instructions[producer])
+                    && value_users[operand] == 1
+                    && !output_values.contains(&operand)
+                    && instruction_values[producer].clone().all(|produced| {
+                        produced == operand
+                            || (value_users[produced] == 0 && !output_values.contains(&produced))
+                    });
+                if producer_is_owned {
+                    hasher.write(b"child");
+                    hasher.write(&shapes[producer].fingerprint);
+                    instruction_children.insert(producer);
+                } else {
+                    let next_ordinal = boundary_ordinals.len();
+                    let ordinal = *boundary_ordinals.entry(operand).or_insert(next_ordinal);
+                    hasher.write(b"boundary");
+                    hasher.write_usize(ordinal);
+                    let kind = match &self.instructions[producer] {
+                        Instruction::Input(_) => b"input".as_slice(),
+                        Instruction::Constant(_) => b"constant".as_slice(),
+                        _ => b"computed".as_slice(),
+                    };
+                    hasher.write(kind);
+                }
+            }
+            let instruction_children = instruction_children.into_iter().collect::<Vec<_>>();
+            let shape = StructuralShape {
+                fingerprint: hasher.finish(),
+                compact_instructions: 1 + instruction_children
+                    .iter()
+                    .map(|&child| shapes[child].compact_instructions)
+                    .sum::<usize>(),
+                graph_nodes: source_map.instruction_sources[instruction_index].len()
+                    + instruction_children
+                        .iter()
+                        .map(|&child| shapes[child].graph_nodes)
+                        .sum::<usize>(),
+                boundary_values: boundary_ordinals.len()
+                    + instruction_children
+                        .iter()
+                        .map(|&child| shapes[child].boundary_values)
+                        .sum::<usize>(),
+            };
+            children.push(instruction_children);
+            shapes.push(shape);
+            if Self::is_structural_instruction(instruction)
+                && (shape.compact_instructions >= 2 || shape.graph_nodes >= 2)
+            {
+                groups
+                    .entry((shape, self.instruction_operation_label(instruction)))
+                    .or_default()
+                    .push(instruction_index);
+            }
+        }
+
+        let denominator = trace_total_ns.max(1) as f64;
+        let mut hotspots = groups
+            .into_iter()
+            .filter(|(_, roots)| roots.len() >= 2)
+            .map(|((shape, root_operation), roots)| {
+                let occurrence_instructions = roots
+                    .iter()
+                    .map(|&root| structural_closure(root, &children))
+                    .collect::<Vec<_>>();
+                let unique_instructions = occurrence_instructions
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .collect::<BTreeSet<_>>();
+                let estimated_inclusive_ns = unique_instructions
+                    .iter()
+                    .fold(0_u64, |sum, &i| sum.saturating_add(instruction_costs[i]));
+                let samples = roots
+                    .iter()
+                    .zip(&occurrence_instructions)
+                    .take(3)
+                    .map(|(&root, instructions)| {
+                        let covered_nodes = instructions
+                            .iter()
+                            .flat_map(|&instruction| {
+                                source_map.instruction_sources[instruction].iter().copied()
+                            })
+                            .collect::<BTreeSet<_>>();
+                        let boundary_source_nodes = instructions
+                            .iter()
+                            .flat_map(|&instruction| {
+                                source_map.instruction_boundary_sources[instruction]
+                                    .iter()
+                                    .copied()
+                            })
+                            .filter(|node| !covered_nodes.contains(node))
+                            .collect::<BTreeSet<_>>()
+                            .into_iter()
+                            .collect();
+                        let root_source_nodes = instruction_values[root]
+                            .clone()
+                            .map(|value| source_map.value_sources[value])
+                            .collect::<BTreeSet<_>>()
+                            .into_iter()
+                            .collect();
+                        StructuralOccurrence {
+                            root_instruction: root,
+                            root_source_nodes,
+                            compact_instruction_count: instructions.len(),
+                            source_node_ranges: source_ranges(covered_nodes),
+                            boundary_source_nodes,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let graph_nodes_per_occurrence =
+                    samples.first().map_or(shape.graph_nodes, |sample| {
+                        sample
+                            .source_node_ranges
+                            .iter()
+                            .map(|range| range.end - range.start)
+                            .sum()
+                    });
+                let boundary_values_per_occurrence =
+                    samples.first().map_or(shape.boundary_values, |sample| {
+                        sample.boundary_source_nodes.len()
+                    });
+                StructuralHotspot {
+                    fingerprint: shape
+                        .fingerprint
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect(),
+                    root_operation,
+                    occurrences: roots.len(),
+                    compact_instructions_per_occurrence: shape.compact_instructions,
+                    graph_nodes_per_occurrence,
+                    boundary_values_per_occurrence,
+                    total_unique_compact_instructions: unique_instructions.len(),
+                    estimated_inclusive_ns,
+                    estimated_inclusive_percent: estimated_inclusive_ns as f64 * 100.0
+                        / denominator,
+                    samples,
+                }
+            })
+            .collect::<Vec<_>>();
+        hotspots.sort_by(|left, right| {
+            right
+                .estimated_inclusive_ns
+                .cmp(&left.estimated_inclusive_ns)
+                .then_with(|| right.occurrences.cmp(&left.occurrences))
+                .then_with(|| left.fingerprint.cmp(&right.fingerprint))
+        });
+        if maximum != 0 {
+            hotspots.truncate(maximum);
+        }
+        hotspots
+    }
+
+    fn special_instruction_profile_frame(&self, index: usize) -> Option<ProfileFrame> {
+        let label = match &self.instructions[index] {
+            Instruction::BlackBox(black_box) => format!(
+                "instruction[{index}]:black_box:{}",
+                self.black_boxes[*black_box as usize].name
+            ),
+            Instruction::Native(native) => format!(
+                "instruction[{index}]:native_subgraph:{}",
+                self.native_subgraphs[*native as usize].name
+            ),
+            Instruction::RuntimeCall(runtime_call) => {
+                let runtime_call = &self.runtime_calls[*runtime_call as usize];
+                let name = &self.runtime_functions[runtime_call.function].name;
+                format!(
+                    "instruction[{index}]:runtime_call:{name}:output[{}]",
+                    runtime_call.output
+                )
+            }
+            _ => return None,
+        };
+        Some(ProfileFrame::instruction(index, label))
+    }
+
+    pub(crate) fn with_native_runtime_functions(
+        mut self,
+        functions: Vec<NativeRuntimeFunction>,
+    ) -> eyre::Result<Self> {
+        for function in &functions {
+            if function.matcher().is_empty() {
+                bail!("native runtime-function matchers must not be empty");
+            }
+            if !self
+                .runtime_functions
+                .iter()
+                .any(|candidate| function.matcher().matches(&candidate.name))
+            {
+                bail!(
+                    "native runtime-function matcher {:?} matches no function in this graph",
+                    function.matcher()
+                );
+            }
+        }
+        self.native_runtime_functions = functions;
+        Ok(self)
     }
 
     pub(crate) fn input_count(&self) -> usize {
@@ -703,6 +1390,12 @@ impl Program {
                     .try_fold(0_usize, |depth, &value| {
                         Ok::<_, eyre::Report>(depth.max(value_depth(value)?))
                     })?,
+                Instruction::Native(native) => self.native_subgraphs[*native as usize]
+                    .inputs
+                    .iter()
+                    .try_fold(0_usize, |depth, &value| {
+                        Ok::<_, eyre::Report>(depth.max(value_depth(value)?))
+                    })?,
                 Instruction::RuntimeCall(runtime_call) => self.runtime_calls
                     [*runtime_call as usize]
                     .parameters
@@ -713,11 +1406,7 @@ impl Program {
             };
             max_depth = max_depth.max(depth);
             instruction_depths.push(depth);
-            let produced_values = if matches!(instruction, Instruction::Pow5(_)) {
-                3
-            } else {
-                1
-            };
+            let produced_values = self.instruction_output_count(instruction);
             value_depths.extend(std::iter::repeat_n(depth, produced_values));
         }
         if value_depths.len() != self.value_count {
@@ -755,22 +1444,14 @@ impl Program {
         let mut next_value = 0_usize;
         for instruction in &self.instructions {
             old_value_starts.push(next_value);
-            next_value += if matches!(instruction, Instruction::Pow5(_)) {
-                3
-            } else {
-                1
-            };
+            next_value += self.instruction_output_count(instruction);
         }
         let mut value_renumber = vec![usize::MAX; self.value_count];
         let mut next_value = 0_usize;
         for &old_instruction in &order {
             let old_start = old_value_starts[old_instruction];
             let produced_values =
-                if matches!(self.instructions[old_instruction], Instruction::Pow5(_)) {
-                    3
-                } else {
-                    1
-                };
+                self.instruction_output_count(&self.instructions[old_instruction]);
             for offset in 0..produced_values {
                 value_renumber[old_start + offset] = next_value + offset;
             }
@@ -790,8 +1471,33 @@ impl Program {
         let mut linear3 = Vec::with_capacity(self.linear3.len());
         let mut linear4 = Vec::with_capacity(self.linear4.len());
         let mut black_boxes = Vec::with_capacity(self.black_boxes.len());
+        let mut native_subgraphs = Vec::with_capacity(self.native_subgraphs.len());
         let mut runtime_calls = Vec::with_capacity(self.runtime_calls.len());
+        let mut reordered_source_map = self.source_map.get().map(|source_map| ProgramSourceMap {
+            instruction_sources: Vec::with_capacity(source_map.instruction_sources.len()),
+            instruction_boundary_sources: Vec::with_capacity(
+                source_map.instruction_boundary_sources.len(),
+            ),
+            value_sources: Vec::with_capacity(source_map.value_sources.len()),
+            node_count: source_map.node_count,
+        });
         for old_instruction in order {
+            if let (Some(source_map), Some(reordered)) =
+                (self.source_map.get(), reordered_source_map.as_mut())
+            {
+                reordered
+                    .instruction_sources
+                    .push(source_map.instruction_sources[old_instruction].clone());
+                reordered
+                    .instruction_boundary_sources
+                    .push(source_map.instruction_boundary_sources[old_instruction].clone());
+                let old_start = old_value_starts[old_instruction];
+                let output_count =
+                    self.instruction_output_count(&self.instructions[old_instruction]);
+                reordered.value_sources.extend_from_slice(
+                    &source_map.value_sources[old_start..old_start + output_count],
+                );
+            }
             let instruction = match &self.instructions[old_instruction] {
                 Instruction::Input(input) => Instruction::Input(*input),
                 Instruction::Constant(coefficient) => Instruction::Constant(*coefficient),
@@ -843,6 +1549,21 @@ impl Program {
                     });
                     Instruction::BlackBox(index)
                 }
+                Instruction::Native(native) => {
+                    let native = &self.native_subgraphs[*native as usize];
+                    let index = narrow_id(native_subgraphs.len(), "native subgraph ID")?;
+                    native_subgraphs.push(NativeInstruction {
+                        name: native.name.clone(),
+                        inputs: native
+                            .inputs
+                            .iter()
+                            .map(|&value| remap_value(value))
+                            .collect::<eyre::Result<Vec<_>>>()?,
+                        output_count: native.output_count,
+                        function: native.function.clone(),
+                    });
+                    Instruction::Native(index)
+                }
                 Instruction::RuntimeCall(runtime_call) => {
                     let runtime_call = &self.runtime_calls[*runtime_call as usize];
                     let index = narrow_id(runtime_calls.len(), "runtime-call ID")?;
@@ -864,7 +1585,9 @@ impl Program {
         self.linear3 = linear3;
         self.linear4 = linear4;
         self.black_boxes = black_boxes;
+        self.native_subgraphs = native_subgraphs;
         self.runtime_calls = runtime_calls;
+        self.source_map = reordered_source_map.map_or_else(OnceLock::new, OnceLock::from);
         self.outputs = self
             .outputs
             .into_iter()
@@ -887,7 +1610,7 @@ impl Program {
         bbfs: Option<&HashMap<String, BlackBoxFunction>>,
     ) -> eyre::Result<Vec<U256>> {
         let mut workspace = EvaluationWorkspace::default();
-        self.evaluate_with_workspace(inputs, bbfs, None, &mut workspace)?;
+        self.evaluate_with_workspace(inputs, bbfs, None, &mut workspace, None)?;
         Ok(workspace.outputs)
     }
 
@@ -897,7 +1620,17 @@ impl Program {
         black_boxes: &BoundBlackBoxes,
         workspace: &mut EvaluationWorkspace,
     ) -> eyre::Result<()> {
-        self.evaluate_with_workspace(inputs, None, Some(black_boxes), workspace)
+        self.evaluate_with_workspace(inputs, None, Some(black_boxes), workspace, None)
+    }
+
+    pub(crate) fn evaluate_prepared_profiled(
+        &self,
+        inputs: &[U256],
+        black_boxes: &BoundBlackBoxes,
+        workspace: &mut EvaluationWorkspace,
+        profile: &mut ProfileCollector,
+    ) -> eyre::Result<()> {
+        self.evaluate_with_workspace(inputs, None, Some(black_boxes), workspace, Some(profile))
     }
 
     fn evaluate_with_workspace(
@@ -906,12 +1639,15 @@ impl Program {
         bbfs: Option<&HashMap<String, BlackBoxFunction>>,
         bound_black_boxes: Option<&BoundBlackBoxes>,
         workspace: &mut EvaluationWorkspace,
+        mut profile: Option<&mut ProfileCollector>,
     ) -> eyre::Result<()> {
         let EvaluationWorkspace {
             values,
             inverses,
             inversion_scratch,
             black_box_parameters,
+            native_inputs,
+            native_outputs,
             runtime_parameters,
             runtime_results,
             runtime_ready,
@@ -921,6 +1657,8 @@ impl Program {
         values.reserve(self.value_count);
         inverses.clear();
         black_box_parameters.clear();
+        native_inputs.clear();
+        native_outputs.clear();
         runtime_parameters.clear();
         runtime_results.resize_with(self.runtime_call_count, Vec::new);
         runtime_ready.resize(self.runtime_call_count, false);
@@ -929,13 +1667,21 @@ impl Program {
         outputs.reserve(self.outputs.len());
         let mut batches = self.division_batches.iter().peekable();
         let mut instruction_index = 0;
+        let mut profile_block_token = None;
+        let mut profile_block_end = 0;
 
         while instruction_index < self.instructions.len() {
             if batches
                 .peek()
                 .is_some_and(|batch| batch.start == instruction_index)
             {
+                if let Some(token) = profile_block_token.take() {
+                    profile.as_deref_mut().unwrap().exit(token);
+                }
                 let batch = batches.next().unwrap().clone();
+                let profile_token = profile.as_deref_mut().map(|profile| {
+                    profile.enter(ProfileFrame::division_batch(batch.start, batch.end))
+                });
                 inverses.clear();
                 for instruction in &self.instructions[batch.clone()] {
                     let Instruction::Op(Operation::Div, _, divisor) = instruction else {
@@ -952,10 +1698,33 @@ impl Program {
                     };
                     values.push(values[*numerator as usize] * inverse);
                 }
+                if let Some(token) = profile_token {
+                    profile.as_deref_mut().unwrap().exit(token);
+                }
                 instruction_index = batch.end;
                 continue;
             }
 
+            if profile.is_some() && profile_block_token.is_none() {
+                let block_size = profile.as_deref().unwrap().instruction_block_size();
+                let next_batch = batches
+                    .peek()
+                    .map(|batch| batch.start)
+                    .unwrap_or(self.instructions.len());
+                profile_block_end = instruction_index
+                    .saturating_add(block_size)
+                    .min(next_batch)
+                    .min(self.instructions.len());
+                profile_block_token = Some(profile.as_deref_mut().unwrap().enter(
+                    ProfileFrame::instruction_block(instruction_index, profile_block_end),
+                ));
+            }
+            let profile_token = if profile.is_some() {
+                self.special_instruction_profile_frame(instruction_index)
+                    .map(|frame| profile.as_deref_mut().unwrap().enter(frame))
+            } else {
+                None
+            };
             match &self.instructions[instruction_index] {
                 Instruction::Input(input) => values.push(Fr::new(
                     inputs.get(*input).copied().unwrap_or(U256::MAX).into(),
@@ -1038,6 +1807,16 @@ impl Program {
                     );
                     values.push(function(black_box_parameters));
                 }
+                Instruction::Native(native) => {
+                    let native = &self.native_subgraphs[*native as usize];
+                    native_inputs.clear();
+                    native_inputs.extend(native.inputs.iter().map(|&value| values[value as usize]));
+                    native_outputs.clear();
+                    native_outputs.resize(native.output_count, Fr::from(0_u64));
+                    (native.function)(native_inputs, native_outputs)
+                        .wrap_err_with(|| format!("native subgraph {:?} failed", native.name))?;
+                    values.extend_from_slice(native_outputs);
+                }
                 Instruction::RuntimeCall(runtime_call) => {
                     let runtime_call = &self.runtime_calls[*runtime_call as usize];
                     if !runtime_ready[runtime_call.call] {
@@ -1050,17 +1829,35 @@ impl Program {
                         );
                         runtime_results[runtime_call.call] = crate::runtime::evaluate(
                             &self.runtime_functions,
-                            runtime_call.function,
-                            runtime_parameters,
-                            runtime_call.arena_size,
-                            runtime_call.output_count,
+                            &self.native_runtime_functions,
+                            profile.as_deref_mut(),
+                            crate::runtime::RuntimeInvocation {
+                                function: runtime_call.function,
+                                arguments: runtime_parameters,
+                                argument_sizes: &runtime_call.argument_sizes,
+                                arena_size: runtime_call.arena_size,
+                                result_size: runtime_call.output_count,
+                            },
                         )?;
                         runtime_ready[runtime_call.call] = true;
                     }
                     values.push(runtime_results[runtime_call.call][runtime_call.output]);
                 }
             }
+            if let Some(token) = profile_token {
+                profile.as_deref_mut().unwrap().exit(token);
+            }
             instruction_index += 1;
+            if profile_block_token.is_some() && instruction_index == profile_block_end {
+                profile
+                    .as_deref_mut()
+                    .unwrap()
+                    .exit(profile_block_token.take().unwrap());
+            }
+        }
+
+        if let Some(token) = profile_block_token {
+            profile.unwrap().exit(token);
         }
 
         outputs.extend(
@@ -1129,6 +1926,19 @@ impl Program {
                         check_value(parameter as usize)?;
                     }
                 }
+                Instruction::Native(native) => {
+                    let native = self.native_subgraphs.get(*native as usize).ok_or_else(|| {
+                        eyre!(
+                            "program instruction {index} references missing native subgraph {native}"
+                        )
+                    })?;
+                    if native.output_count == 0 {
+                        bail!("native subgraph {:?} has no outputs", native.name);
+                    }
+                    for &input in &native.inputs {
+                        check_value(input as usize)?;
+                    }
+                }
                 Instruction::RuntimeCall(runtime_call) => {
                     let runtime_call = self.runtime_calls.get(*runtime_call as usize).ok_or_else(|| {
                         eyre!("program instruction {index} references missing runtime call {runtime_call}")
@@ -1148,17 +1958,20 @@ impl Program {
                             runtime_call.output
                         );
                     }
+                    let argument_count = runtime_call
+                        .argument_sizes
+                        .iter()
+                        .try_fold(0_usize, |total, size| total.checked_add(*size));
+                    if argument_count != Some(runtime_call.parameters.len()) {
+                        bail!("runtime-call argument boundaries do not match its parameters");
+                    }
                     for &parameter in &runtime_call.parameters {
                         check_value(parameter as usize)?;
                     }
                 }
             }
             next_value = next_value
-                .checked_add(if matches!(instruction, Instruction::Pow5(_)) {
-                    3
-                } else {
-                    1
-                })
+                .checked_add(self.instruction_output_count(instruction))
                 .ok_or_else(|| eyre!("program value count overflowed"))?;
         }
         if next_value != self.value_count {
@@ -1169,11 +1982,35 @@ impl Program {
                 bail!("program output value {output} is out of bounds");
             }
         }
+        if let Some(source_map) = self.source_map.get() {
+            if source_map.instruction_sources.len() != self.instructions.len() {
+                bail!("program instruction provenance is inconsistent");
+            }
+            if source_map.instruction_boundary_sources.len() != self.instructions.len() {
+                bail!("program instruction boundary provenance is inconsistent");
+            }
+            if source_map.value_sources.len() != self.value_count {
+                bail!("program value provenance is inconsistent");
+            }
+            if source_map
+                .instruction_sources
+                .iter()
+                .flatten()
+                .chain(source_map.instruction_boundary_sources.iter().flatten())
+                .chain(&source_map.value_sources)
+                .any(|&node| node >= source_map.node_count)
+            {
+                bail!("program provenance references a missing graph node");
+            }
+        }
         Ok(())
     }
 
     pub(crate) fn encode(&self) -> eyre::Result<EncodedProgram> {
         self.validate()?;
+        if !self.native_subgraphs.is_empty() || !self.native_runtime_functions.is_empty() {
+            bail!("graphs with process-local native customizations cannot be serialized");
+        }
         let mut next_value = 0_usize;
         let mut instructions = Vec::with_capacity(self.instructions.len());
         for instruction in &self.instructions {
@@ -1233,6 +2070,7 @@ impl Program {
                             .collect::<eyre::Result<Vec<_>>>()?,
                     )
                 }
+                Instruction::Native(_) => unreachable!("native subgraphs were rejected above"),
                 Instruction::RuntimeCall(runtime_call) => {
                     let runtime_call = &self.runtime_calls[*runtime_call as usize];
                     EncodedInstruction::RuntimeCall {
@@ -1241,6 +2079,7 @@ impl Program {
                         output: runtime_call.output,
                         output_count: runtime_call.output_count,
                         arena_size: runtime_call.arena_size,
+                        argument_sizes: runtime_call.argument_sizes.clone(),
                         parameters: runtime_call
                             .parameters
                             .iter()
@@ -1250,14 +2089,7 @@ impl Program {
                 }
             };
             instructions.push(instruction);
-            next_value += if matches!(
-                self.instructions[instructions.len() - 1],
-                Instruction::Pow5(_)
-            ) {
-                3
-            } else {
-                1
-            };
+            next_value += self.instruction_output_count(&self.instructions[instructions.len() - 1]);
         }
 
         let mut previous = 0_usize;
@@ -1415,6 +2247,7 @@ impl Program {
                     output,
                     output_count,
                     arena_size,
+                    argument_sizes,
                     parameters,
                 } => {
                     let index = narrow_id(runtime_calls.len(), "runtime-call ID")?;
@@ -1428,6 +2261,7 @@ impl Program {
                         output,
                         output_count,
                         arena_size,
+                        argument_sizes,
                         parameters: parameters
                             .into_iter()
                             .map(|parameter| narrow_id(absolute(parameter)?, "value ID"))
@@ -1468,18 +2302,99 @@ impl Program {
             linear3,
             linear4,
             black_boxes,
+            native_subgraphs: Vec::new(),
             runtime_functions,
+            native_runtime_functions: Vec::new(),
             runtime_calls,
             runtime_call_count,
             outputs,
             division_batches: Vec::new(),
             value_count: next_value,
             input_count,
+            source_map: OnceLock::new(),
         };
         program
             .validate()
             .wrap_err("invalid encoded witness program")?;
         Ok(program)
+    }
+
+    /// Attaches provenance for the deterministic compatibility DAG produced by [`Self::to_nodes`].
+    /// This keeps profile node IDs useful for fused files without serializing a second graph.
+    pub(crate) fn ensure_compatibility_source_map(&self) -> eyre::Result<()> {
+        if self.source_map.get().is_some() {
+            return Ok(());
+        }
+        let mut instruction_sources = Vec::with_capacity(self.instructions.len());
+        let mut value_sources = Vec::with_capacity(self.value_count);
+        let mut next_node = self.coefficients.len();
+        for instruction in &self.instructions {
+            let added_nodes = match instruction {
+                Instruction::Constant(coefficient) => {
+                    instruction_sources.push(vec![*coefficient as usize]);
+                    value_sources.push(*coefficient as usize);
+                    continue;
+                }
+                Instruction::Input(_)
+                | Instruction::Mul(_, _)
+                | Instruction::Add(_, _)
+                | Instruction::Sub(_, _)
+                | Instruction::Op(_, _, _)
+                | Instruction::Square(_)
+                | Instruction::BlackBox(_)
+                | Instruction::RuntimeCall(_) => 1,
+                Instruction::Pow5(_) => 3,
+                Instruction::Linear3(_) => 5,
+                Instruction::Linear4(_) => 7,
+                Instruction::Native(native) => {
+                    bail!(
+                        "native subgraph {:?} has no compatibility-DAG provenance",
+                        self.native_subgraphs[*native as usize].name
+                    )
+                }
+            };
+            let sources = (next_node..next_node + added_nodes).collect::<Vec<_>>();
+            match instruction {
+                Instruction::Pow5(_) => value_sources.extend_from_slice(&sources),
+                _ => value_sources.push(*sources.last().unwrap()),
+            }
+            instruction_sources.push(sources);
+            next_node += added_nodes;
+        }
+        let instruction_boundary_sources = self
+            .instructions
+            .iter()
+            .map(|instruction| {
+                let mut boundaries = self
+                    .instruction_operands(instruction)
+                    .into_iter()
+                    .map(|value| value_sources[value])
+                    .collect::<BTreeSet<_>>();
+                match instruction {
+                    Instruction::Linear3(linear) => boundaries.extend(
+                        self.linear3[*linear as usize]
+                            .iter()
+                            .map(|&(_, coefficient)| coefficient as usize),
+                    ),
+                    Instruction::Linear4(linear) => boundaries.extend(
+                        self.linear4[*linear as usize]
+                            .iter()
+                            .map(|&(_, coefficient)| coefficient as usize),
+                    ),
+                    _ => {}
+                }
+                boundaries.into_iter().collect()
+            })
+            .collect();
+        let source_map = ProgramSourceMap {
+            instruction_sources,
+            instruction_boundary_sources,
+            value_sources,
+            node_count: next_node,
+        };
+        let _ = self.source_map.set(source_map);
+        self.validate()?;
+        Ok(())
     }
 
     /// Rebuilds a semantically equivalent Node DAG for the public compatibility fields. Runtime
@@ -1582,6 +2497,12 @@ impl Program {
                         &mut nodes,
                     ));
                 }
+                Instruction::Native(native) => {
+                    bail!(
+                        "native subgraph {:?} cannot be expanded back into graph nodes",
+                        self.native_subgraphs[*native as usize].name
+                    );
+                }
                 Instruction::RuntimeCall(runtime_call) => {
                     let runtime_call = &self.runtime_calls[*runtime_call as usize];
                     value_nodes.push(push(
@@ -1591,6 +2512,7 @@ impl Program {
                             output: runtime_call.output,
                             output_count: runtime_call.output_count,
                             arena_size: runtime_call.arena_size,
+                            argument_sizes: runtime_call.argument_sizes.clone(),
                             parameters: runtime_call
                                 .parameters
                                 .iter()
@@ -1609,6 +2531,35 @@ impl Program {
             .collect();
         Ok((nodes, outputs))
     }
+}
+
+fn structural_closure(root: usize, children: &[Vec<usize>]) -> Vec<usize> {
+    let mut closure = BTreeSet::new();
+    let mut pending = vec![root];
+    while let Some(instruction) = pending.pop() {
+        if closure.insert(instruction) {
+            pending.extend_from_slice(&children[instruction]);
+        }
+    }
+    closure.into_iter().collect()
+}
+
+fn source_ranges(nodes: impl IntoIterator<Item = usize>) -> Vec<SourceNodeRange> {
+    let nodes = nodes.into_iter().collect::<BTreeSet<_>>();
+    let mut ranges = Vec::<SourceNodeRange>::new();
+    for node in nodes {
+        if let Some(last) = ranges.last_mut() {
+            if last.end == node {
+                last.end += 1;
+                continue;
+            }
+        }
+        ranges.push(SourceNodeRange {
+            start: node,
+            end: node + 1,
+        });
+    }
+    ranges
 }
 
 fn expand_linear<const N: usize>(

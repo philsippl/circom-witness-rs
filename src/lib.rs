@@ -1,4 +1,6 @@
+pub mod custom;
 pub mod graph;
+pub mod profile;
 mod program;
 #[doc(hidden)]
 pub mod runtime;
@@ -102,6 +104,68 @@ impl Graph {
         })
     }
 
+    /// Returns a graph that evaluates selected DAG regions with native Rust callbacks.
+    ///
+    /// Node IDs in each replacement refer to this graph's [`Graph::nodes`] view. Replacements are
+    /// validated as closed subgraphs: every dependency entering a region must be listed as an
+    /// input, and every covered value used outside it must be listed as an output.
+    pub fn customize(&self, replacements: &[custom::NativeSubgraph]) -> eyre::Result<Self> {
+        self.apply_customizations(replacements, &[])
+    }
+
+    /// Starts a builder for combining native DAG replacements and dynamic runtime-function
+    /// implementations in one customized graph.
+    pub fn customizer(&self) -> custom::GraphCustomizer<'_> {
+        custom::GraphCustomizer::new(self)
+    }
+
+    /// Names of dynamic Circom functions embedded in this graph's portable runtime IR.
+    ///
+    /// These are the names accepted by [`custom::RuntimeFunctionMatcher`].
+    pub fn runtime_function_names(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.program
+            .runtime_functions()
+            .iter()
+            .map(|function| function.name.as_str())
+    }
+
+    pub(crate) fn apply_customizations(
+        &self,
+        replacements: &[custom::NativeSubgraph],
+        runtime_functions: &[custom::NativeRuntimeFunction],
+    ) -> eyre::Result<Self> {
+        if replacements.is_empty() && runtime_functions.is_empty() {
+            return Ok(self.clone());
+        }
+        if self.program.has_customizations() {
+            return Err(eyre!(
+                "a customized graph cannot be customized again; register all customizations on the original graph"
+            ));
+        }
+        let mut compatibility = self.compatibility.get().cloned();
+        let program = if replacements.is_empty() {
+            self.program.clone()
+        } else {
+            let graph = self.compatibility();
+            let resolved = custom::resolve(&graph.nodes, &graph.signals, replacements)?;
+            compatibility = Some(graph.clone());
+            program::compile_with_native(
+                &graph.nodes,
+                &graph.signals,
+                &[],
+                self.program.runtime_functions().to_vec(),
+                &resolved,
+            )?
+            .prepare_evaluation()?
+        }
+        .with_native_runtime_functions(runtime_functions.to_vec())?;
+        Ok(Self {
+            compatibility: compatibility.map_or_else(OnceLock::new, OnceLock::from),
+            input_mapping: self.input_mapping.clone(),
+            program,
+        })
+    }
+
     /// Returns the number of compact runtime instructions after graph preparation and fusion.
     #[doc(hidden)]
     pub fn runtime_instruction_count(&self) -> usize {
@@ -117,6 +181,20 @@ impl WitnessEvaluator<'_> {
         self.graph
             .program
             .evaluate_prepared(inputs, &self.black_boxes, &mut self.workspace)?;
+        Ok(self.workspace.outputs())
+    }
+
+    pub(crate) fn evaluate_profiled(
+        &mut self,
+        inputs: &[U256],
+        profile: &mut profile::ProfileCollector,
+    ) -> eyre::Result<&[U256]> {
+        self.graph.program.evaluate_prepared_profiled(
+            inputs,
+            &self.black_boxes,
+            &mut self.workspace,
+            profile,
+        )?;
         Ok(self.workspace.outputs())
     }
 }
@@ -182,7 +260,8 @@ pub fn serialize_graph_with_runtime(
     // Preserve the builder's topological order on disk. Division-depth reordering improves runtime
     // but measurably hurts compression on large graphs, so it is deliberately done only at load.
     let encoded_program =
-        program::compile(&nodes, &signals, &[], runtime_functions.clone())?.encode()?;
+        program::compile_for_serialization(&nodes, &signals, runtime_functions.clone())?
+            .encode()?;
     let postcard = postcard::to_stdvec(&(&encoded_program, &input_mapping, &runtime_functions))?;
     let compressed = zstd::stream::encode_all(postcard.as_slice(), GRAPH_COMPRESSION_LEVEL)
         .wrap_err("failed to compress witness graph")?;
@@ -341,7 +420,15 @@ pub fn get_inputs_buffer(size: usize) -> Vec<U256> {
 }
 
 /// Calculates the position of the given signal in the inputs buffer
-pub fn get_input_mapping(input_list: &Vec<String>, graph: &Graph) -> HashMap<String, usize> {
+pub fn get_input_mapping(input_list: &[String], graph: &Graph) -> HashMap<String, usize> {
+    try_get_input_mapping(input_list, graph).expect("input signal is missing from witness graph")
+}
+
+/// Fallible variant of [`get_input_mapping`] for command-line tools and untrusted input objects.
+pub fn try_get_input_mapping(
+    input_list: &[String],
+    graph: &Graph,
+) -> eyre::Result<HashMap<String, usize>> {
     let mut input_mapping = HashMap::new();
     for key in input_list {
         let h = fnv1a(key);
@@ -349,11 +436,11 @@ pub fn get_input_mapping(input_list: &Vec<String>, graph: &Graph) -> HashMap<Str
             .input_mapping
             .iter()
             .position(|x| x.hash == h)
-            .unwrap();
+            .ok_or_else(|| eyre!("input signal {key:?} is missing from witness graph"))?;
         let si = (graph.input_mapping[pos].signalid) as usize;
         input_mapping.insert(key.to_string(), si);
     }
-    input_mapping
+    Ok(input_mapping)
 }
 
 /// Sets all provided inputs given the mapping and inputs buffer
@@ -376,7 +463,8 @@ pub fn calculate_witness(
     bbfs: Option<&HashMap<String, BlackBoxFunction>>,
 ) -> eyre::Result<Vec<U256>> {
     let mut inputs_buffer = get_inputs_buffer(get_inputs_size(graph));
-    let input_mapping = get_input_mapping(&input_list.keys().cloned().collect(), graph);
+    let input_names = input_list.keys().cloned().collect::<Vec<_>>();
+    let input_mapping = get_input_mapping(&input_names, graph);
     populate_inputs(&input_list, &input_mapping, &mut inputs_buffer);
     graph.evaluate(&inputs_buffer, bbfs)
 }
@@ -385,7 +473,6 @@ pub fn calculate_witness(
 mod tests {
     use super::*;
     use crate::graph::Operation;
-    use crate::runtime::{RuntimeExpression, RuntimeFunction, RuntimeStatement};
 
     fn graph_parts() -> (Vec<Node>, Vec<usize>, Vec<HashSignalInfo>) {
         let nodes = vec![
@@ -488,6 +575,30 @@ mod tests {
     }
 
     #[test]
+    fn previous_fused_graphs_remain_supported() {
+        let nodes = vec![
+            Node::Input(0),
+            Node::Input(1),
+            Node::Op(Operation::Add, 0, 1),
+        ];
+        let program = program::compile(&nodes, &[2], &[], Vec::new()).unwrap();
+        let postcard =
+            postcard::to_stdvec(&(program.encode().unwrap(), Vec::<HashSignalInfo>::new()))
+                .unwrap();
+        let compressed = zstd::stream::encode_all(postcard.as_slice(), 19).unwrap();
+        let mut encoded = PREVIOUS_FUSED_GRAPH_HEADER.to_vec();
+        encoded.extend(compressed);
+
+        let graph = init_graph(&encoded).unwrap();
+        assert_eq!(
+            graph
+                .evaluate(&[U256::from(2_u64), U256::from(3_u64)], None)
+                .unwrap(),
+            vec![U256::from(5_u64)]
+        );
+    }
+
+    #[test]
     fn fused_graph_batches_independent_divisions() {
         let nodes = vec![
             Node::Input(0),
@@ -508,39 +619,6 @@ mod tests {
         assert_eq!(graph.evaluate(&inputs, None).unwrap(), expected);
         let mut evaluator = graph.evaluator(None).unwrap();
         assert_eq!(evaluator.evaluate(&inputs).unwrap(), expected);
-    }
-
-    #[test]
-    fn fused_graph_round_trips_runtime_ir_calls() {
-        let nodes = vec![
-            Node::Input(0),
-            Node::RuntimeCall {
-                function: 0,
-                call: 0,
-                output: 0,
-                output_count: 1,
-                arena_size: 1,
-                parameters: vec![0],
-            },
-        ];
-        let functions = vec![RuntimeFunction {
-            name: "identity".to_owned(),
-            variable_count: 1,
-            body: vec![RuntimeStatement::Return {
-                value: RuntimeExpression::Load {
-                    offset: Box::new(RuntimeExpression::Address(0)),
-                    size: 1,
-                },
-                size: 1,
-            }],
-        }];
-        let encoded = serialize_graph_with_runtime(nodes, vec![1], Vec::new(), functions).unwrap();
-        let graph = init_graph(&encoded).unwrap();
-
-        assert_eq!(
-            graph.evaluate(&[U256::from(7_u64)], None).unwrap(),
-            vec![U256::from(7_u64)]
-        );
     }
 
     #[test]

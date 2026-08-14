@@ -82,6 +82,7 @@ impl GraphBuilder {
         &mut self,
         function: usize,
         params: Vec<usize>,
+        argument_sizes: Vec<usize>,
         arena_size: usize,
         output_count: usize,
     ) -> Vec<usize> {
@@ -97,6 +98,7 @@ impl GraphBuilder {
                         output,
                         output_count,
                         arena_size,
+                        argument_sizes: argument_sizes.clone(),
                         parameters: params.clone(),
                     },
                     value,
@@ -334,6 +336,7 @@ impl<'a> Interpreter<'a> {
         &mut self,
         symbol: &str,
         arguments: Vec<usize>,
+        argument_sizes: Vec<usize>,
         arena_size: usize,
         component: usize,
         result_size: usize,
@@ -352,9 +355,13 @@ impl<'a> Interpreter<'a> {
                 self.graph.values.truncate(checkpoint);
                 self.graph.constant.truncate(checkpoint);
                 let function = self.compile_runtime_function(symbol, component)?;
-                Ok(self
-                    .graph
-                    .runtime_call(function, arguments, arena_size, result_size))
+                Ok(self.graph.runtime_call(
+                    function,
+                    arguments,
+                    argument_sizes,
+                    arena_size,
+                    result_size,
+                ))
             }
             Err(error) => Err(error),
         }
@@ -532,12 +539,14 @@ impl<'a> Interpreter<'a> {
 
     fn execute_call(&mut self, call: &CallBucket, frame: &mut Frame) -> Result<Option<Eval>> {
         let mut arguments = Vec::new();
+        let mut argument_sizes = Vec::with_capacity(call.arguments.len());
         for (argument, context) in call.arguments.iter().zip(&call.argument_types) {
             let (values, component) = self.eval(argument.as_ref(), frame)?.values()?;
             let size = self.resolve_size(context, component)?;
             if values.len() < size {
                 bail!("Circom call argument is shorter than its declared size");
             }
+            argument_sizes.push(size);
             arguments.extend_from_slice(&values[..size]);
         }
 
@@ -557,6 +566,7 @@ impl<'a> Interpreter<'a> {
                     let values = self.execute_function_or_runtime(
                         &call.symbol,
                         arguments,
+                        argument_sizes,
                         call.arena_size,
                         frame.component,
                         1,
@@ -582,6 +592,7 @@ impl<'a> Interpreter<'a> {
                     self.execute_function_or_runtime(
                         &call.symbol,
                         arguments,
+                        argument_sizes,
                         call.arena_size,
                         frame.component,
                         size,

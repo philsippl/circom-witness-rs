@@ -76,6 +76,7 @@ pub enum Node {
         output: usize,
         output_count: usize,
         arena_size: usize,
+        argument_sizes: Vec<usize>,
         parameters: Vec<usize>,
     },
 }
