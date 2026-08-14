@@ -44,6 +44,11 @@ jobs:
             --output "$RUNNER_TEMP/circom"
           chmod +x "$RUNNER_TEMP/circom"
 
+      - name: Compare circomlib WASM and Rust witnesses
+        env:
+          CIRCOM: ${{ runner.temp }}/circom
+        run: cargo test -p circom-witness-graph-builder --release --features test-circomlib --test circomlib_witness
+
       - name: Compare Semaphore WASM and Rust witnesses
         env:
           CIRCOM: ${{ runner.temp }}/circom

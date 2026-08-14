@@ -103,12 +103,25 @@ fn flatten_values(value: Value, output: &mut Vec<U256>) {
     }
 }
 
+#[allow(dead_code)]
 pub fn wasm_witness(
     circuit: &Path,
     circuit_name: &str,
     input_json: &str,
     library_paths: &[&Path],
 ) -> Vec<U256> {
+    wasm_witnesses(circuit, circuit_name, &[input_json], library_paths)
+        .pop()
+        .unwrap()
+}
+
+#[allow(dead_code)]
+pub fn wasm_witnesses(
+    circuit: &Path,
+    circuit_name: &str,
+    input_jsons: &[&str],
+    library_paths: &[&Path],
+) -> Vec<Vec<U256>> {
     let temp = TempDir::new(circuit_name);
     let circom = env::var_os("CIRCOM").unwrap_or_else(|| "circom".into());
     let mut compile = Command::new(circom);
@@ -125,18 +138,23 @@ pub fn wasm_witness(
 
     let input_path = temp.path().join("input.json");
     let runner_path = temp.path().join("calculate_witness.js");
-    fs::write(&input_path, input_json).unwrap();
     fs::write(&runner_path, WASM_RUNNER).unwrap();
 
     let js_dir = temp.path().join(format!("{circuit_name}_js"));
     let node = env::var_os("NODE").unwrap_or_else(|| "node".into());
-    let wasm_output = run(Command::new(node)
-        .arg(&runner_path)
-        .arg(js_dir.join("witness_calculator.js"))
-        .arg(js_dir.join(format!("{circuit_name}.wasm")))
-        .arg(&input_path));
+    input_jsons
+        .iter()
+        .map(|input_json| {
+            fs::write(&input_path, input_json).unwrap();
+            let wasm_output = run(Command::new(&node)
+                .arg(&runner_path)
+                .arg(js_dir.join("witness_calculator.js"))
+                .arg(js_dir.join(format!("{circuit_name}.wasm")))
+                .arg(&input_path));
 
-    serde_json::from_slice(&wasm_output.stdout).unwrap()
+            serde_json::from_slice(&wasm_output.stdout).unwrap()
+        })
+        .collect()
 }
 
 pub fn assert_witnesses_equal(rust_witness: &[U256], wasm_witness: &[U256]) {
