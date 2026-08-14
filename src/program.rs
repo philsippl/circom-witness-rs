@@ -4,7 +4,7 @@ use std::{
 };
 
 use ark_bn254::Fr;
-use ark_ff::Field;
+use ark_ff::{AdditiveGroup, Field};
 use eyre::{bail, eyre, Context as _};
 use ruint::aliases::U256;
 use serde::{Deserialize, Serialize};
@@ -30,6 +30,7 @@ pub(crate) struct Program {
     runtime_functions: Vec<RuntimeFunction>,
     runtime_calls: Vec<RuntimeCallInstruction>,
     runtime_call_count: usize,
+    bit_cache_count: usize,
     outputs: Vec<usize>,
     division_batches: Vec<Range<usize>>,
     value_count: usize,
@@ -45,6 +46,7 @@ pub(crate) struct EvaluationWorkspace {
     runtime_parameters: Vec<Fr>,
     runtime_results: Vec<Vec<Fr>>,
     runtime_ready: Vec<bool>,
+    bit_cache: Vec<U256>,
     outputs: Vec<U256>,
 }
 
@@ -73,6 +75,18 @@ enum Instruction {
     Linear4(u32),
     BlackBox(u32),
     RuntimeCall(u32),
+    /// Canonicalizes a field value once for a group of bit extractions. The produced field value
+    /// is only a scheduling dependency and is otherwise ignored.
+    CacheBits {
+        source: u32,
+        cache: u32,
+    },
+    /// Extracts one bit from a canonical value populated by `CacheBits`.
+    BitExtract {
+        dependency: u32,
+        cache: u32,
+        bit: u8,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -608,6 +622,7 @@ pub(crate) fn compile(
         runtime_functions,
         runtime_calls,
         runtime_call_count,
+        bit_cache_count: 0,
         outputs,
         division_batches,
         value_count,
@@ -648,10 +663,323 @@ impl Program {
         Ok(BoundBlackBoxes { functions })
     }
 
+    /// Fuses the common `(value >> constant) & 1` expansion used by Circom bit-decomposition
+    /// gadgets. A decomposition often extracts hundreds of bits from the same field value; doing
+    /// every shift through `Fr -> U256 -> Fr` needlessly repeats Montgomery conversion. The first
+    /// extraction caches the canonical integer and the remaining instructions read individual
+    /// bits from that cache.
+    fn fuse_bit_extractions(&mut self) -> eyre::Result<()> {
+        if self.bit_cache_count != 0
+            || self.instructions.iter().any(|instruction| {
+                matches!(
+                    instruction,
+                    Instruction::CacheBits { .. } | Instruction::BitExtract { .. }
+                )
+            })
+        {
+            return Ok(());
+        }
+
+        let mut producers = Vec::with_capacity(self.value_count);
+        for (instruction, item) in self.instructions.iter().enumerate() {
+            producers.extend(std::iter::repeat_n(
+                instruction,
+                if matches!(item, Instruction::Pow5(_)) {
+                    3
+                } else {
+                    1
+                },
+            ));
+        }
+        if producers.len() != self.value_count {
+            bail!("program value count is inconsistent");
+        }
+
+        let mut uses = vec![0_usize; self.value_count];
+        for instruction in &self.instructions {
+            let mut count = |value: u32| uses[value as usize] += 1;
+            match instruction {
+                Instruction::Mul(left, right)
+                | Instruction::Add(left, right)
+                | Instruction::Sub(left, right)
+                | Instruction::Op(_, left, right) => {
+                    count(*left);
+                    count(*right);
+                }
+                Instruction::Square(value) | Instruction::Pow5(value) => count(*value),
+                Instruction::Linear3(linear) => self.linear3[*linear as usize]
+                    .iter()
+                    .for_each(|&(value, _)| count(value)),
+                Instruction::Linear4(linear) => self.linear4[*linear as usize]
+                    .iter()
+                    .for_each(|&(value, _)| count(value)),
+                Instruction::BlackBox(black_box) => self.black_boxes[*black_box as usize]
+                    .parameters
+                    .iter()
+                    .for_each(|&value| count(value)),
+                Instruction::RuntimeCall(runtime_call) => self.runtime_calls
+                    [*runtime_call as usize]
+                    .parameters
+                    .iter()
+                    .for_each(|&value| count(value)),
+                Instruction::Input(_)
+                | Instruction::Constant(_)
+                | Instruction::CacheBits { .. }
+                | Instruction::BitExtract { .. } => {}
+            }
+        }
+        for &output in &self.outputs {
+            uses[output] += 1;
+        }
+
+        let constant = |value: u32| -> Option<U256> {
+            match self.instructions[producers[value as usize]] {
+                Instruction::Constant(coefficient) => {
+                    Some(self.coefficients[coefficient as usize].into())
+                }
+                _ => None,
+            }
+        };
+        let mut source_caches = HashMap::<u32, (u32, u32)>::new();
+        let mut fusions = Vec::new();
+        for (band_instruction, instruction) in self.instructions.iter().enumerate() {
+            let Instruction::Op(Operation::Band, left, right) = instruction else {
+                continue;
+            };
+            let Some((shift_value, mask_value)) = [(*left, *right), (*right, *left)]
+                .into_iter()
+                .find(|(value, _)| {
+                    matches!(
+                        self.instructions[producers[*value as usize]],
+                        Instruction::Op(Operation::Shr, _, _)
+                    )
+                })
+            else {
+                continue;
+            };
+            if uses[shift_value as usize] != 1 || constant(mask_value) != Some(U256::from(1_u64)) {
+                continue;
+            }
+            let shift_instruction = producers[shift_value as usize];
+            let Instruction::Op(Operation::Shr, source, amount) =
+                self.instructions[shift_instruction]
+            else {
+                unreachable!();
+            };
+            let Some(bit) = constant(amount).and_then(|amount| u8::try_from(amount).ok()) else {
+                continue;
+            };
+            let next_cache = narrow_id(source_caches.len(), "bit cache ID")?;
+            let (cache, dependency) = *source_caches
+                .entry(source)
+                .or_insert((next_cache, shift_value));
+            fusions.push((
+                shift_instruction,
+                band_instruction,
+                source,
+                dependency,
+                cache,
+                bit,
+            ));
+        }
+        if fusions.is_empty() {
+            return Ok(());
+        }
+
+        let zero = if let Some(index) = self
+            .coefficients
+            .iter()
+            .position(|coefficient| *coefficient == Fr::from(0_u64))
+        {
+            narrow_id(index, "coefficient ID")?
+        } else {
+            let index = narrow_id(self.coefficients.len(), "coefficient ID")?;
+            self.coefficients.push(Fr::from(0_u64));
+            index
+        };
+        let mut remove = vec![false; self.instructions.len()];
+        for &(shift_instruction, _, _, _, _, _) in &fusions {
+            self.instructions[shift_instruction] = Instruction::Constant(zero);
+            remove[shift_instruction] = true;
+        }
+        let mut initialized = vec![false; source_caches.len()];
+        for (_, band_instruction, source, dependency, cache, bit) in fusions {
+            if !initialized[cache as usize] {
+                let cache_instruction = producers[dependency as usize];
+                self.instructions[cache_instruction] = Instruction::CacheBits { source, cache };
+                remove[cache_instruction] = false;
+                initialized[cache as usize] = true;
+            }
+            self.instructions[band_instruction] = Instruction::BitExtract {
+                dependency,
+                cache,
+                bit,
+            };
+        }
+        self.bit_cache_count = source_caches.len();
+        self.compact_instructions(&remove)
+    }
+
+    /// Removes selected instructions and rewrites all value references. Callers must prove that
+    /// every removed value is dead; unresolved references are rejected while remapping.
+    fn compact_instructions(&mut self, remove: &[bool]) -> eyre::Result<()> {
+        if remove.len() != self.instructions.len() {
+            bail!("instruction removal mask has the wrong length");
+        }
+        let mut old_value_starts = Vec::with_capacity(self.instructions.len());
+        let mut old_value = 0_usize;
+        for instruction in &self.instructions {
+            old_value_starts.push(old_value);
+            old_value += if matches!(instruction, Instruction::Pow5(_)) {
+                3
+            } else {
+                1
+            };
+        }
+        if old_value != self.value_count {
+            bail!("program value count is inconsistent");
+        }
+
+        let mut value_renumber = vec![usize::MAX; self.value_count];
+        let mut next_value = 0_usize;
+        for (index, instruction) in self.instructions.iter().enumerate() {
+            if remove[index] {
+                continue;
+            }
+            let produced = if matches!(instruction, Instruction::Pow5(_)) {
+                3
+            } else {
+                1
+            };
+            for offset in 0..produced {
+                value_renumber[old_value_starts[index] + offset] = next_value + offset;
+            }
+            next_value += produced;
+        }
+        let remap_value = |value: u32| -> eyre::Result<u32> {
+            let remapped = value_renumber
+                .get(value as usize)
+                .copied()
+                .filter(|&value| value != usize::MAX)
+                .ok_or_else(|| eyre!("removed program value {value} is still referenced"))?;
+            narrow_id(remapped, "value ID")
+        };
+
+        let mut instructions = Vec::with_capacity(self.instructions.len());
+        let mut linear3 = Vec::with_capacity(self.linear3.len());
+        let mut linear4 = Vec::with_capacity(self.linear4.len());
+        let mut black_boxes = Vec::with_capacity(self.black_boxes.len());
+        let mut runtime_calls = Vec::with_capacity(self.runtime_calls.len());
+        for (index, instruction) in self.instructions.iter().enumerate() {
+            if remove[index] {
+                continue;
+            }
+            let instruction = match instruction {
+                Instruction::Input(input) => Instruction::Input(*input),
+                Instruction::Constant(coefficient) => Instruction::Constant(*coefficient),
+                Instruction::Mul(left, right) => {
+                    Instruction::Mul(remap_value(*left)?, remap_value(*right)?)
+                }
+                Instruction::Add(left, right) => {
+                    Instruction::Add(remap_value(*left)?, remap_value(*right)?)
+                }
+                Instruction::Sub(left, right) => {
+                    Instruction::Sub(remap_value(*left)?, remap_value(*right)?)
+                }
+                Instruction::Op(operation, left, right) => {
+                    Instruction::Op(*operation, remap_value(*left)?, remap_value(*right)?)
+                }
+                Instruction::Square(value) => Instruction::Square(remap_value(*value)?),
+                Instruction::Pow5(value) => Instruction::Pow5(remap_value(*value)?),
+                Instruction::CacheBits { source, cache } => Instruction::CacheBits {
+                    source: remap_value(*source)?,
+                    cache: *cache,
+                },
+                Instruction::BitExtract {
+                    dependency,
+                    cache,
+                    bit,
+                } => Instruction::BitExtract {
+                    dependency: remap_value(*dependency)?,
+                    cache: *cache,
+                    bit: *bit,
+                },
+                Instruction::Linear3(linear) => {
+                    let terms = self.linear3[*linear as usize];
+                    let index = narrow_id(linear3.len(), "linear3 ID")?;
+                    linear3.push([
+                        (remap_value(terms[0].0)?, terms[0].1),
+                        (remap_value(terms[1].0)?, terms[1].1),
+                        (remap_value(terms[2].0)?, terms[2].1),
+                    ]);
+                    Instruction::Linear3(index)
+                }
+                Instruction::Linear4(linear) => {
+                    let terms = self.linear4[*linear as usize];
+                    let index = narrow_id(linear4.len(), "linear4 ID")?;
+                    linear4.push([
+                        (remap_value(terms[0].0)?, terms[0].1),
+                        (remap_value(terms[1].0)?, terms[1].1),
+                        (remap_value(terms[2].0)?, terms[2].1),
+                        (remap_value(terms[3].0)?, terms[3].1),
+                    ]);
+                    Instruction::Linear4(index)
+                }
+                Instruction::BlackBox(black_box) => {
+                    let black_box = &self.black_boxes[*black_box as usize];
+                    let index = narrow_id(black_boxes.len(), "black-box ID")?;
+                    black_boxes.push(BlackBoxInstruction {
+                        name: black_box.name.clone(),
+                        parameters: black_box
+                            .parameters
+                            .iter()
+                            .map(|&value| remap_value(value))
+                            .collect::<eyre::Result<Vec<_>>>()?,
+                    });
+                    Instruction::BlackBox(index)
+                }
+                Instruction::RuntimeCall(runtime_call) => {
+                    let runtime_call = &self.runtime_calls[*runtime_call as usize];
+                    let index = narrow_id(runtime_calls.len(), "runtime-call ID")?;
+                    runtime_calls.push(RuntimeCallInstruction {
+                        parameters: runtime_call
+                            .parameters
+                            .iter()
+                            .map(|&value| remap_value(value))
+                            .collect::<eyre::Result<Vec<_>>>()?,
+                        ..runtime_call.clone()
+                    });
+                    Instruction::RuntimeCall(index)
+                }
+            };
+            instructions.push(instruction);
+        }
+
+        self.instructions = instructions;
+        self.linear3 = linear3;
+        self.linear4 = linear4;
+        self.black_boxes = black_boxes;
+        self.runtime_calls = runtime_calls;
+        self.outputs = self
+            .outputs
+            .iter()
+            .map(|&output| {
+                value_renumber
+                    .get(output)
+                    .copied()
+                    .filter(|&value| value != usize::MAX)
+                    .ok_or_else(|| eyre!("removed program output value {output}"))
+            })
+            .collect::<eyre::Result<Vec<_>>>()?;
+        self.value_count = next_value;
+        Ok(())
+    }
+
     /// Reorders the already-fused program into division-depth layers without expanding it back
     /// into a [`Node`] DAG. Programs produced by `compile` and `decode` are validated, so this pass
     /// only needs to calculate depths, renumber values, and build the division batch ranges.
     pub(crate) fn prepare_evaluation(mut self) -> eyre::Result<Self> {
+        self.fuse_bit_extractions()?;
         if !self
             .instructions
             .iter()
@@ -687,6 +1015,8 @@ impl Program {
                     }
                 }
                 Instruction::Square(value) | Instruction::Pow5(value) => value_depth(*value)?,
+                Instruction::CacheBits { source, .. } => value_depth(*source)?,
+                Instruction::BitExtract { dependency, .. } => value_depth(*dependency)?,
                 Instruction::Linear3(linear) => self.linear3[*linear as usize]
                     .iter()
                     .try_fold(0_usize, |depth, &(value, _)| {
@@ -809,6 +1139,19 @@ impl Program {
                 }
                 Instruction::Square(value) => Instruction::Square(remap_value(*value)?),
                 Instruction::Pow5(value) => Instruction::Pow5(remap_value(*value)?),
+                Instruction::CacheBits { source, cache } => Instruction::CacheBits {
+                    source: remap_value(*source)?,
+                    cache: *cache,
+                },
+                Instruction::BitExtract {
+                    dependency,
+                    cache,
+                    bit,
+                } => Instruction::BitExtract {
+                    dependency: remap_value(*dependency)?,
+                    cache: *cache,
+                    bit: *bit,
+                },
                 Instruction::Linear3(linear) => {
                     let terms = self.linear3[*linear as usize];
                     let index = narrow_id(linear3.len(), "linear3 ID")?;
@@ -915,6 +1258,7 @@ impl Program {
             runtime_parameters,
             runtime_results,
             runtime_ready,
+            bit_cache,
             outputs,
         } = workspace;
         values.clear();
@@ -925,6 +1269,7 @@ impl Program {
         runtime_results.resize_with(self.runtime_call_count, Vec::new);
         runtime_ready.resize(self.runtime_call_count, false);
         runtime_ready.fill(false);
+        bit_cache.resize(self.bit_cache_count, U256::ZERO);
         outputs.clear();
         outputs.reserve(self.outputs.len());
         let mut batches = self.division_batches.iter().peekable();
@@ -983,6 +1328,17 @@ impl Program {
                     values.push(square);
                     values.push(fourth);
                     values.push(fourth * values[value]);
+                }
+                Instruction::CacheBits { source, cache } => {
+                    bit_cache[*cache as usize] = values[*source as usize].into();
+                    values.push(Fr::ZERO);
+                }
+                Instruction::BitExtract { cache, bit, .. } => {
+                    values.push(if bit_cache[*cache as usize].bit(*bit as usize) {
+                        Fr::ONE
+                    } else {
+                        Fr::ZERO
+                    });
                 }
                 Instruction::Linear3(linear) => {
                     let terms = &self.linear3[*linear as usize];
@@ -1100,6 +1456,20 @@ impl Program {
                 }
                 Instruction::Square(value) | Instruction::Pow5(value) => {
                     check_value(*value as usize)?
+                }
+                Instruction::CacheBits { source, cache } => {
+                    check_value(*source as usize)?;
+                    if *cache as usize >= self.bit_cache_count {
+                        bail!("program instruction {index} references missing bit cache {cache}");
+                    }
+                }
+                Instruction::BitExtract {
+                    dependency, cache, ..
+                } => {
+                    check_value(*dependency as usize)?;
+                    if *cache as usize >= self.bit_cache_count {
+                        bail!("program instruction {index} references missing bit cache {cache}");
+                    }
                 }
                 Instruction::Linear3(linear) => {
                     let terms = self.linear3.get(*linear as usize).ok_or_else(|| {
@@ -1247,6 +1617,9 @@ impl Program {
                             .map(|&parameter| backward(parameter as usize))
                             .collect::<eyre::Result<Vec<_>>>()?,
                     }
+                }
+                Instruction::CacheBits { .. } | Instruction::BitExtract { .. } => {
+                    bail!("evaluation-only instructions cannot be serialized")
                 }
             };
             instructions.push(instruction);
@@ -1471,6 +1844,7 @@ impl Program {
             runtime_functions,
             runtime_calls,
             runtime_call_count,
+            bit_cache_count: 0,
             outputs,
             division_batches: Vec::new(),
             value_count: next_value,
@@ -1555,6 +1929,20 @@ impl Program {
                     let fourth = push(Node::Op(Operation::Mul, square, square), &mut nodes);
                     let fifth = push(Node::Op(Operation::Mul, fourth, base), &mut nodes);
                     value_nodes.extend([square, fourth, fifth]);
+                }
+                Instruction::CacheBits { source, .. } => {
+                    value_nodes.push(value_nodes[*source as usize]);
+                }
+                Instruction::BitExtract {
+                    dependency, bit, ..
+                } => {
+                    let shift = push(Node::MontConstant(Fr::from(*bit as u64)), &mut nodes);
+                    let mask = push(Node::MontConstant(Fr::from(1_u64)), &mut nodes);
+                    let shifted = push(
+                        Node::Op(Operation::Shr, value_nodes[*dependency as usize], shift),
+                        &mut nodes,
+                    );
+                    value_nodes.push(push(Node::Op(Operation::Band, shifted, mask), &mut nodes));
                 }
                 Instruction::Linear3(linear) => value_nodes.push(expand_linear(
                     &self.linear3[*linear as usize],
