@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.4.1](https://github.com/philsippl/circom-witness-rs/compare/circom-witness-rs-v0.4.0...circom-witness-rs-v0.4.1) - 2026-08-14
+
+### Other
+
+- Add IsZero and Point2Bits witness fixtures ([#42](https://github.com/philsippl/circom-witness-rs/pull/42))
+
 ## [0.3.0](https://github.com/philsippl/circom-witness-rs/compare/v0.2.3...v0.3.0) - 2026-08-07
 
 ### Other

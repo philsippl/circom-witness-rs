@@ -11,7 +11,7 @@ authors = [
 ]
 
 [dependencies]
-circom-witness-rs = { path = "..", version = "0.4.0" }
+circom-witness-rs = { path = "..", version = "0.4.1" }
 circom-compiler = { package = "compiler", git = "https://github.com/iden3/circom.git", rev = "6f782d7313793b3dc18cc3b38d2335eead9f5d50" }
 circom-constraint-generation = { package = "constraint_generation", git = "https://github.com/iden3/circom.git", rev = "6f782d7313793b3dc18cc3b38d2335eead9f5d50" }
 circom-parser = { package = "parser", git = "https://github.com/iden3/circom.git", rev = "6f782d7313793b3dc18cc3b38d2335eead9f5d50" }
