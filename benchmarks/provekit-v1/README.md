@@ -36,7 +36,7 @@ sample set. Only witness generation was run; proving was not run.
 | Self RSA-4096 register | 967,666 | 4,548,709 B | 403.400 ms | 2,851.167 ms (`rust-witness`) | 7.07x | 3,406.359 ms | 8.44x |
 | Self VC disclose | 145,722 | 405,473 B | 3.313 ms | 73.320 ms (`rust-witness`) | 22.13x | 116.092 ms | 35.04x |
 | Passport P1 | 965,282 | 4,549,230 B | 430.186 ms | 2,989.547 ms (`rust-witness`) | 6.95x | 3,415.550 ms | 7.94x |
-| WebAuthn | 3,413,073 | 27,175,055 B | 2,155.110 ms | 47,061.531 ms (`rust-witness`) | 21.84x | 53,456.554 ms | 24.80x |
+| WebAuthn | 3,413,073 | 27,175,055 B | 862.136 ms | 47,061.531 ms (`rust-witness`) | 54.59x | 53,456.554 ms | 62.00x |
 | World ID OPRF query | 34,155 | 173,558 B | 0.958 ms | 514.669 ms (`wasmi`) | 537.23x | 36.905 ms | 38.52x |
 | World ID OPRF nullifier | 73,756 | 231,061 B | 2.337 ms | 1,734.262 ms (`wasmi`) | 742.09x | 105.855 ms | 45.30x |
 
@@ -52,6 +52,18 @@ comparison must time `init_graph` through the first completed witness as a singl
 
 Sample counts were 5-20 for the hybrid and Rust/Wasmi paths, except the very slow WebAuthn
 `rust-witness` and warm-WASM baselines, which used one measured sample after warm-up.
+
+### WebAuthn native bigint specialization
+
+Profiling showed that interpreted `circom-pairing` bigint helpers consumed most of the remaining
+WebAuthn runtime. The witness runtime now recognizes Circom's numeric function specializations and
+executes `long_div2`, `short_div_norm`, `long_scalar_mult`, and `SplitFn` with native `BigUint`
+division, multiplication, and bit-range operations. Unsupported signatures still fall back to the
+portable IR interpreter; the constraint graph and witness signal ordering are unchanged.
+
+On the same machine and graph, the 15-sample hot median fell from 2,155.110 ms to 862.136 ms: a
+60.0% time reduction, or 2.50x speedup over the previous hybrid path. Graph loading remained a
+separate cold-start cost (1,182.560 ms in the final run).
 
 ## Correctness
 
@@ -70,6 +82,12 @@ Passport P1 was generated from the pinned source and fixture and matched all 965
 elements; its generated WTNS hash was
 `0754ae5733f6e3a4bf4baaf87b732cb57d5e633e671517f14ab05d19602cf3cd`.
 
+The optimized WebAuthn witness matched all 3,413,073 cached WASM fields. Hashing the concatenated
+32-byte little-endian field payload (without the WTNS header) produced
+`9ba7a4f38e9c11656c07e8b72cfe4b974dab27f224a4fdb60a2da83492a5c177`. This payload hash is used for
+fast iteration without rerunning the WASM generator; the full reference WTNS hash remains the value
+in the table above.
+
 ## Harness
 
 The reusable command-line harness is [`../../examples/witness-benchmark.rs`](../../examples/witness-benchmark.rs):
@@ -80,4 +98,6 @@ cargo run --release --example witness-benchmark -- \
 ```
 
 It loads and prepares the graph once, verifies every output field against WTNS v2, performs one
-untimed evaluation, then reports sorted witness-only samples and their median.
+untimed evaluation, then reports the deterministic field-payload SHA-256, sorted witness-only
+samples, and their median. Use `-` in place of `REFERENCE.wtns` and `0` iterations for a single
+hash-only correctness run against an already recorded payload hash.

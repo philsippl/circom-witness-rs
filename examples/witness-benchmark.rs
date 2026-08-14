@@ -8,6 +8,7 @@ use circom_witness_rs::{
 };
 use ruint::aliases::U256;
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 
 fn flatten(value: &Value, output: &mut Vec<U256>) -> eyre::Result<()> {
     match value {
@@ -129,11 +130,19 @@ fn read_wtns(path: &str) -> eyre::Result<Vec<U256>> {
         .collect())
 }
 
+fn witness_hash(witness: &[U256]) -> String {
+    let mut digest = Sha256::new();
+    for value in witness {
+        digest.update(value.to_le_bytes::<32>());
+    }
+    format!("{:x}", digest.finalize())
+}
+
 fn main() -> eyre::Result<()> {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
     eyre::ensure!(
         (2..=4).contains(&arguments.len()),
-        "usage: witness-benchmark GRAPH INPUT [REFERENCE.wtns] [ITERATIONS]"
+        "usage: witness-benchmark GRAPH INPUT [REFERENCE.wtns|-] [ITERATIONS]"
     );
     let iterations = arguments
         .get(3)
@@ -153,7 +162,11 @@ fn main() -> eyre::Result<()> {
 
     let witness = evaluator.evaluate(&input_buffer)?;
     let witness_elements = witness.len();
-    if let Some(reference) = arguments.get(2) {
+    let witness_sha256 = witness_hash(witness);
+    if let Some(reference) = arguments
+        .get(2)
+        .filter(|reference| reference.as_str() != "-")
+    {
         let reference = read_wtns(reference)?;
         eyre::ensure!(witness.len() == reference.len(), "witness lengths differ");
         for (index, (actual, expected)) in witness.iter().zip(&reference).enumerate() {
@@ -170,6 +183,7 @@ fn main() -> eyre::Result<()> {
     samples.sort_unstable();
     println!("graph_load_ms={:.3}", graph_load.as_secs_f64() * 1_000.0);
     println!("witness_elements={witness_elements}");
+    println!("witness_sha256={witness_sha256}");
     println!(
         "samples_ms={}",
         samples
@@ -178,9 +192,11 @@ fn main() -> eyre::Result<()> {
             .collect::<Vec<_>>()
             .join(",")
     );
-    println!(
-        "median_ms={:.3}",
-        samples[samples.len() / 2].as_secs_f64() * 1_000.0
-    );
+    if !samples.is_empty() {
+        println!(
+            "median_ms={:.3}",
+            samples[samples.len() / 2].as_secs_f64() * 1_000.0
+        );
+    }
     Ok(())
 }

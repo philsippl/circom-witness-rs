@@ -37,6 +37,10 @@ fn main() {
 
 Input-dependent control flow in Circom functions is handled automatically by the runtime IR interpreter, including multi-value returns. Dynamic template branches with only local variable and signal effects are lowered to arithmetic selects. Branches that create or conditionally execute components are still rejected.
 
+The runtime recognizes the numeric specializations of the standard `circom-pairing` bigint helpers
+`long_div2`, `short_div_norm`, `long_scalar_mult`, and `SplitFn`. Compatible calls use native bigint
+arithmetic; calls with a different signature continue through the portable IR interpreter.
+
 Black-box callbacks remain available as an explicit escape hatch or native acceleration hook. A Circom function is routed to a callback only when its name starts with `bbf`; callbacks return one field element.
 
 ```rust
