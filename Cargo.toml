@@ -5,7 +5,7 @@ resolver = "2"
 [package]
 name = "circom-witness-rs"
 description = "Fast witness generator for Circom circuits"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 license = "MIT"
 keywords = ["cryptography", "ZK", "circom"]

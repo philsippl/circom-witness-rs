@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.4.1](https://github.com/philsippl/circom-witness-rs/compare/circom-witness-rs-v0.4.0...circom-witness-rs-v0.4.1) - 2026-08-14
+
+### Other
+
+- Support input-dependent Circom runtime IR ([#41](https://github.com/philsippl/circom-witness-rs/pull/41))
+
 ## [0.3.0](https://github.com/philsippl/circom-witness-rs/compare/v0.2.3...v0.3.0) - 2026-08-07
 
 ### Other
