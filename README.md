@@ -11,7 +11,7 @@ The repository contains two crates with a graph file as their boundary:
 1. `circom-witness-graph-builder` compiles a circuit into a static execution graph as a one-off operation.
 2. `circom-witness-rs` loads that graph and generates witness elements at runtime.
 
-In the first mode, it compiles the circuit in-process with Circom 2.2.2 and symbolically executes the compiler's typed witness IR to build an execution graph. No generated C++, native compiler, or Rust/C++ bridge is involved. The graph is optimized through constant propagation and dead code elimination, then lowered into a compact execution program with fused linear combinations, squaring, and multi-output power-of-five instructions. Constants and coefficients are pooled, references are backward-delta encoded, and the result is compressed with Zstandard. At runtime, independent field divisions are scheduled into batches that use one fast modular inversion per batch. The graph can be embedded in the binary and interpreted to generate the witness. Legacy compressed and uncompressed Postcard graphs remain readable.
+In the first mode, it compiles the circuit in-process with Circom 2.2.2 and symbolically executes the compiler's typed witness IR to build an execution graph. No generated C++, native compiler, or Rust/C++ bridge is involved. The graph is optimized through constant propagation and dead code elimination, then lowered into a compact execution program with fused linear combinations, squaring, and multi-output power-of-five instructions. Constants and coefficients are pooled, references are backward-delta encoded, and the result is compressed with Zstandard. At runtime, independent field divisions are scheduled into batches that use one fast modular inversion per batch. Input-dependent function branches, loops, and array indexes are embedded as portable Circom IR and interpreted only at those graph boundaries; the rest of the witness remains precomputed. The graph can be embedded in the binary and interpreted to generate the witness. Legacy compressed and uncompressed Postcard graphs remain readable.
 
 ## Usage
 
@@ -21,6 +21,7 @@ cargo run --release -p circom-witness-graph-builder -- circuit.circom graph.bin
 ```
 
 Additional arguments are treated as Circom library search paths.
+For circuits whose reference artifacts use Circom O1, put `--O1` before the circuit path.
 
 **2. (At runtime) Generate witness:**
 ```rust
@@ -32,11 +33,11 @@ fn main() {
 }
 ```
 
-**📦 Blackbox functions**
+**📦 Dynamic control flow and black-box functions**
 
-Unconstrained control flow is also supported through configurable blackbox functions. This also includes the commonly requested ternary operator. Importantly, any unconstained / dynamic control flow needs to live in circom functions (i.e. cannot live in templates), so requires small modifications to existing circuits. Those functions are currently limited to a single return value. 
+Input-dependent control flow in Circom functions is handled automatically by the runtime IR interpreter, including multi-value returns. Dynamic template branches with only local variable and signal effects are lowered to arithmetic selects. Branches that create or conditionally execute components are still rejected.
 
-*Important:* Those functions only get hooked iff you prefix them with `bbf*`.
+Black-box callbacks remain available as an explicit escape hatch or native acceleration hook. A Circom function is routed to a callback only when its name starts with `bbf`; callbacks return one field element.
 
 ```rust
     let mut bbfs: HashMap<String, BlackBoxFunction> = HashMap::new();

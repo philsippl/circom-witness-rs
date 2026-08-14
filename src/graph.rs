@@ -58,6 +58,8 @@ pub enum Operation {
     Bxor,
     Bnot,
     Lnot,
+    /// Division used while lowering eager select branches; zero maps to zero on the unselected path.
+    SafeDiv,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +70,14 @@ pub enum Node {
     MontConstant(Fr),
     Op(Operation, usize, usize),
     BBF(String, Vec<usize>),
+    RuntimeCall {
+        function: usize,
+        call: usize,
+        output: usize,
+        output_count: usize,
+        arena_size: usize,
+        parameters: Vec<usize>,
+    },
 }
 
 #[derive(Debug, Default, Clone)]
@@ -108,6 +118,13 @@ pub(crate) fn prepare_evaluation(
                 }
             }
             Node::BBF(_, parameters) => {
+                let mut depth = 0;
+                for parameter in parameters {
+                    depth = depth.max(referenced_depth(*parameter)?);
+                }
+                depth
+            }
+            Node::RuntimeCall { parameters, .. } => {
                 let mut depth = 0;
                 for parameter in parameters {
                     depth = depth.max(referenced_depth(*parameter)?);
@@ -160,6 +177,11 @@ pub(crate) fn prepare_evaluation(
                 *right = renumber[*right];
             }
             Node::BBF(_, parameters) => {
+                for parameter in parameters {
+                    *parameter = renumber[*parameter];
+                }
+            }
+            Node::RuntimeCall { parameters, .. } => {
                 for parameter in parameters {
                     *parameter = renumber[*parameter];
                 }
@@ -220,6 +242,10 @@ impl Operation {
             Neg => (M - a) % M,
             Inv => a.inv_mod(M).unwrap(),
             Div => a.mul_mod(b.inv_mod(M).unwrap(), M),
+            SafeDiv => b
+                .inv_mod(M)
+                .map(|inverse| a.mul_mod(inverse, M))
+                .unwrap_or(U256::ZERO),
             Mod => a.reduce_mod(b),
             Pow => a.pow_mod(b, M),
             IDiv => a / b,
@@ -236,6 +262,13 @@ impl Operation {
             Eq => (a == b).into(),
             Neg => -a,
             Div => a / b,
+            SafeDiv => {
+                if b == Fr::from(0_u64) {
+                    Fr::from(0_u64)
+                } else {
+                    a / b
+                }
+            }
             IDiv => {
                 let a: BigUint = a.into();
                 let b: BigUint = b.into();
@@ -294,9 +327,15 @@ fn shift_right(a: U256, amount: U256) -> U256 {
 /// All references must be backwards.
 fn assert_valid(nodes: &[Node]) {
     for (i, node) in nodes.iter().enumerate() {
-        if let Node::Op(_, a, b) = node {
-            assert!(*a < i);
-            assert!(*b < i);
+        match node {
+            Node::Op(_, a, b) => {
+                assert!(*a < i);
+                assert!(*b < i);
+            }
+            Node::BBF(_, parameters) | Node::RuntimeCall { parameters, .. } => {
+                assert!(parameters.iter().all(|parameter| *parameter < i));
+            }
+            Node::Input(_) | Node::Constant(_) | Node::MontConstant(_) => {}
         }
     }
 }
@@ -388,6 +427,9 @@ pub(crate) fn evaluate_with_plan(
                 } else {
                     bail!("no black box functions provided");
                 }
+            }
+            Node::RuntimeCall { .. } => {
+                bail!("runtime Circom calls require their serialized function table")
             }
         };
         values.push(value);
@@ -485,6 +527,11 @@ pub fn tree_shake(nodes: &mut Vec<Node>, outputs: &mut [usize]) {
                     used[param] = true;
                 }
             }
+            if let Node::RuntimeCall { parameters, .. } = &nodes[i] {
+                for &parameter in parameters {
+                    used[parameter] = true;
+                }
+            }
         }
     }
 
@@ -519,6 +566,11 @@ pub fn tree_shake(nodes: &mut Vec<Node>, outputs: &mut [usize]) {
                 *param = renumber[*param].unwrap();
             }
         }
+        if let Node::RuntimeCall { parameters, .. } = node {
+            for parameter in parameters {
+                *parameter = renumber[*parameter].unwrap();
+            }
+        }
     }
     for output in outputs.iter_mut() {
         *output = renumber[*output].unwrap();
@@ -536,7 +588,7 @@ fn random_eval(nodes: &mut [Node]) -> Vec<U256> {
     for node in nodes.iter() {
         use Operation::*;
         let value = match node {
-            Node::BBF(_, _) => rng.gen::<U256>() % M,
+            Node::BBF(_, _) | Node::RuntimeCall { .. } => rng.gen::<U256>() % M,
             // Constants evaluate to themselves
             Node::Constant(c) => *c,
 
@@ -590,6 +642,11 @@ pub fn value_numbering(nodes: &mut [Node], outputs: &mut [usize]) {
                 *p = renumber[*p];
             }
         }
+        if let Node::RuntimeCall { parameters, .. } = node {
+            for parameter in parameters {
+                *parameter = renumber[*parameter];
+            }
+        }
     }
     for output in outputs.iter_mut() {
         *output = renumber[*output];
@@ -630,6 +687,7 @@ pub fn montgomery_form(nodes: &mut [Node]) {
             Input(..) => (),
             Op(..) => (),
             BBF(..) => (),
+            RuntimeCall { .. } => (),
         }
     }
     eprintln!("Converted to Montgomery form");
