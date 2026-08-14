@@ -6,3 +6,19 @@
 	path = graph-builder/tests/fixtures/circomlib
 	url = https://github.com/iden3/circomlib.git
 	shallow = true
+[submodule "benchmarks/provekit-v1/sources/self"]
+	path = benchmarks/provekit-v1/sources/self
+	url = https://github.com/selfxyz/self.git
+	shallow = true
+[submodule "benchmarks/provekit-v1/sources/webauth-circom"]
+	path = benchmarks/provekit-v1/sources/webauth-circom
+	url = https://github.com/privacy-ethereum/webauth-circom.git
+	shallow = true
+[submodule "benchmarks/provekit-v1/sources/world-id-protocol"]
+	path = benchmarks/provekit-v1/sources/world-id-protocol
+	url = https://github.com/worldcoin/world-id-protocol.git
+	shallow = true
+[submodule "benchmarks/provekit-v1/upstream"]
+	path = benchmarks/provekit-v1/upstream
+	url = https://github.com/worldfnd/provekit.git
+	shallow = true
