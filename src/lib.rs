@@ -1,5 +1,7 @@
 pub mod graph;
 mod program;
+#[doc(hidden)]
+pub mod runtime;
 
 use std::{
     collections::HashMap,
@@ -19,7 +21,8 @@ pub const M: U256 =
     uint!(21888242871839275222246405745257275088548364400416034343698204186575808495617_U256);
 
 const LEGACY_GRAPH_HEADER: &[u8; 8] = b"CWGR\x01DZ\0";
-const GRAPH_HEADER: &[u8; 8] = b"CWGR\x02FZ\0";
+const PREVIOUS_FUSED_GRAPH_HEADER: &[u8; 8] = b"CWGR\x02FZ\0";
+const GRAPH_HEADER: &[u8; 8] = b"CWGR\x03FZ\0";
 const GRAPH_MAGIC: &[u8; 4] = b"CWGR";
 const GRAPH_COMPRESSION_LEVEL: i32 = 19;
 
@@ -166,10 +169,21 @@ pub fn serialize_graph(
     signals: Vec<usize>,
     input_mapping: Vec<HashSignalInfo>,
 ) -> eyre::Result<Vec<u8>> {
+    serialize_graph_with_runtime(nodes, signals, input_mapping, Vec::new())
+}
+
+#[doc(hidden)]
+pub fn serialize_graph_with_runtime(
+    nodes: Vec<Node>,
+    signals: Vec<usize>,
+    input_mapping: Vec<HashSignalInfo>,
+    runtime_functions: Vec<runtime::RuntimeFunction>,
+) -> eyre::Result<Vec<u8>> {
     // Preserve the builder's topological order on disk. Division-depth reordering improves runtime
     // but measurably hurts compression on large graphs, so it is deliberately done only at load.
-    let encoded_program = program::compile(&nodes, &signals, &[])?.encode()?;
-    let postcard = postcard::to_stdvec(&(&encoded_program, &input_mapping))?;
+    let encoded_program =
+        program::compile(&nodes, &signals, &[], runtime_functions.clone())?.encode()?;
+    let postcard = postcard::to_stdvec(&(&encoded_program, &input_mapping, &runtime_functions))?;
     let compressed = zstd::stream::encode_all(postcard.as_slice(), GRAPH_COMPRESSION_LEVEL)
         .wrap_err("failed to compress witness graph")?;
     let mut encoded = Vec::with_capacity(GRAPH_HEADER.len() + compressed.len());
@@ -186,6 +200,11 @@ fn restore_absolute_references(nodes: &mut [Node], signals: &mut [usize]) -> eyr
                 *right = decode_backward_reference(index, *right)?;
             }
             Node::BBF(_, parameters) => {
+                for parameter in parameters {
+                    *parameter = decode_backward_reference(index, *parameter)?;
+                }
+            }
+            Node::RuntimeCall { parameters, .. } => {
                 for parameter in parameters {
                     *parameter = decode_backward_reference(index, *parameter)?;
                 }
@@ -219,6 +238,7 @@ pub fn init_graph(graph_bytes: &[u8]) -> eyre::Result<Graph> {
     #[derive(Clone, Copy)]
     enum Format {
         Fused,
+        PreviousFused,
         LegacyCompressed,
         LegacyRaw,
     }
@@ -229,6 +249,11 @@ pub fn init_graph(graph_bytes: &[u8]) -> eyre::Result<Graph> {
             .ok_or_else(|| eyre!("witness graph header is truncated"))?;
         if header == GRAPH_HEADER {
             (Format::Fused, &graph_bytes[GRAPH_HEADER.len()..])
+        } else if header == PREVIOUS_FUSED_GRAPH_HEADER {
+            (
+                Format::PreviousFused,
+                &graph_bytes[PREVIOUS_FUSED_GRAPH_HEADER.len()..],
+            )
         } else if header == LEGACY_GRAPH_HEADER {
             (
                 Format::LegacyCompressed,
@@ -250,10 +275,21 @@ pub fn init_graph(graph_bytes: &[u8]) -> eyre::Result<Graph> {
         decompressed.as_slice()
     };
 
-    if matches!(format, Format::Fused) {
-        let (encoded, input_mapping): (program::EncodedProgram, Vec<HashSignalInfo>) =
-            postcard::from_bytes(payload).wrap_err("failed to decode fused witness graph")?;
-        let program = program::Program::decode(encoded)?.prepare_evaluation()?;
+    if matches!(format, Format::Fused | Format::PreviousFused) {
+        let (encoded, input_mapping, runtime_functions) = if matches!(format, Format::Fused) {
+            let (encoded, input_mapping, runtime_functions): (
+                program::EncodedProgram,
+                Vec<HashSignalInfo>,
+                Vec<runtime::RuntimeFunction>,
+            ) = postcard::from_bytes(payload).wrap_err("failed to decode fused witness graph")?;
+            (encoded, input_mapping, runtime_functions)
+        } else {
+            let (encoded, input_mapping): (program::EncodedProgram, Vec<HashSignalInfo>) =
+                postcard::from_bytes(payload)
+                    .wrap_err("failed to decode previous fused witness graph")?;
+            (encoded, input_mapping, Vec::new())
+        };
+        let program = program::Program::decode(encoded, runtime_functions)?.prepare_evaluation()?;
         return Ok(Graph {
             compatibility: OnceLock::new(),
             input_mapping,
@@ -262,7 +298,7 @@ pub fn init_graph(graph_bytes: &[u8]) -> eyre::Result<Graph> {
     }
 
     let (mut nodes, mut signals, input_mapping) = match format {
-        Format::Fused => unreachable!(),
+        Format::Fused | Format::PreviousFused => unreachable!(),
         Format::LegacyCompressed => {
             let (mut nodes, mut signals, input_mapping): (
                 Vec<Node>,
@@ -278,7 +314,12 @@ pub fn init_graph(graph_bytes: &[u8]) -> eyre::Result<Graph> {
     };
 
     let evaluation_plan = graph::prepare_evaluation(&mut nodes, &mut signals)?;
-    let program = program::compile(&nodes, &signals, evaluation_plan.division_batches())?;
+    let program = program::compile(
+        &nodes,
+        &signals,
+        evaluation_plan.division_batches(),
+        Vec::new(),
+    )?;
 
     Ok(Graph {
         compatibility: OnceLock::from(CompatibilityGraph { nodes, signals }),
@@ -344,6 +385,7 @@ pub fn calculate_witness(
 mod tests {
     use super::*;
     use crate::graph::Operation;
+    use crate::runtime::{RuntimeExpression, RuntimeFunction, RuntimeStatement};
 
     fn graph_parts() -> (Vec<Node>, Vec<usize>, Vec<HashSignalInfo>) {
         let nodes = vec![
@@ -420,6 +462,11 @@ mod tests {
                         *parameter = encode_backward_reference(index, *parameter).unwrap();
                     }
                 }
+                Node::RuntimeCall { parameters, .. } => {
+                    for parameter in parameters {
+                        *parameter = encode_backward_reference(index, *parameter).unwrap();
+                    }
+                }
                 Node::Input(_) | Node::Constant(_) | Node::MontConstant(_) => {}
             }
         }
@@ -461,6 +508,39 @@ mod tests {
         assert_eq!(graph.evaluate(&inputs, None).unwrap(), expected);
         let mut evaluator = graph.evaluator(None).unwrap();
         assert_eq!(evaluator.evaluate(&inputs).unwrap(), expected);
+    }
+
+    #[test]
+    fn fused_graph_round_trips_runtime_ir_calls() {
+        let nodes = vec![
+            Node::Input(0),
+            Node::RuntimeCall {
+                function: 0,
+                call: 0,
+                output: 0,
+                output_count: 1,
+                arena_size: 1,
+                parameters: vec![0],
+            },
+        ];
+        let functions = vec![RuntimeFunction {
+            name: "identity".to_owned(),
+            variable_count: 1,
+            body: vec![RuntimeStatement::Return {
+                value: RuntimeExpression::Load {
+                    offset: Box::new(RuntimeExpression::Address(0)),
+                    size: 1,
+                },
+                size: 1,
+            }],
+        }];
+        let encoded = serialize_graph_with_runtime(nodes, vec![1], Vec::new(), functions).unwrap();
+        let graph = init_graph(&encoded).unwrap();
+
+        assert_eq!(
+            graph.evaluate(&[U256::from(7_u64)], None).unwrap(),
+            vec![U256::from(7_u64)]
+        );
     }
 
     #[test]

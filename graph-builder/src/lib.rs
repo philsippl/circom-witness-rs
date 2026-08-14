@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use std::{
-    env,
+    collections::{HashMap, HashSet},
+    env, fmt,
     path::{Path, PathBuf},
 };
 
@@ -20,7 +21,8 @@ use ruint::aliases::U256;
 
 use circom_witness_rs::{
     graph::{self, Node, Operation},
-    serialize_graph, HashSignalInfo, M,
+    runtime::{RuntimeExpression, RuntimeFunction, RuntimeOperation, RuntimeStatement},
+    serialize_graph_with_runtime, HashSignalInfo, M,
 };
 
 const CIRCOM_VERSION: &str = "2.2.2";
@@ -30,7 +32,19 @@ struct GraphBuilder {
     nodes: Vec<Node>,
     values: Vec<U256>,
     constant: Vec<bool>,
+    next_runtime_call: usize,
 }
+
+#[derive(Debug)]
+struct NeedsRuntime;
+
+impl fmt::Display for NeedsRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Circom control flow or an array index depends on an input signal")
+    }
+}
+
+impl std::error::Error for NeedsRuntime {}
 
 impl GraphBuilder {
     fn push(&mut self, node: Node, value: U256, constant: bool) -> usize {
@@ -50,8 +64,12 @@ impl GraphBuilder {
     }
 
     fn op(&mut self, operation: Operation, a: usize, b: usize) -> usize {
-        let value = operation.eval(self.values[a], self.values[b]);
         let constant = self.constant[a] && self.constant[b];
+        let value = if constant {
+            operation.eval(self.values[a], self.values[b])
+        } else {
+            rand::thread_rng().gen::<U256>() % M
+        };
         self.push(Node::Op(operation, a, b), value, constant)
     }
 
@@ -60,11 +78,39 @@ impl GraphBuilder {
         self.push(Node::BBF(name, params), value, false)
     }
 
+    fn runtime_call(
+        &mut self,
+        function: usize,
+        params: Vec<usize>,
+        arena_size: usize,
+        output_count: usize,
+    ) -> Vec<usize> {
+        let call = self.next_runtime_call;
+        self.next_runtime_call += 1;
+        (0..output_count)
+            .map(|output| {
+                let value = rand::thread_rng().gen::<U256>() % M;
+                self.push(
+                    Node::RuntimeCall {
+                        function,
+                        call,
+                        output,
+                        output_count,
+                        arena_size,
+                        parameters: params.clone(),
+                    },
+                    value,
+                    false,
+                )
+            })
+            .collect()
+    }
+
     fn constant_value(&self, node: usize) -> Result<U256> {
         if self.constant[node] {
             Ok(self.values[node])
         } else {
-            bail!("Circom control flow or an array index depends on an input signal")
+            Err(NeedsRuntime.into())
         }
     }
 }
@@ -81,6 +127,7 @@ struct Component {
 struct Frame {
     component: usize,
     variables: Vec<Option<usize>>,
+    is_function: bool,
 }
 
 enum Eval {
@@ -123,12 +170,18 @@ enum Flow {
     Return(Vec<usize>),
 }
 
+type TemplateBranchSide = (Flow, Vec<Option<usize>>, HashMap<usize, Option<usize>>);
+
 struct Interpreter<'a> {
     circuit: &'a Circuit,
     graph: GraphBuilder,
     constants: Vec<usize>,
     signals: Vec<Option<usize>>,
     components: Vec<Option<Component>>,
+    runtime_functions: Vec<Option<RuntimeFunction>>,
+    runtime_function_ids: HashMap<(String, usize), usize>,
+    signal_undos: Vec<HashMap<usize, Option<usize>>>,
+    zero: usize,
 }
 
 impl<'a> Interpreter<'a> {
@@ -142,7 +195,8 @@ impl<'a> Interpreter<'a> {
         }
 
         let mut graph = GraphBuilder::default();
-        let mut signals = vec![None; producer.total_number_of_signals];
+        let zero = graph.constant(U256::ZERO);
+        let mut signals = vec![Some(zero); producer.total_number_of_signals];
         signals[0] = Some(graph.constant(U256::ONE));
 
         let main_input_start = producer.get_number_of_main_outputs();
@@ -167,10 +221,14 @@ impl<'a> Interpreter<'a> {
             constants,
             signals,
             components: vec![None; producer.number_of_components],
+            runtime_functions: Vec::new(),
+            runtime_function_ids: HashMap::new(),
+            signal_undos: Vec::new(),
+            zero,
         })
     }
 
-    fn build(mut self) -> Result<(Vec<Node>, Vec<usize>)> {
+    fn build(mut self) -> Result<(Vec<Node>, Vec<usize>, Vec<RuntimeFunction>)> {
         let main_template = self
             .circuit
             .templates
@@ -196,7 +254,15 @@ impl<'a> Interpreter<'a> {
                     .ok_or_else(|| eyre!("witness signal {signal} was not assigned by Circom"))
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok((self.graph.nodes, outputs))
+        let runtime_functions = self
+            .runtime_functions
+            .into_iter()
+            .enumerate()
+            .map(|(index, function)| {
+                function.ok_or_else(|| eyre!("runtime Circom function {index} was not compiled"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((self.graph.nodes, outputs, runtime_functions))
     }
 
     fn run_template(&mut self, component_id: usize) -> Result<()> {
@@ -210,9 +276,17 @@ impl<'a> Interpreter<'a> {
         let template = circuit.get_template(component.template_id);
         let mut frame = Frame {
             component: component_id,
-            variables: vec![None; template.var_stack_depth],
+            variables: vec![Some(self.zero); template.var_stack_depth],
+            is_function: false,
         };
-        match self.execute_list(&template.body, &mut frame)? {
+        match self
+            .execute_list(&template.body, &mut frame)
+            .wrap_err_with(|| {
+                format!(
+                    "while symbolically executing Circom template {} (component {component_id})",
+                    template.header
+                )
+            })? {
             Flow::Continue => Ok(()),
             Flow::Return(_) => bail!("Circom template {} returned a value", template.header),
         }
@@ -232,7 +306,7 @@ impl<'a> Interpreter<'a> {
             .iter()
             .find(|function| function.header == symbol)
             .ok_or_else(|| eyre!("Circom function {symbol} was not found"))?;
-        let mut variables = vec![None; arena_size.max(function.max_number_of_vars)];
+        let mut variables = vec![Some(self.zero); arena_size.max(function.max_number_of_vars)];
         if arguments.len() > variables.len() {
             bail!("arguments for Circom function {symbol} exceed its variable arena");
         }
@@ -242,13 +316,47 @@ impl<'a> Interpreter<'a> {
         let mut frame = Frame {
             component,
             variables,
+            is_function: true,
         };
-        match self.execute_list(&function.body, &mut frame)? {
+        match self
+            .execute_list(&function.body, &mut frame)
+            .wrap_err_with(|| format!("while symbolically executing Circom function {symbol}"))?
+        {
             Flow::Return(mut values) => {
                 values.truncate(result_size);
                 Ok(values)
             }
             Flow::Continue => bail!("Circom function {symbol} did not return a value"),
+        }
+    }
+
+    fn execute_function_or_runtime(
+        &mut self,
+        symbol: &str,
+        arguments: Vec<usize>,
+        arena_size: usize,
+        component: usize,
+        result_size: usize,
+    ) -> Result<Vec<usize>> {
+        let checkpoint = self.graph.nodes.len();
+        match self.execute_function(
+            symbol,
+            arguments.clone(),
+            arena_size,
+            component,
+            result_size,
+        ) {
+            Ok(values) => Ok(values),
+            Err(error) if error.downcast_ref::<NeedsRuntime>().is_some() => {
+                self.graph.nodes.truncate(checkpoint);
+                self.graph.values.truncate(checkpoint);
+                self.graph.constant.truncate(checkpoint);
+                let function = self.compile_runtime_function(symbol, component)?;
+                Ok(self
+                    .graph
+                    .runtime_call(function, arguments, arena_size, result_size))
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -260,14 +368,25 @@ impl<'a> Interpreter<'a> {
                     self.execute_call(call, frame)?;
                 }
                 Instruction::Branch(branch) => {
-                    let condition = self.eval_condition(branch.cond.as_ref(), frame)?;
-                    let body = if condition {
-                        &branch.if_branch
+                    let condition = self.eval_condition_node(branch.cond.as_ref(), frame)?;
+                    if self.graph.constant[condition] {
+                        let body = if self.graph.values[condition] != U256::ZERO {
+                            &branch.if_branch
+                        } else {
+                            &branch.else_branch
+                        };
+                        if let Flow::Return(values) = self.execute_list(body, frame)? {
+                            return Ok(Flow::Return(values));
+                        }
+                    } else if frame.is_function {
+                        return Err(NeedsRuntime.into());
                     } else {
-                        &branch.else_branch
-                    };
-                    if let Flow::Return(values) = self.execute_list(body, frame)? {
-                        return Ok(Flow::Return(values));
+                        self.execute_dynamic_template_branch(
+                            condition,
+                            &branch.if_branch,
+                            &branch.else_branch,
+                            frame,
+                        )?;
                     }
                 }
                 Instruction::Loop(loop_bucket) => {
@@ -435,7 +554,7 @@ impl<'a> Interpreter<'a> {
                 let node = if is_black_box {
                     self.graph.black_box(call.symbol.clone(), arguments)
                 } else {
-                    let values = self.execute_function(
+                    let values = self.execute_function_or_runtime(
                         &call.symbol,
                         arguments,
                         call.arena_size,
@@ -460,7 +579,7 @@ impl<'a> Interpreter<'a> {
                     }
                     vec![self.graph.black_box(call.symbol.clone(), arguments)]
                 } else {
-                    self.execute_function(
+                    self.execute_function_or_runtime(
                         &call.symbol,
                         arguments,
                         call.arena_size,
@@ -685,6 +804,14 @@ impl<'a> Interpreter<'a> {
     }
 
     fn write_place(&mut self, place: &Place, values: &[usize], frame: &mut Frame) -> Result<()> {
+        if matches!(place.memory, Memory::Signals) {
+            for offset in 0..values.len() {
+                let index = place.offset + offset;
+                for undo in &mut self.signal_undos {
+                    undo.entry(index).or_insert(self.signals[index]);
+                }
+            }
+        }
         let memory = match place.memory {
             Memory::Variables => &mut frame.variables,
             Memory::Signals => &mut self.signals,
@@ -730,12 +857,311 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    fn compile_runtime_function(&mut self, symbol: &str, component: usize) -> Result<usize> {
+        let template_id = self.component(component)?.template_id;
+        let key = (symbol.to_owned(), template_id);
+        if let Some(&function) = self.runtime_function_ids.get(&key) {
+            return Ok(function);
+        }
+        let function = self
+            .circuit
+            .functions
+            .iter()
+            .find(|function| function.header == symbol)
+            .ok_or_else(|| eyre!("Circom function {symbol} was not found"))?;
+        let name = function.header.clone();
+        let variable_count = function.max_number_of_vars;
+        let body = function.body.clone();
+
+        let id = self.runtime_functions.len();
+        self.runtime_functions.push(None);
+        self.runtime_function_ids.insert(key, id);
+        let body = self.translate_runtime_list(&body, component)?;
+        self.runtime_functions[id] = Some(RuntimeFunction {
+            name,
+            variable_count,
+            body,
+        });
+        Ok(id)
+    }
+
+    fn translate_runtime_list(
+        &mut self,
+        body: &InstructionList,
+        component: usize,
+    ) -> Result<Vec<RuntimeStatement>> {
+        let mut translated = Vec::new();
+        for instruction in body {
+            match instruction.as_ref() {
+                Instruction::Store(store) => {
+                    if !matches!(store.dest_address_type, AddressType::Variable)
+                        || store.src_address_type.is_some()
+                    {
+                        bail!("runtime Circom functions may only access local variables")
+                    }
+                    let destination_size = self.resolve_size(&store.context, Some(component))?;
+                    let source_size = self.resolve_size(&store.src_context, Some(component))?;
+                    translated.push(RuntimeStatement::Store {
+                        offset: self.translate_runtime_location(&store.dest, component)?,
+                        size: destination_size.min(source_size),
+                        value: self.translate_runtime_expression(store.src.as_ref(), component)?,
+                    });
+                }
+                Instruction::Call(call) => match &call.return_info {
+                    ReturnType::Intermediate { .. } => translated.push(RuntimeStatement::Call(
+                        self.translate_runtime_call(call, component, 1)?,
+                    )),
+                    ReturnType::Final(data) => {
+                        if !matches!(data.dest_address_type, AddressType::Variable) {
+                            bail!("runtime Circom functions may only store local call results")
+                        }
+                        let size = self.resolve_size(&data.context, Some(component))?;
+                        translated.push(RuntimeStatement::Store {
+                            offset: self.translate_runtime_location(&data.dest, component)?,
+                            size,
+                            value: self.translate_runtime_call(call, component, size)?,
+                        });
+                    }
+                },
+                Instruction::Branch(branch) => translated.push(RuntimeStatement::Branch {
+                    condition: self
+                        .translate_runtime_expression(branch.cond.as_ref(), component)?,
+                    if_branch: self.translate_runtime_list(&branch.if_branch, component)?,
+                    else_branch: self.translate_runtime_list(&branch.else_branch, component)?,
+                }),
+                Instruction::Loop(loop_bucket) => translated.push(RuntimeStatement::Loop {
+                    condition: self.translate_runtime_expression(
+                        loop_bucket.continue_condition.as_ref(),
+                        component,
+                    )?,
+                    body: self.translate_runtime_list(&loop_bucket.body, component)?,
+                }),
+                Instruction::Return(return_bucket) => translated.push(RuntimeStatement::Return {
+                    value: self
+                        .translate_runtime_expression(return_bucket.value.as_ref(), component)?,
+                    size: return_bucket.with_size,
+                }),
+                Instruction::Value(_) | Instruction::Load(_) | Instruction::Compute(_) => {
+                    translated.push(RuntimeStatement::Call(
+                        self.translate_runtime_expression(instruction.as_ref(), component)?,
+                    ));
+                }
+                Instruction::Assert(_) | Instruction::Log(_) => {}
+                Instruction::CreateCmp(_) => {
+                    bail!("runtime Circom functions cannot create components")
+                }
+            }
+        }
+        Ok(translated)
+    }
+
+    fn translate_runtime_expression(
+        &mut self,
+        instruction: &Instruction,
+        component: usize,
+    ) -> Result<RuntimeExpression> {
+        Ok(match instruction {
+            Instruction::Value(value) => match value.parse_as {
+                ValueType::U32 => RuntimeExpression::Address(value.value),
+                ValueType::BigInt => {
+                    RuntimeExpression::Field(self.graph.values[self.constants[value.value]])
+                }
+            },
+            Instruction::Load(load) => {
+                if !matches!(load.address_type, AddressType::Variable) {
+                    bail!("runtime Circom functions may only load local variables")
+                }
+                RuntimeExpression::Load {
+                    offset: Box::new(self.translate_runtime_location(&load.src, component)?),
+                    size: self.resolve_size(&load.context, Some(component))?,
+                }
+            }
+            Instruction::Compute(compute) => {
+                let operation = match &compute.op {
+                    OperatorType::AddAddress => RuntimeOperation::AddAddress,
+                    OperatorType::MulAddress => RuntimeOperation::MulAddress,
+                    OperatorType::ToAddress => RuntimeOperation::ToAddress,
+                    OperatorType::Eq(size) => {
+                        RuntimeOperation::Equal(self.resolve_size_option(size, Some(component))?)
+                    }
+                    operation => RuntimeOperation::Field(operation_from_circom(operation)?),
+                };
+                RuntimeExpression::Compute {
+                    operation,
+                    operands: compute
+                        .stack
+                        .iter()
+                        .map(|operand| {
+                            self.translate_runtime_expression(operand.as_ref(), component)
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                }
+            }
+            Instruction::Call(call) => {
+                let ReturnType::Intermediate { .. } = call.return_info else {
+                    bail!("a final Circom call cannot be a runtime expression")
+                };
+                self.translate_runtime_call(call, component, 1)?
+            }
+            _ => bail!("Circom statement cannot be a runtime expression"),
+        })
+    }
+
+    fn translate_runtime_call(
+        &mut self,
+        call: &CallBucket,
+        component: usize,
+        result_size: usize,
+    ) -> Result<RuntimeExpression> {
+        let function = self.compile_runtime_function(&call.symbol, component)?;
+        let mut arguments = Vec::with_capacity(call.arguments.len());
+        for (argument, context) in call.arguments.iter().zip(&call.argument_types) {
+            arguments.push((
+                self.translate_runtime_expression(argument.as_ref(), component)?,
+                self.resolve_size(context, Some(component))?,
+            ));
+        }
+        Ok(RuntimeExpression::Call {
+            function,
+            arena_size: call.arena_size,
+            result_size,
+            arguments,
+        })
+    }
+
+    fn translate_runtime_location(
+        &mut self,
+        location: &LocationRule,
+        component: usize,
+    ) -> Result<RuntimeExpression> {
+        match location {
+            LocationRule::Indexed { location, .. } => {
+                self.translate_runtime_expression(location.as_ref(), component)
+            }
+            LocationRule::Mapped { .. } => {
+                bail!("runtime Circom functions cannot use mapped component locations")
+            }
+        }
+    }
+
+    fn execute_dynamic_template_branch(
+        &mut self,
+        condition: usize,
+        if_branch: &InstructionList,
+        else_branch: &InstructionList,
+        frame: &mut Frame,
+    ) -> Result<()> {
+        if !branch_has_local_effects(if_branch) || !branch_has_local_effects(else_branch) {
+            bail!("input-dependent Circom template branch has component side effects")
+        }
+
+        let base_variables = frame.variables.clone();
+        let (if_flow, if_variables, if_signals) =
+            self.execute_template_branch_side(if_branch, frame)?;
+        frame.variables.clone_from(&base_variables);
+        let (else_flow, else_variables, else_signals) =
+            self.execute_template_branch_side(else_branch, frame)?;
+        if !matches!((if_flow, else_flow), (Flow::Continue, Flow::Continue)) {
+            bail!("input-dependent Circom template branch cannot return a value")
+        }
+
+        for index in 0..frame.variables.len() {
+            frame.variables[index] = self.merge_optional_nodes(
+                condition,
+                if_variables[index],
+                else_variables[index],
+                "variable",
+                index,
+            )?;
+        }
+
+        let signal_indexes = if_signals
+            .keys()
+            .chain(else_signals.keys())
+            .copied()
+            .collect::<HashSet<_>>();
+        for index in signal_indexes {
+            let base = self.signals[index];
+            let if_value = if_signals.get(&index).copied().unwrap_or(base);
+            let else_value = else_signals.get(&index).copied().unwrap_or(base);
+            let merged =
+                self.merge_optional_nodes(condition, if_value, else_value, "signal", index)?;
+            self.set_signal(index, merged);
+        }
+        Ok(())
+    }
+
+    fn execute_template_branch_side(
+        &mut self,
+        body: &InstructionList,
+        frame: &mut Frame,
+    ) -> Result<TemplateBranchSide> {
+        let graph_start = self.graph.nodes.len();
+        self.signal_undos.push(HashMap::new());
+        let result = self.execute_list(body, frame);
+        for node in &mut self.graph.nodes[graph_start..] {
+            if let Node::Op(operation, _, _) = node {
+                if *operation == Operation::Div {
+                    *operation = Operation::SafeDiv;
+                }
+            }
+        }
+        let undo = self.signal_undos.pop().unwrap();
+        let values = undo
+            .keys()
+            .map(|&index| (index, self.signals[index]))
+            .collect::<HashMap<_, _>>();
+        for (&index, &original) in &undo {
+            self.signals[index] = original;
+        }
+        let flow = result?;
+        Ok((flow, frame.variables.clone(), values))
+    }
+
+    fn merge_optional_nodes(
+        &mut self,
+        condition: usize,
+        if_value: Option<usize>,
+        else_value: Option<usize>,
+        kind: &str,
+        index: usize,
+    ) -> Result<Option<usize>> {
+        match (if_value, else_value) {
+            (None, None) => Ok(None),
+            (Some(if_value), Some(else_value)) if if_value == else_value => Ok(Some(if_value)),
+            (Some(if_value), Some(else_value)) => {
+                let zero = self.graph.constant(U256::ZERO);
+                let condition = self.graph.op(Operation::Neq, condition, zero);
+                let difference = self.graph.op(Operation::Sub, if_value, else_value);
+                let selected = self.graph.op(Operation::Mul, condition, difference);
+                Ok(Some(self.graph.op(Operation::Add, else_value, selected)))
+            }
+            _ => bail!("input-dependent Circom branch initializes {kind} {index} on only one path"),
+        }
+    }
+
+    fn set_signal(&mut self, index: usize, value: Option<usize>) {
+        for undo in &mut self.signal_undos {
+            undo.entry(index).or_insert(self.signals[index]);
+        }
+        self.signals[index] = value;
+    }
+
     fn eval_condition(&mut self, instruction: &Instruction, frame: &mut Frame) -> Result<bool> {
-        let (nodes, _) = self.eval(instruction, frame)?.values()?;
-        let node = *nodes
-            .first()
-            .ok_or_else(|| eyre!("Circom condition is empty"))?;
+        let node = self.eval_condition_node(instruction, frame)?;
         Ok(self.graph.constant_value(node)? != U256::ZERO)
+    }
+
+    fn eval_condition_node(
+        &mut self,
+        instruction: &Instruction,
+        frame: &mut Frame,
+    ) -> Result<usize> {
+        let (nodes, _) = self.eval(instruction, frame)?.values()?;
+        nodes
+            .first()
+            .copied()
+            .ok_or_else(|| eyre!("Circom condition is empty"))
     }
 
     fn update_subcomponent_after_write(
@@ -790,6 +1216,33 @@ impl<'a> Interpreter<'a> {
     }
 }
 
+fn branch_has_local_effects(body: &InstructionList) -> bool {
+    body.iter().all(|instruction| match instruction.as_ref() {
+        Instruction::Store(store) => matches!(
+            store.dest_address_type,
+            AddressType::Variable | AddressType::Signal
+        ),
+        Instruction::Call(call) => match &call.return_info {
+            ReturnType::Intermediate { .. } => true,
+            ReturnType::Final(data) => matches!(
+                data.dest_address_type,
+                AddressType::Variable | AddressType::Signal
+            ),
+        },
+        Instruction::Branch(branch) => {
+            branch_has_local_effects(&branch.if_branch)
+                && branch_has_local_effects(&branch.else_branch)
+        }
+        Instruction::Loop(_) | Instruction::CreateCmp(_) => false,
+        Instruction::Value(_)
+        | Instruction::Load(_)
+        | Instruction::Compute(_)
+        | Instruction::Return(_)
+        | Instruction::Assert(_)
+        | Instruction::Log(_) => true,
+    })
+}
+
 fn operation_from_circom(operation: &OperatorType) -> Result<Operation> {
     use OperatorType::*;
     Ok(match operation {
@@ -836,7 +1289,11 @@ fn parse_field_constant(value: &str) -> Result<U256> {
     }
 }
 
-fn compile_circuit(circuit_path: &Path, library_paths: &[PathBuf]) -> Result<Circuit> {
+fn compile_circuit(
+    circuit_path: &Path,
+    library_paths: &[PathBuf],
+    use_o1: bool,
+) -> Result<Circuit> {
     let prime = M
         .to_string()
         .parse::<circom_compiler::num_bigint::BigInt>()
@@ -859,10 +1316,10 @@ fn compile_circuit(circuit_path: &Path, library_paths: &[PathBuf]) -> Result<Cir
     let (_, vcp) = build_circuit(
         program,
         BuildConfig {
-            no_rounds: usize::MAX,
+            no_rounds: if use_o1 { 0 } else { usize::MAX },
             flag_json_sub: false,
             json_substitutions: String::new(),
-            flag_s: false,
+            flag_s: use_o1,
             flag_f: false,
             flag_p: false,
             flag_verbose: false,
@@ -901,8 +1358,17 @@ pub fn generate_witness_graph_from_file(
     circuit_path: impl AsRef<Path>,
     library_paths: &[PathBuf],
 ) -> Result<Vec<u8>> {
+    generate_witness_graph_from_file_with_optimization(circuit_path, library_paths, false)
+}
+
+/// Compile a Circom circuit using either its O1 or O2 witness-to-signal mapping.
+pub fn generate_witness_graph_from_file_with_optimization(
+    circuit_path: impl AsRef<Path>,
+    library_paths: &[PathBuf],
+    use_o1: bool,
+) -> Result<Vec<u8>> {
     let circuit_path = circuit_path.as_ref();
-    let circuit = compile_circuit(circuit_path, library_paths)?;
+    let circuit = compile_circuit(circuit_path, library_paths, use_o1)?;
     let input_map = circuit
         .c_producer
         .main_input_list
@@ -915,12 +1381,12 @@ pub fn generate_witness_graph_from_file(
         .collect::<Vec<_>>();
 
     let started = std::time::Instant::now();
-    let (mut nodes, mut signals) = Interpreter::new(&circuit)?.build()?;
+    let (mut nodes, mut signals, runtime_functions) = Interpreter::new(&circuit)?.build()?;
     eprintln!("Symbolic execution took: {:?}", started.elapsed());
     eprintln!("Graph with {} nodes", nodes.len());
     graph::optimize(&mut nodes, &mut signals);
 
-    let bytes = serialize_graph(nodes, signals, input_map)?;
+    let bytes = serialize_graph_with_runtime(nodes, signals, input_map, runtime_functions)?;
     eprintln!("Graph size: {} bytes", bytes.len());
     Ok(bytes)
 }
@@ -935,7 +1401,8 @@ pub fn generate_witness_graph() -> Result<Vec<u8>> {
         .map(PathBuf::from)
         .into_iter()
         .collect::<Vec<_>>();
-    generate_witness_graph_from_file(&circuit_path, &library_paths)
+    let use_o1 = env::var_os("CIRCOM_OPTIMIZATION").is_some_and(|value| value == "O1");
+    generate_witness_graph_from_file_with_optimization(&circuit_path, &library_paths, use_o1)
 }
 
 /// Compile the selected circuit and write its optimized graph to `graph.bin`.

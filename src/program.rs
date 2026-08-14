@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     graph::{Node, Operation},
+    runtime::RuntimeFunction,
     BlackBoxFunction, M,
 };
 
@@ -26,6 +27,9 @@ pub(crate) struct Program {
     linear3: Vec<[(u32, u32); 3]>,
     linear4: Vec<[(u32, u32); 4]>,
     black_boxes: Vec<BlackBoxInstruction>,
+    runtime_functions: Vec<RuntimeFunction>,
+    runtime_calls: Vec<RuntimeCallInstruction>,
+    runtime_call_count: usize,
     outputs: Vec<usize>,
     division_batches: Vec<Range<usize>>,
     value_count: usize,
@@ -38,6 +42,9 @@ pub(crate) struct EvaluationWorkspace {
     inverses: Vec<Fr>,
     inversion_scratch: Vec<Fr>,
     black_box_parameters: Vec<Fr>,
+    runtime_parameters: Vec<Fr>,
+    runtime_results: Vec<Vec<Fr>>,
+    runtime_ready: Vec<bool>,
     outputs: Vec<U256>,
 }
 
@@ -65,11 +72,22 @@ enum Instruction {
     Linear3(u32),
     Linear4(u32),
     BlackBox(u32),
+    RuntimeCall(u32),
 }
 
 #[derive(Debug, Clone)]
 struct BlackBoxInstruction {
     name: String,
+    parameters: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeCallInstruction {
+    function: usize,
+    call: usize,
+    output: usize,
+    output_count: usize,
+    arena_size: usize,
     parameters: Vec<u32>,
 }
 
@@ -95,6 +113,14 @@ enum EncodedInstruction {
     Linear3([(usize, usize); 3]),
     Linear4([(usize, usize); 4]),
     BlackBox(String, Vec<usize>),
+    RuntimeCall {
+        function: usize,
+        call: usize,
+        output: usize,
+        output_count: usize,
+        arena_size: usize,
+        parameters: Vec<usize>,
+    },
 }
 
 #[derive(Default)]
@@ -128,6 +154,11 @@ fn validate_graph(nodes: &[Node], outputs: &[usize]) -> eyre::Result<()> {
                 check_reference(index, *right)?;
             }
             Node::BBF(_, parameters) => {
+                for &parameter in parameters {
+                    check_reference(index, parameter)?;
+                }
+            }
+            Node::RuntimeCall { parameters, .. } => {
                 for &parameter in parameters {
                     check_reference(index, parameter)?;
                 }
@@ -242,6 +273,11 @@ fn linear_specs(
                     sole_user[parameter] = Some(index);
                 }
             }
+            Node::RuntimeCall { parameters, .. } => {
+                for &parameter in parameters {
+                    sole_user[parameter] = Some(index);
+                }
+            }
             _ => {}
         }
     }
@@ -299,6 +335,7 @@ pub(crate) fn compile(
     nodes: &[Node],
     outputs: &[usize],
     division_node_batches: &[Range<usize>],
+    runtime_functions: Vec<RuntimeFunction>,
 ) -> eyre::Result<Program> {
     validate_graph(nodes, outputs)?;
 
@@ -312,6 +349,11 @@ pub(crate) fn compile(
                 }
             }
             Node::BBF(_, parameters) => {
+                for &parameter in parameters {
+                    uses[parameter] += 1;
+                }
+            }
+            Node::RuntimeCall { parameters, .. } => {
                 for &parameter in parameters {
                     uses[parameter] += 1;
                 }
@@ -390,6 +432,8 @@ pub(crate) fn compile(
     let mut linear3 = Vec::new();
     let mut linear4 = Vec::new();
     let mut black_boxes = Vec::new();
+    let mut runtime_calls = Vec::new();
+    let mut runtime_call_count = 0_usize;
     let mut node_to_value = vec![None; nodes.len()];
     let mut node_to_instruction = vec![None; nodes.len()];
     let mut value_count = 0_usize;
@@ -489,6 +533,34 @@ pub(crate) fn compile(
                         });
                         Instruction::BlackBox(index)
                     }
+                    Node::RuntimeCall {
+                        function,
+                        call,
+                        output,
+                        output_count,
+                        arena_size,
+                        parameters,
+                    } => {
+                        let index = narrow_id(runtime_calls.len(), "runtime-call ID")?;
+                        runtime_call_count = runtime_call_count.max(
+                            call.checked_add(1)
+                                .ok_or_else(|| eyre!("runtime-call ID overflowed"))?,
+                        );
+                        runtime_calls.push(RuntimeCallInstruction {
+                            function: *function,
+                            call: *call,
+                            output: *output,
+                            output_count: *output_count,
+                            arena_size: *arena_size,
+                            parameters: parameters
+                                .iter()
+                                .map(|parameter| {
+                                    narrow_id(node_to_value[*parameter].unwrap(), "value ID")
+                                })
+                                .collect::<eyre::Result<Vec<_>>>()?,
+                        });
+                        Instruction::RuntimeCall(index)
+                    }
                 }
             };
             node_to_value[node_index] = Some(value_count);
@@ -533,6 +605,9 @@ pub(crate) fn compile(
         linear3,
         linear4,
         black_boxes,
+        runtime_functions,
+        runtime_calls,
+        runtime_call_count,
         outputs,
         division_batches,
         value_count,
@@ -628,6 +703,13 @@ impl Program {
                     .try_fold(0_usize, |depth, &value| {
                         Ok::<_, eyre::Report>(depth.max(value_depth(value)?))
                     })?,
+                Instruction::RuntimeCall(runtime_call) => self.runtime_calls
+                    [*runtime_call as usize]
+                    .parameters
+                    .iter()
+                    .try_fold(0_usize, |depth, &value| {
+                        Ok::<_, eyre::Report>(depth.max(value_depth(value)?))
+                    })?,
             };
             max_depth = max_depth.max(depth);
             instruction_depths.push(depth);
@@ -708,6 +790,7 @@ impl Program {
         let mut linear3 = Vec::with_capacity(self.linear3.len());
         let mut linear4 = Vec::with_capacity(self.linear4.len());
         let mut black_boxes = Vec::with_capacity(self.black_boxes.len());
+        let mut runtime_calls = Vec::with_capacity(self.runtime_calls.len());
         for old_instruction in order {
             let instruction = match &self.instructions[old_instruction] {
                 Instruction::Input(input) => Instruction::Input(*input),
@@ -760,6 +843,19 @@ impl Program {
                     });
                     Instruction::BlackBox(index)
                 }
+                Instruction::RuntimeCall(runtime_call) => {
+                    let runtime_call = &self.runtime_calls[*runtime_call as usize];
+                    let index = narrow_id(runtime_calls.len(), "runtime-call ID")?;
+                    runtime_calls.push(RuntimeCallInstruction {
+                        parameters: runtime_call
+                            .parameters
+                            .iter()
+                            .map(|&value| remap_value(value))
+                            .collect::<eyre::Result<Vec<_>>>()?,
+                        ..runtime_call.clone()
+                    });
+                    Instruction::RuntimeCall(index)
+                }
             };
             instructions.push(instruction);
         }
@@ -768,6 +864,7 @@ impl Program {
         self.linear3 = linear3;
         self.linear4 = linear4;
         self.black_boxes = black_boxes;
+        self.runtime_calls = runtime_calls;
         self.outputs = self
             .outputs
             .into_iter()
@@ -815,12 +912,19 @@ impl Program {
             inverses,
             inversion_scratch,
             black_box_parameters,
+            runtime_parameters,
+            runtime_results,
+            runtime_ready,
             outputs,
         } = workspace;
         values.clear();
         values.reserve(self.value_count);
         inverses.clear();
         black_box_parameters.clear();
+        runtime_parameters.clear();
+        runtime_results.resize_with(self.runtime_call_count, Vec::new);
+        runtime_ready.resize(self.runtime_call_count, false);
+        runtime_ready.fill(false);
         outputs.clear();
         outputs.reserve(self.outputs.len());
         let mut batches = self.division_batches.iter().peekable();
@@ -934,6 +1038,27 @@ impl Program {
                     );
                     values.push(function(black_box_parameters));
                 }
+                Instruction::RuntimeCall(runtime_call) => {
+                    let runtime_call = &self.runtime_calls[*runtime_call as usize];
+                    if !runtime_ready[runtime_call.call] {
+                        runtime_parameters.clear();
+                        runtime_parameters.extend(
+                            runtime_call
+                                .parameters
+                                .iter()
+                                .map(|&value| values[value as usize]),
+                        );
+                        runtime_results[runtime_call.call] = crate::runtime::evaluate(
+                            &self.runtime_functions,
+                            runtime_call.function,
+                            runtime_parameters,
+                            runtime_call.arena_size,
+                            runtime_call.output_count,
+                        )?;
+                        runtime_ready[runtime_call.call] = true;
+                    }
+                    values.push(runtime_results[runtime_call.call][runtime_call.output]);
+                }
             }
             instruction_index += 1;
         }
@@ -1001,6 +1126,29 @@ impl Program {
                         )
                     })?;
                     for &parameter in &black_box.parameters {
+                        check_value(parameter as usize)?;
+                    }
+                }
+                Instruction::RuntimeCall(runtime_call) => {
+                    let runtime_call = self.runtime_calls.get(*runtime_call as usize).ok_or_else(|| {
+                        eyre!("program instruction {index} references missing runtime call {runtime_call}")
+                    })?;
+                    if runtime_call.function >= self.runtime_functions.len() {
+                        bail!(
+                            "runtime call references missing function {}",
+                            runtime_call.function
+                        );
+                    }
+                    if runtime_call.call >= self.runtime_call_count {
+                        bail!("runtime-call ID {} is out of bounds", runtime_call.call);
+                    }
+                    if runtime_call.output >= runtime_call.output_count {
+                        bail!(
+                            "runtime-call output {} is out of bounds",
+                            runtime_call.output
+                        );
+                    }
+                    for &parameter in &runtime_call.parameters {
                         check_value(parameter as usize)?;
                     }
                 }
@@ -1085,6 +1233,21 @@ impl Program {
                             .collect::<eyre::Result<Vec<_>>>()?,
                     )
                 }
+                Instruction::RuntimeCall(runtime_call) => {
+                    let runtime_call = &self.runtime_calls[*runtime_call as usize];
+                    EncodedInstruction::RuntimeCall {
+                        function: runtime_call.function,
+                        call: runtime_call.call,
+                        output: runtime_call.output,
+                        output_count: runtime_call.output_count,
+                        arena_size: runtime_call.arena_size,
+                        parameters: runtime_call
+                            .parameters
+                            .iter()
+                            .map(|&parameter| backward(parameter as usize))
+                            .collect::<eyre::Result<Vec<_>>>()?,
+                    }
+                }
             };
             instructions.push(instruction);
             next_value += if matches!(
@@ -1125,7 +1288,10 @@ impl Program {
         })
     }
 
-    pub(crate) fn decode(encoded: EncodedProgram) -> eyre::Result<Self> {
+    pub(crate) fn decode(
+        encoded: EncodedProgram,
+        runtime_functions: Vec<RuntimeFunction>,
+    ) -> eyre::Result<Self> {
         let coefficients = encoded
             .coefficients
             .into_iter()
@@ -1141,6 +1307,8 @@ impl Program {
         let mut linear3 = Vec::new();
         let mut linear4 = Vec::new();
         let mut black_boxes = Vec::new();
+        let mut runtime_calls = Vec::new();
+        let mut runtime_call_count = 0_usize;
         let mut next_value = 0_usize;
         let mut input_count = 0_usize;
         for encoded_instruction in encoded.instructions {
@@ -1241,6 +1409,32 @@ impl Program {
                     });
                     Instruction::BlackBox(index)
                 }
+                EncodedInstruction::RuntimeCall {
+                    function,
+                    call,
+                    output,
+                    output_count,
+                    arena_size,
+                    parameters,
+                } => {
+                    let index = narrow_id(runtime_calls.len(), "runtime-call ID")?;
+                    runtime_call_count = runtime_call_count.max(
+                        call.checked_add(1)
+                            .ok_or_else(|| eyre!("runtime-call ID overflowed"))?,
+                    );
+                    runtime_calls.push(RuntimeCallInstruction {
+                        function,
+                        call,
+                        output,
+                        output_count,
+                        arena_size,
+                        parameters: parameters
+                            .into_iter()
+                            .map(|parameter| narrow_id(absolute(parameter)?, "value ID"))
+                            .collect::<eyre::Result<Vec<_>>>()?,
+                    });
+                    Instruction::RuntimeCall(index)
+                }
             };
             next_value = next_value
                 .checked_add(if matches!(instruction, Instruction::Pow5(_)) {
@@ -1274,6 +1468,9 @@ impl Program {
             linear3,
             linear4,
             black_boxes,
+            runtime_functions,
+            runtime_calls,
+            runtime_call_count,
             outputs,
             division_batches: Vec::new(),
             value_count: next_value,
@@ -1385,6 +1582,24 @@ impl Program {
                         &mut nodes,
                     ));
                 }
+                Instruction::RuntimeCall(runtime_call) => {
+                    let runtime_call = &self.runtime_calls[*runtime_call as usize];
+                    value_nodes.push(push(
+                        Node::RuntimeCall {
+                            function: runtime_call.function,
+                            call: runtime_call.call,
+                            output: runtime_call.output,
+                            output_count: runtime_call.output_count,
+                            arena_size: runtime_call.arena_size,
+                            parameters: runtime_call
+                                .parameters
+                                .iter()
+                                .map(|&parameter| value_nodes[parameter as usize])
+                                .collect(),
+                        },
+                        &mut nodes,
+                    ));
+                }
             }
         }
         let outputs = self
@@ -1452,7 +1667,7 @@ mod tests {
             Node::Op(Operation::Mul, 10, 8),
         ];
         let outputs = vec![5, 6, 7, 8, 9, 10, 11];
-        let original = compile(&nodes, &outputs, &[]).unwrap();
+        let original = compile(&nodes, &outputs, &[], Vec::new()).unwrap();
         let prepared = original.clone().prepare_evaluation().unwrap();
         assert_eq!(prepared.instruction_count(), original.instruction_count());
         assert_eq!(prepared.division_batches.len(), 2);
@@ -1492,7 +1707,7 @@ mod tests {
             Node::Op(Operation::Mul, 7, 5),
         ];
         let outputs = vec![5, 6, 7, 8];
-        let program = compile(&nodes, &outputs, &[]).unwrap();
+        let program = compile(&nodes, &outputs, &[], Vec::new()).unwrap();
         assert!(program
             .instructions
             .iter()
@@ -1502,14 +1717,14 @@ mod tests {
             .iter()
             .any(|instruction| matches!(instruction, Instruction::Pow5(_))));
 
-        let decoded = Program::decode(program.encode().unwrap()).unwrap();
+        let decoded = Program::decode(program.encode().unwrap(), Vec::new()).unwrap();
         let inputs = [U256::from(3_u64), U256::from(2_u64)];
         assert_eq!(
             crate::graph::evaluate(&nodes, &inputs, &outputs, None).unwrap(),
             decoded.evaluate(&inputs, None).unwrap()
         );
         let (expanded, expanded_outputs) = decoded.to_nodes().unwrap();
-        let recompiled = compile(&expanded, &expanded_outputs, &[]).unwrap();
+        let recompiled = compile(&expanded, &expanded_outputs, &[], Vec::new()).unwrap();
         assert_eq!(recompiled.instructions.len(), decoded.instructions.len());
         assert_eq!(
             crate::graph::evaluate(&nodes, &inputs, &outputs, None).unwrap(),
@@ -1524,14 +1739,14 @@ mod tests {
             instructions: vec![EncodedInstruction::Square(0)],
             output_deltas: vec![0],
         };
-        assert!(Program::decode(invalid_reference).is_err());
+        assert!(Program::decode(invalid_reference, Vec::new()).is_err());
 
         let invalid_coefficient = EncodedProgram {
             coefficients: vec![M.to_le_bytes()],
             instructions: vec![EncodedInstruction::Constant(0)],
             output_deltas: vec![0],
         };
-        assert!(Program::decode(invalid_coefficient).is_err());
+        assert!(Program::decode(invalid_coefficient, Vec::new()).is_err());
     }
 
     #[test]
@@ -1546,7 +1761,7 @@ mod tests {
         ];
         let outputs = [5];
         let inputs = [U256::from(4_u64), U256::from(5_u64)];
-        let program = compile(&nodes, &outputs, &[]).unwrap();
+        let program = compile(&nodes, &outputs, &[], Vec::new()).unwrap();
         assert_eq!(
             program.evaluate(&inputs, None).unwrap(),
             crate::graph::evaluate(&nodes, &inputs, &outputs, None).unwrap()
@@ -1567,7 +1782,7 @@ mod tests {
         ];
         let outputs = [7];
         let inputs = [U256::from(4_u64), U256::from(5_u64)];
-        let program = compile(&nodes, &outputs, &[]).unwrap();
+        let program = compile(&nodes, &outputs, &[], Vec::new()).unwrap();
         assert_eq!(
             program.evaluate(&inputs, None).unwrap(),
             crate::graph::evaluate(&nodes, &inputs, &outputs, None).unwrap()
@@ -1582,9 +1797,9 @@ mod tests {
             nodes.push(Node::Op(Operation::Add, previous, 0));
         }
         let outputs = [nodes.len() - 1];
-        let program = compile(&nodes, &outputs, &[]).unwrap();
-        let decoded = Program::decode(program.encode().unwrap()).unwrap();
+        let program = compile(&nodes, &outputs, &[], Vec::new()).unwrap();
+        let decoded = Program::decode(program.encode().unwrap(), Vec::new()).unwrap();
         let (expanded, expanded_outputs) = decoded.to_nodes().unwrap();
-        compile(&expanded, &expanded_outputs, &[]).unwrap();
+        compile(&expanded, &expanded_outputs, &[], Vec::new()).unwrap();
     }
 }
