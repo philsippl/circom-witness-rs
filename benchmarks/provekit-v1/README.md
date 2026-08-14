@@ -36,7 +36,7 @@ sample set. Only witness generation was run; proving was not run.
 | Self RSA-4096 register | 967,666 | 4,548,709 B | 403.400 ms | 2,851.167 ms (`rust-witness`) | 7.07x | 3,406.359 ms | 8.44x |
 | Self VC disclose | 145,722 | 405,473 B | 3.313 ms | 73.320 ms (`rust-witness`) | 22.13x | 116.092 ms | 35.04x |
 | Passport P1 | 965,282 | 4,549,230 B | 430.186 ms | 2,989.547 ms (`rust-witness`) | 6.95x | 3,415.550 ms | 7.94x |
-| WebAuthn | 3,413,073 | 27,175,055 B | 862.136 ms | 47,061.531 ms (`rust-witness`) | 54.59x | 53,456.554 ms | 62.00x |
+| WebAuthn | 3,413,073 | 27,175,055 B | 379.277 ms | 47,061.531 ms (`rust-witness`) | 124.08x | 53,456.554 ms | 140.94x |
 | World ID OPRF query | 34,155 | 173,558 B | 0.958 ms | 514.669 ms (`wasmi`) | 537.23x | 36.905 ms | 38.52x |
 | World ID OPRF nullifier | 73,756 | 231,061 B | 2.337 ms | 1,734.262 ms (`wasmi`) | 742.09x | 105.855 ms | 45.30x |
 
@@ -50,20 +50,24 @@ pre-populated positional input buffer. Graph loading, JSON parsing, input mappin
 evaluation are excluded. These are therefore hot-path results, not cold-start results. A fair cold
 comparison must time `init_graph` through the first completed witness as a single region.
 
-Sample counts were 5-20 for the hybrid and Rust/Wasmi paths, except the very slow WebAuthn
-`rust-witness` and warm-WASM baselines, which used one measured sample after warm-up.
+Sample counts were 5-20 for the hybrid and Rust/Wasmi paths. The final WebAuthn hybrid result used
+25 samples; the very slow WebAuthn `rust-witness` and warm-WASM baselines used one measured sample
+after warm-up.
 
 ### WebAuthn native bigint specialization
 
 Profiling showed that interpreted `circom-pairing` bigint helpers consumed most of the remaining
 WebAuthn runtime. The witness runtime now recognizes Circom's numeric function specializations and
-executes `long_div2`, `short_div_norm`, `long_scalar_mult`, and `SplitFn` with native `BigUint`
-division, multiplication, and bit-range operations. Unsupported signatures still fall back to the
-portable IR interpreter; the constraint graph and witness signal ordering are unchanged.
+executes `long_div2`, `short_div_norm`, `long_scalar_mult`, `long_gt`, `long_sub`, `long_add`,
+`signed_long_to_short`, `get_signed_Fp_carry_witness`, and `SplitFn` with native bigint arithmetic.
+Nested calls retain their exact argument boundaries; flattened top-level calls are accepted only
+for the bigint library's exact symmetric layouts. Unsupported signatures still fall back to the
+portable IR interpreter, and the constraint graph and witness signal ordering are unchanged.
 
-On the same machine and graph, the 15-sample hot median fell from 2,155.110 ms to 862.136 ms: a
-60.0% time reduction, or 2.50x speedup over the previous hybrid path. Graph loading remained a
-separate cold-start cost (1,182.560 ms in the final run).
+On the same machine and graph, the final 25-sample hot median was 379.277 ms. That is an 82.4% time
+reduction (5.68x speedup) from the original 2,155.110 ms hybrid path, and a further 56.0% reduction
+(2.27x speedup) from the earlier 862.136 ms native-bigint result. Graph loading remained a separate
+cold-start cost (1,173.885 ms in the final run).
 
 ## Correctness
 

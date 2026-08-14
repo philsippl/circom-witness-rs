@@ -3,7 +3,7 @@
 
 use ark_bn254::Fr;
 use eyre::{bail, eyre};
-use num_bigint::BigUint;
+use num_bigint::{BigInt, BigUint, Sign};
 use ruint::aliases::U256;
 use serde::{Deserialize, Serialize};
 
@@ -112,6 +112,7 @@ impl<'a> Interpreter<'a> {
         &mut self,
         function: usize,
         arguments: &[Fr],
+        argument_layout: Option<&[(RuntimeExpression, usize)]>,
         arena_size: usize,
         result_size: usize,
     ) -> eyre::Result<Vec<Fr>> {
@@ -121,6 +122,36 @@ impl<'a> Interpreter<'a> {
             .ok_or_else(|| eyre!("runtime Circom function {function} is missing"))?;
         if function_name_matches(&function.name, "mod_inv") {
             return evaluate_mod_inv(arguments, result_size);
+        }
+        if function_name_matches(&function.name, "signed_long_to_short") {
+            if let Some(result) = evaluate_signed_long_to_short(arguments, result_size) {
+                return result;
+            }
+        }
+        if function_name_matches(&function.name, "get_signed_Fp_carry_witness") {
+            if let Some(result) = evaluate_signed_fp_carry(arguments, result_size) {
+                return result;
+            }
+        }
+        for (name, specialization) in [
+            (
+                "long_gt",
+                evaluate_long_gt
+                    as fn(
+                        &[Fr],
+                        Option<&[(RuntimeExpression, usize)]>,
+                        usize,
+                    ) -> Option<eyre::Result<Vec<Fr>>>,
+            ),
+            ("long_sub", evaluate_long_sub),
+            ("long_add", evaluate_long_add),
+        ] {
+            if function_name_matches(&function.name, name) {
+                if let Some(result) = specialization(arguments, argument_layout, result_size) {
+                    return result;
+                }
+                break;
+            }
         }
         for (name, specialization) in [
             (
@@ -319,7 +350,13 @@ impl<'a> Interpreter<'a> {
                     }
                     flattened.extend_from_slice(&values[..*size]);
                 }
-                Value::Fields(self.call(*function, &flattened, *arena_size, *result_size)?)
+                Value::Fields(self.call(
+                    *function,
+                    &flattened,
+                    Some(arguments),
+                    *arena_size,
+                    *result_size,
+                )?)
             }
         })
     }
@@ -356,6 +393,189 @@ fn compose_limbs(limbs: &[Fr], n: usize) -> Option<BigUint> {
         })
 }
 
+/// Recover the two array operands used by the fixed-width bigint helpers. Nested calls retain
+/// their exact Circom argument boundaries. Top-level graph calls currently retain only flattened
+/// parameters, so accept only the library's two unambiguous layouts: two `k`-limb values or two
+/// 50-limb scratch arrays.
+fn two_array_operands<'a>(
+    arguments: &'a [Fr],
+    argument_layout: Option<&[(RuntimeExpression, usize)]>,
+    k: usize,
+) -> Option<(&'a [Fr], &'a [Fr])> {
+    let (left_width, right_width) = if let Some(argument_layout) = argument_layout {
+        if argument_layout.len() != 4
+            || argument_layout[0].1 != 1
+            || argument_layout[1].1 != 1
+            || argument_layout[2].1 < k
+            || argument_layout[3].1 < k
+            || argument_layout.iter().map(|(_, size)| size).sum::<usize>() != arguments.len()
+        {
+            return None;
+        }
+        (argument_layout[2].1, argument_layout[3].1)
+    } else if arguments.len() == 2 + 2 * k {
+        (k, k)
+    } else if k <= 50 && arguments.len() == 2 + 2 * 50 {
+        (50, 50)
+    } else {
+        return None;
+    };
+    let left_start = 2;
+    let right_start = left_start + left_width;
+    debug_assert_eq!(right_start + right_width, arguments.len());
+    Some((
+        &arguments[left_start..left_start + k],
+        &arguments[right_start..right_start + k],
+    ))
+}
+
+fn write_limbs(value: &BigUint, n: usize, output: &mut [Fr]) {
+    let mask = (BigUint::from(1_u8) << n) - BigUint::from(1_u8);
+    for (index, destination) in output.iter_mut().enumerate() {
+        *destination = Fr::from((value >> (n * index)) & &mask);
+    }
+}
+
+fn balanced_integer(value: Fr) -> BigInt {
+    let value: U256 = value.into();
+    if value > crate::M >> 1 {
+        BigInt::from_biguint(Sign::Minus, BigUint::from(crate::M - value))
+    } else {
+        BigInt::from_biguint(Sign::Plus, BigUint::from(value))
+    }
+}
+
+fn compose_balanced_limbs(limbs: &[Fr], n: usize) -> BigInt {
+    limbs
+        .iter()
+        .enumerate()
+        .fold(BigInt::from(0_u8), |value, (index, limb)| {
+            value + (balanced_integer(*limb) << (n * index))
+        })
+}
+
+fn write_signed_limbs(value: &BigUint, negative: bool, n: usize, output: &mut [Fr]) {
+    write_limbs(value, n, output);
+    if negative {
+        for limb in output {
+            *limb = -*limb;
+        }
+    }
+}
+
+fn evaluate_signed_long_to_short(
+    arguments: &[Fr],
+    result_size: usize,
+) -> Option<eyre::Result<Vec<Fr>>> {
+    const MAX_LIMBS: usize = 50;
+    let (n, k) = limb_width(arguments)?;
+    if result_size != MAX_LIMBS + 1 || arguments.len() < 2 + k {
+        return None;
+    }
+
+    let value = compose_balanced_limbs(&arguments[2..2 + k], n);
+    let negative = value.sign() == Sign::Minus;
+    let magnitude = value.magnitude();
+    if magnitude >> (n * MAX_LIMBS) != BigUint::from(0_u8) {
+        return None;
+    }
+
+    let mut output = vec![Fr::from(0_u64); result_size];
+    write_signed_limbs(magnitude, negative, n, &mut output[..MAX_LIMBS]);
+    if negative {
+        output[MAX_LIMBS] = Fr::from(1_u64);
+    }
+    Some(Ok(output))
+}
+
+fn evaluate_signed_fp_carry(arguments: &[Fr], result_size: usize) -> Option<eyre::Result<Vec<Fr>>> {
+    const ROW_SIZE: usize = 50;
+    let (n, k) = limb_width(arguments)?;
+    let m = dimension(*arguments.get(2)?)?;
+    if m == 0 || m >= ROW_SIZE || result_size != 2 * ROW_SIZE || arguments.len() != 3 + 2 * k {
+        return None;
+    }
+
+    let value = compose_balanced_limbs(&arguments[3..3 + k], n);
+    let modulus = compose_limbs(&arguments[3 + k..], n)?;
+    if modulus == BigUint::from(0_u8) {
+        return None;
+    }
+
+    let negative = value.sign() == Sign::Minus;
+    let magnitude = value.magnitude();
+    let mut quotient = magnitude / &modulus;
+    let mut remainder = magnitude % &modulus;
+    if negative && remainder != BigUint::from(0_u8) {
+        quotient += BigUint::from(1_u8);
+        remainder = &modulus - remainder;
+    }
+    if (&quotient >> (n * m)) != BigUint::from(0_u8)
+        || (&remainder >> (n * k)) != BigUint::from(0_u8)
+    {
+        return None;
+    }
+
+    let mut output = vec![Fr::from(0_u64); result_size];
+    write_signed_limbs(&quotient, negative, n, &mut output[..m]);
+    write_limbs(&remainder, n, &mut output[ROW_SIZE..ROW_SIZE + k]);
+    Some(Ok(output))
+}
+
+fn evaluate_long_gt(
+    arguments: &[Fr],
+    argument_layout: Option<&[(RuntimeExpression, usize)]>,
+    result_size: usize,
+) -> Option<eyre::Result<Vec<Fr>>> {
+    let (n, k) = limb_width(arguments)?;
+    if result_size != 1 {
+        return None;
+    }
+    let (left, right) = two_array_operands(arguments, argument_layout, k)?;
+    let left = compose_limbs(left, n)?;
+    let right = compose_limbs(right, n)?;
+    Some(Ok(vec![Fr::from(left > right)]))
+}
+
+fn evaluate_long_sub(
+    arguments: &[Fr],
+    argument_layout: Option<&[(RuntimeExpression, usize)]>,
+    result_size: usize,
+) -> Option<eyre::Result<Vec<Fr>>> {
+    let (n, k) = limb_width(arguments)?;
+    if result_size < k {
+        return None;
+    }
+    let (left, right) = two_array_operands(arguments, argument_layout, k)?;
+    let left = compose_limbs(left, n)?;
+    let right = compose_limbs(right, n)?;
+    let modulus = BigUint::from(1_u8) << (n * k);
+    let difference = if left >= right {
+        left - right
+    } else {
+        modulus + left - right
+    };
+    let mut output = vec![Fr::from(0_u64); result_size];
+    write_limbs(&difference, n, &mut output[..k]);
+    Some(Ok(output))
+}
+
+fn evaluate_long_add(
+    arguments: &[Fr],
+    argument_layout: Option<&[(RuntimeExpression, usize)]>,
+    result_size: usize,
+) -> Option<eyre::Result<Vec<Fr>>> {
+    let (n, k) = limb_width(arguments)?;
+    if result_size <= k {
+        return None;
+    }
+    let (left, right) = two_array_operands(arguments, argument_layout, k)?;
+    let sum = compose_limbs(left, n)? + compose_limbs(right, n)?;
+    let mut output = vec![Fr::from(0_u64); result_size];
+    write_limbs(&sum, n, &mut output[..k + 1]);
+    Some(Ok(output))
+}
+
 fn evaluate_split(arguments: &[Fr], result_size: usize) -> Option<eyre::Result<Vec<Fr>>> {
     if arguments.len() != 3 || result_size != 2 {
         return None;
@@ -376,11 +596,20 @@ fn evaluate_split(arguments: &[Fr], result_size: usize) -> Option<eyre::Result<V
 
 fn evaluate_short_div_norm(arguments: &[Fr], result_size: usize) -> Option<eyre::Result<Vec<Fr>>> {
     let (n, k) = limb_width(arguments)?;
-    if result_size != 1 || arguments.len() < 2 + (k + 1) + k {
+    if result_size != 1 {
         return None;
     }
+    let (left_width, right_width) = if arguments.len() == 2 + (k + 1) + k {
+        (k + 1, k)
+    } else if k < 50 && arguments.len() == 2 + 2 * 50 {
+        (50, 50)
+    } else {
+        return None;
+    };
+    let right_start = 2 + left_width;
+    debug_assert_eq!(right_start + right_width, arguments.len());
     let dividend = compose_limbs(&arguments[2..2 + k + 1], n)?;
-    let divisor = compose_limbs(&arguments[arguments.len() - k..], n)?;
+    let divisor = compose_limbs(&arguments[right_start..right_start + k], n)?;
     if divisor == BigUint::from(0_u8) {
         return None;
     }
@@ -556,7 +785,7 @@ pub(crate) fn evaluate(
         functions,
         steps_left: 100_000_000,
     }
-    .call(function, arguments, arena_size, result_size)
+    .call(function, arguments, None, arena_size, result_size)
 }
 
 #[cfg(test)]
@@ -672,19 +901,90 @@ mod tests {
             variable_count: 0,
             body: Vec::new(),
         };
-        // Base 16: 0x123 / 0x9a = 1. Preserve padding between the two array operands.
-        let arguments = [
-            4_u64, 2, // n, k
-            3, 2, 1, // dividend limbs
-            0, 0, // dividend padding
-            10, 9, // divisor limbs
-        ]
-        .map(Fr::from);
+        // Base 16: 0x123 / 0x9a = 1. Both operands occupy 50-limb scratch arrays, so
+        // the divisor starts at the second array boundary rather than at the end.
+        let mut arguments = vec![Fr::from(4_u64), Fr::from(2_u64)];
+        arguments.extend([3_u64, 2, 1].map(Fr::from));
+        arguments.resize(52, Fr::from(0_u64));
+        arguments.extend([10_u64, 9].map(Fr::from));
+        arguments.resize(102, Fr::from(0_u64));
 
         assert_eq!(
             evaluate(&[function], 0, &arguments, 0, 1).unwrap(),
             vec![Fr::from(1_u64)]
         );
+    }
+
+    #[test]
+    fn bigint_comparison_addition_and_subtraction_use_padded_array_boundaries() {
+        let functions = ["long_gt_53", "long_sub_42", "long_add_45"].map(|name| RuntimeFunction {
+            name: name.to_owned(),
+            variable_count: 0,
+            body: Vec::new(),
+        });
+        // Base 16: left = 0x21 and right = 0x1f. Each occupies a 50-limb array.
+        let mut arguments = vec![Fr::from(4_u64), Fr::from(2_u64)];
+        arguments.extend([1_u64, 2].map(Fr::from));
+        arguments.resize(52, Fr::from(0_u64));
+        arguments.extend([15_u64, 1].map(Fr::from));
+        arguments.resize(102, Fr::from(0_u64));
+
+        assert_eq!(
+            evaluate(&functions, 0, &arguments, 0, 1).unwrap(),
+            vec![Fr::from(1_u64)]
+        );
+        let difference = evaluate(&functions, 1, &arguments, 0, 50).unwrap();
+        assert_eq!(difference[0], Fr::from(2_u64));
+        assert!(difference[1..]
+            .iter()
+            .all(|value| *value == Fr::from(0_u64)));
+        let sum = evaluate(&functions, 2, &arguments, 0, 50).unwrap();
+        assert_eq!(
+            sum[..3],
+            [Fr::from(0_u64), Fr::from(4_u64), Fr::from(0_u64)]
+        );
+        assert!(sum[3..].iter().all(|value| *value == Fr::from(0_u64)));
+    }
+
+    #[test]
+    fn signed_bigint_specializations_preserve_balanced_limbs_and_euclidean_remainder() {
+        let functions = ["signed_long_to_short_35", "get_signed_Fp_carry_witness_7"].map(|name| {
+            RuntimeFunction {
+                name: name.to_owned(),
+                variable_count: 0,
+                body: Vec::new(),
+            }
+        });
+        // In base 16, limbs [-4, -1] represent -20.
+        let signed_arguments = [
+            Fr::from(4_u64),
+            Fr::from(2_u64),
+            -Fr::from(4_u64),
+            -Fr::from(1_u64),
+        ];
+        let normalized = evaluate(&functions, 0, &signed_arguments, 0, 51).unwrap();
+        assert_eq!(normalized[0], -Fr::from(4_u64));
+        assert_eq!(normalized[1], -Fr::from(1_u64));
+        assert!(normalized[2..50]
+            .iter()
+            .all(|value| *value == Fr::from(0_u64)));
+        assert_eq!(normalized[50], Fr::from(1_u64));
+
+        // -20 = (-2 * 13) + 6, with a non-negative Euclidean remainder.
+        let carry_arguments = [
+            Fr::from(4_u64),
+            Fr::from(2_u64),
+            Fr::from(1_u64),
+            -Fr::from(4_u64),
+            -Fr::from(1_u64),
+            Fr::from(13_u64),
+            Fr::from(0_u64),
+        ];
+        let carry = evaluate(&functions, 1, &carry_arguments, 0, 100).unwrap();
+        assert_eq!(carry[0], -Fr::from(2_u64));
+        assert!(carry[1..50].iter().all(|value| *value == Fr::from(0_u64)));
+        assert_eq!(carry[50], Fr::from(6_u64));
+        assert!(carry[51..].iter().all(|value| *value == Fr::from(0_u64)));
     }
 
     #[test]
