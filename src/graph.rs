@@ -3,7 +3,6 @@ use std::{cmp::Ordering, collections::HashMap, ops::Range, ops::Shr};
 use crate::{BlackBoxFunction, M};
 use ark_bn254::Fr;
 use eyre::bail;
-use num_bigint::BigUint;
 use rand::Rng;
 use ruint::aliases::U256;
 use ruint::uint;
@@ -220,6 +219,10 @@ impl Operation {
     pub fn eval(&self, a: U256, b: U256) -> U256 {
         let a = a % M;
         let b = b % M;
+        self.eval_canonical(a, b)
+    }
+
+    fn eval_canonical(&self, a: U256, b: U256) -> U256 {
         use Operation::*;
         match self {
             Add => a.add_mod(b, M),
@@ -234,13 +237,19 @@ impl Operation {
             Lor => U256::from(a != U256::ZERO || b != U256::ZERO),
             Shl => compute_shl(a, b),
             Shr => compute_shr(a, b),
-            Bor => a.bitor(b) % M,
-            Band => a.bitand(b) % M,
-            Bxor => a.bitxor(b) % M,
-            Bnot => (bit_mask() ^ a) % M,
+            Bor => reduce_masked(a.bitor(b)),
+            Band => a.bitand(b),
+            Bxor => reduce_masked(a.bitxor(b)),
+            Bnot => reduce_masked(bit_mask() ^ a),
             Lnot => U256::from(a == U256::ZERO),
             Land => U256::from(a != U256::ZERO && b != U256::ZERO),
-            Neg => (M - a) % M,
+            Neg => {
+                if a == U256::ZERO {
+                    U256::ZERO
+                } else {
+                    M - a
+                }
+            }
             Inv => a.inv_mod(M).unwrap(),
             Div => a.mul_mod(b.inv_mod(M).unwrap(), M),
             SafeDiv => b
@@ -261,7 +270,32 @@ impl Operation {
             Sub => a - b,
             Mul => a * b,
             Eq => (a == b).into(),
+            Neq => (a != b).into(),
             Neg => -a,
+            Lor => (a != Fr::from(0_u64) || b != Fr::from(0_u64)).into(),
+            Land => (a != Fr::from(0_u64) && b != Fr::from(0_u64)).into(),
+            Lnot => (a == Fr::from(0_u64)).into(),
+            Lt | Gt | Leq | Geq => {
+                let a: U256 = a.into();
+                let b: U256 = b.into();
+                let ordering = cmp_balanced(a, b);
+                let result = match self {
+                    Lt => ordering.is_lt(),
+                    Gt => ordering.is_gt(),
+                    Leq => ordering.is_le(),
+                    Geq => ordering.is_ge(),
+                    _ => unreachable!(),
+                };
+                Fr::from(result)
+            }
+            IDiv | Mod => {
+                let a: U256 = a.into();
+                let b: U256 = b.into();
+                match (u64::try_from(a), u64::try_from(b)) {
+                    (Ok(a), Ok(b)) => Fr::from(if matches!(self, IDiv) { a / b } else { a % b }),
+                    _ => Fr::new(self.eval_canonical(a, b).into()),
+                }
+            }
             Div => a / b,
             SafeDiv => {
                 if b == Fr::from(0_u64) {
@@ -270,20 +304,10 @@ impl Operation {
                     a / b
                 }
             }
-            IDiv => {
-                let a: BigUint = a.into();
-                let b: BigUint = b.into();
-                Fr::from(a / b)
-            }
-            Mod => {
-                let a: BigUint = a.into();
-                let b: BigUint = b.into();
-                Fr::from(a % b)
-            }
             _ => {
                 let a: U256 = a.into();
                 let b: U256 = b.into();
-                Fr::new(self.eval(a, b).into())
+                Fr::new(self.eval_canonical(a, b).into())
             }
         }
     }
@@ -309,11 +333,22 @@ fn bit_mask() -> U256 {
     (U256::ONE << M.bit_len()) - U256::ONE
 }
 
+fn reduce_masked(value: U256) -> U256 {
+    // Bitwise results are masked to 254 bits. Since M has 254 bits, one conditional subtraction
+    // is the complete field reduction.
+    debug_assert!(value < M + M);
+    if value >= M {
+        value - M
+    } else {
+        value
+    }
+}
+
 fn shift_left(a: U256, amount: U256) -> U256 {
     if amount >= uint!(254) {
         U256::ZERO
     } else {
-        ((a << amount.as_limbs()[0]) & bit_mask()) % M
+        reduce_masked((a << amount.as_limbs()[0]) & bit_mask())
     }
 }
 
@@ -321,7 +356,7 @@ fn shift_right(a: U256, amount: U256) -> U256 {
     if amount >= uint!(254) {
         U256::ZERO
     } else {
-        (a >> amount.as_limbs()[0]) % M
+        a >> amount.as_limbs()[0]
     }
 }
 
@@ -725,6 +760,41 @@ mod tests {
             Operation::Shr.eval(uint!(8_U256), uint!(254_U256)),
             U256::ZERO
         );
+    }
+
+    #[test]
+    fn field_fast_paths_match_canonical_u256_operations() {
+        let operations = [
+            Operation::Neq,
+            Operation::Lt,
+            Operation::Gt,
+            Operation::Leq,
+            Operation::Geq,
+            Operation::Lor,
+            Operation::Land,
+            Operation::Lnot,
+            Operation::IDiv,
+            Operation::Mod,
+            Operation::Bor,
+            Operation::Band,
+            Operation::Bxor,
+            Operation::Bnot,
+            Operation::Shl,
+            Operation::Shr,
+        ];
+        let inputs = [
+            (U256::from(123_u64), U256::from(17_u64)),
+            (M - U256::from(5_u64), M - U256::from(7_u64)),
+        ];
+
+        for operation in operations {
+            for (left, right) in inputs {
+                let actual: U256 = operation
+                    .eval_fr(Fr::new(left.into()), Fr::new(right.into()))
+                    .into();
+                assert_eq!(actual, operation.eval(left, right), "{operation:?}");
+            }
+        }
     }
 
     #[test]

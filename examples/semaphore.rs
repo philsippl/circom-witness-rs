@@ -3,13 +3,14 @@
 //! Run with a Semaphore graph built by `circom-witness-graph-builder`:
 //!
 //! ```text
-//! cargo run --release --example semaphore -- semaphore.bin
+//! cargo run --release --example semaphore -- semaphore.bin --record-fuzz-corpus corpus.json
+//! cargo run --release --example semaphore -- semaphore.bin --fuzz-corpus corpus.json
 //! ```
 
 use std::{collections::BTreeMap, env, fs};
 
 use circom_witness_rs::{
-    custom::{fuzz_equivalence, FuzzConfig, NativeSubgraph},
+    custom::{record_fuzz_corpus, verify_fuzz_corpus, FuzzConfig, FuzzCorpus, NativeSubgraph},
     graph::{Node, Operation},
     init_graph, Graph,
 };
@@ -65,9 +66,28 @@ fn semaphore_mux_replacements(graph: &Graph) -> Vec<NativeSubgraph> {
 }
 
 fn main() -> eyre::Result<()> {
-    let path = env::args_os()
-        .nth(1)
-        .ok_or_else(|| eyre::eyre!("usage: semaphore <semaphore-graph.bin>"))?;
+    let mut arguments = env::args_os().skip(1);
+    let path = arguments.next().ok_or_else(|| {
+        eyre::eyre!(
+            "usage: semaphore <semaphore-graph.bin> \
+             (--record-fuzz-corpus CORPUS.json | --fuzz-corpus CORPUS.json)"
+        )
+    })?;
+    let mode = arguments.next().and_then(|value| value.into_string().ok());
+    let corpus_path = arguments.next();
+    if arguments.next().is_some()
+        || corpus_path.is_none()
+        || !matches!(
+            mode.as_deref(),
+            Some("--record-fuzz-corpus" | "--fuzz-corpus")
+        )
+    {
+        bail!(
+            "usage: semaphore <semaphore-graph.bin> \
+             (--record-fuzz-corpus CORPUS.json | --fuzz-corpus CORPUS.json)"
+        );
+    }
+    let corpus_path = corpus_path.unwrap();
     let bytes = fs::read(&path).wrap_err("failed to read Semaphore graph")?;
     let original = init_graph(&bytes).wrap_err("failed to load Semaphore graph")?;
     let replacements = semaphore_mux_replacements(&original);
@@ -80,10 +100,21 @@ fn main() -> eyre::Result<()> {
         .customizer()
         .native_subgraphs(replacements)
         .build()?;
-    let report = fuzz_equivalence(&original, &optimized, FuzzConfig::default(), None)?;
+    let corpus = if mode.as_deref() == Some("--record-fuzz-corpus") {
+        let corpus = record_fuzz_corpus(&original, FuzzConfig::default(), None)?;
+        fs::write(&corpus_path, serde_json::to_vec_pretty(&corpus)?)
+            .wrap_err("failed to write fuzz corpus")?;
+        corpus
+    } else {
+        serde_json::from_slice::<FuzzCorpus>(
+            &fs::read(&corpus_path).wrap_err("failed to read fuzz corpus")?,
+        )
+        .wrap_err("failed to decode fuzz corpus")?
+    };
+    let report = verify_fuzz_corpus(&optimized, &corpus, None)?;
     println!(
-        "replaced {} mux pairs; {} random witnesses matched (seed {})",
-        replacement_count, report.cases, report.seed
+        "replaced {} mux pairs; {} pregenerated random witnesses matched",
+        replacement_count, report.cases
     );
     println!(
         "runtime instructions: {} -> {}",

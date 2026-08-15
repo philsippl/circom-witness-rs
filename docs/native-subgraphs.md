@@ -50,13 +50,21 @@ handler; if all handlers decline, execution continues in the portable IR. This m
 optimizations safe: one implementation can cover common limb widths while unusual shapes retain the
 canonical behavior.
 
+Use `NativeRuntimeFunction::named` or `try_named` to give generated handlers stable profiler labels.
+Calling `tracked()` returns the handler plus a shared `NativeRuntimeCoverage` handle. Its snapshots
+report attempts, handled calls, fallbacks, errors, and every generated function/argument/result
+shape encountered. Tracking is deliberately opt-in because it synchronizes on each attempted call;
+build a separately tracked graph for verification, then benchmark an untracked graph.
+
 Argument boundaries are preserved at top-level graph calls and recursively for nested runtime-IR
 calls. This is the key requirement for the WebAuthn-style helpers (`long_div2`, scalar
 multiplication, comparisons, carry witnesses, and split functions), whose meaning depends on
 specialized array lengths. Multi-output callbacks cover helpers returning limb arrays. Repeated bit
 extractions can either be one multi-output static subgraph or a runtime-function handler, depending
 on how the builder lowered that circuit. Generic field-operation fast paths remain core runtime
-optimizations rather than extension callbacks.
+optimizations rather than extension callbacks. The prepared interpreter also collapses contiguous
+outputs of one runtime invocation into a single compact instruction and lets native handlers write
+those outputs directly into the value arena; extension authors do not need to batch them manually.
 
 ## Autoresearch workflow
 
@@ -70,11 +78,19 @@ optimizations rather than extension callbacks.
    function.
 4. Generate native Rust plus `NativeSubgraph` and/or `NativeRuntimeFunction` declarations.
 5. Register the complete set with `Graph::customizer()` and call `build()` once.
-6. Run `fuzz_equivalence` with a fixed seed. Use `fuzz_equivalence_with` to constrain booleans,
-   ranges, encodings, or other circuit-specific domains.
-7. Profile and benchmark again only after equivalence passes, and keep the original graph as the fallback
-   and reference implementation.
+6. Outside the autoresearch loop, run `record_fuzz_corpus` once on the original graph. It stores
+   only deterministic random seeds and BLAKE3 hashes of their complete witnesses. Use
+   `record_fuzz_corpus_with` for booleans, ranges, encodings, or other circuit-specific domains.
+7. In every autoresearch iteration, call `verify_fuzz_corpus` (or its `_with` variant) on only the
+   optimized graph. It regenerates the same inputs from their seeds and compares witness hashes;
+   the slow original interpreter is not executed.
+8. Profile and benchmark again only after corpus replay passes, and keep the original graph as the
+   fallback and reference implementation used to regenerate the corpus when the circuit changes.
 
 Node IDs belong to the semantic node view of a particular loaded graph and are not a stable file
 format API. Generated extensions should either pin/hash their graph artifact or rediscover boundaries
-structurally. The [Semaphore example](../examples/semaphore.rs) demonstrates the latter approach.
+structurally. The [Semaphore example](../examples/semaphore.rs) demonstrates the latter approach for
+static DAG regions. The [WebAuthn guide](../examples/webauthn/README.md) demonstrates the
+complementary runtime-function approach for input-dependent bigint helpers, including a pinned
+source, exact argument slicing, selective fallback, call-shape coverage, constrained differential
+seed/hash corpus replay, artifact provenance, and an agent-readable benchmark/profile mode.

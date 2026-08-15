@@ -1,12 +1,16 @@
 //! Process-local native replacements for witness DAG regions and dynamic Circom functions, plus
-//! deterministic differential testing against the portable graph.
+//! deterministic seed/BLAKE3 corpus recording and replay against the portable graph.
 
-use std::{collections::HashSet, fmt, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fmt,
+    sync::{Arc, Mutex},
+};
 
 use ark_bn254::Fr;
 use eyre::{bail, eyre, Context as _};
-use rand::{rngs::StdRng, Rng as _, SeedableRng as _};
 use ruint::aliases::U256;
+use serde::{Deserialize, Serialize};
 
 use crate::{graph::Node, BlackBoxFunction, Graph, M};
 
@@ -54,6 +58,12 @@ impl RuntimeFunctionMatcher {
     pub(crate) fn is_empty(&self) -> bool {
         match self {
             Self::Exact(name) | Self::NumericSuffix(name) => name.is_empty(),
+        }
+    }
+
+    fn default_diagnostic_name(&self) -> String {
+        match self {
+            Self::Exact(name) | Self::NumericSuffix(name) => name.clone(),
         }
     }
 }
@@ -136,6 +146,149 @@ pub enum NativeRuntimeOutcome {
     Fallback,
 }
 
+/// One runtime call shape observed by an optionally tracked native handler.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct NativeRuntimeCallShape {
+    pub function_id: usize,
+    pub function_name: String,
+    pub argument_sizes: Vec<usize>,
+    pub arena_size: usize,
+    pub result_count: usize,
+}
+
+impl NativeRuntimeCallShape {
+    fn from_call(call: RuntimeCallInfo<'_>) -> Self {
+        Self {
+            function_id: call.function_id(),
+            function_name: call.function_name().to_owned(),
+            argument_sizes: call.argument_sizes().to_vec(),
+            arena_size: call.arena_size(),
+            result_count: call.result_count(),
+        }
+    }
+}
+
+/// Counts for one call shape in a [`NativeRuntimeCoverageSnapshot`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NativeRuntimeShapeCoverage {
+    pub shape: NativeRuntimeCallShape,
+    pub attempts: u64,
+    pub handled: u64,
+    pub fallbacks: u64,
+    pub errors: u64,
+}
+
+/// Point-in-time coverage for one named native runtime handler.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NativeRuntimeCoverageSnapshot {
+    pub handler_name: String,
+    pub attempts: u64,
+    pub handled: u64,
+    pub fallbacks: u64,
+    pub errors: u64,
+    pub shapes: Vec<NativeRuntimeShapeCoverage>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct CoverageCounts {
+    attempts: u64,
+    handled: u64,
+    fallbacks: u64,
+    errors: u64,
+}
+
+#[derive(Debug, Default)]
+struct CoverageState {
+    total: CoverageCounts,
+    shapes: BTreeMap<NativeRuntimeCallShape, CoverageCounts>,
+}
+
+/// Shared handle for inspecting an opt-in native runtime handler's coverage.
+#[derive(Debug, Clone)]
+pub struct NativeRuntimeCoverage {
+    handler_name: String,
+    state: Arc<Mutex<CoverageState>>,
+}
+
+impl NativeRuntimeCoverage {
+    fn new(handler_name: String) -> Self {
+        Self {
+            handler_name,
+            state: Arc::new(Mutex::new(CoverageState::default())),
+        }
+    }
+
+    fn begin(&self, call: RuntimeCallInfo<'_>) -> NativeRuntimeCallShape {
+        let shape = NativeRuntimeCallShape::from_call(call);
+        let mut state = self
+            .state
+            .lock()
+            .expect("native coverage lock was poisoned");
+        state.total.attempts += 1;
+        state.shapes.entry(shape.clone()).or_default().attempts += 1;
+        shape
+    }
+
+    fn finish(&self, shape: &NativeRuntimeCallShape, result: &eyre::Result<NativeRuntimeOutcome>) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("native coverage lock was poisoned");
+        match result {
+            Ok(NativeRuntimeOutcome::Handled) => {
+                state.total.handled += 1;
+                state
+                    .shapes
+                    .get_mut(shape)
+                    .expect("a completed native call must have a coverage entry")
+                    .handled += 1;
+            }
+            Ok(NativeRuntimeOutcome::Fallback) => {
+                state.total.fallbacks += 1;
+                state
+                    .shapes
+                    .get_mut(shape)
+                    .expect("a completed native call must have a coverage entry")
+                    .fallbacks += 1;
+            }
+            Err(_) => {
+                state.total.errors += 1;
+                state
+                    .shapes
+                    .get_mut(shape)
+                    .expect("a completed native call must have a coverage entry")
+                    .errors += 1;
+            }
+        }
+    }
+
+    /// Returns accumulated counts without resetting them.
+    pub fn snapshot(&self) -> NativeRuntimeCoverageSnapshot {
+        let state = self
+            .state
+            .lock()
+            .expect("native coverage lock was poisoned");
+        NativeRuntimeCoverageSnapshot {
+            handler_name: self.handler_name.clone(),
+            attempts: state.total.attempts,
+            handled: state.total.handled,
+            fallbacks: state.total.fallbacks,
+            errors: state.total.errors,
+            shapes: state
+                .shapes
+                .iter()
+                .map(|(shape, counts)| NativeRuntimeShapeCoverage {
+                    shape: shape.clone(),
+                    attempts: counts.attempts,
+                    handled: counts.handled,
+                    fallbacks: counts.fallbacks,
+                    errors: counts.errors,
+                })
+                .collect(),
+        }
+    }
+}
+
 pub type NativeRuntimeFunctionCallback = Arc<
     dyn for<'a> Fn(RuntimeCallInfo<'a>, &mut [Fr]) -> eyre::Result<NativeRuntimeOutcome>
         + Send
@@ -149,14 +302,17 @@ pub type NativeRuntimeFunctionCallback = Arc<
 /// handlers. A handler may decline a call shape with [`NativeRuntimeOutcome::Fallback`].
 #[derive(Clone)]
 pub struct NativeRuntimeFunction {
+    name: String,
     matcher: RuntimeFunctionMatcher,
     function: NativeRuntimeFunctionCallback,
+    coverage: Option<NativeRuntimeCoverage>,
 }
 
 impl fmt::Debug for NativeRuntimeFunction {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("NativeRuntimeFunction")
+            .field("name", &self.name)
             .field("matcher", &self.matcher)
             .finish_non_exhaustive()
     }
@@ -170,7 +326,22 @@ impl NativeRuntimeFunction {
             + Sync
             + 'static,
     ) -> Self {
-        Self::try_new(matcher, move |call, outputs| Ok(function(call, outputs)))
+        let name = matcher.default_diagnostic_name();
+        Self::named(name, matcher, function)
+    }
+
+    /// Creates an infallible handler with a stable diagnostic name.
+    pub fn named(
+        name: impl Into<String>,
+        matcher: RuntimeFunctionMatcher,
+        function: impl for<'a> Fn(RuntimeCallInfo<'a>, &mut [Fr]) -> NativeRuntimeOutcome
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        Self::try_named(name, matcher, move |call, outputs| {
+            Ok(function(call, outputs))
+        })
     }
 
     pub fn try_new(
@@ -180,14 +351,43 @@ impl NativeRuntimeFunction {
             + Sync
             + 'static,
     ) -> Self {
+        let name = matcher.default_diagnostic_name();
+        Self::try_named(name, matcher, function)
+    }
+
+    /// Creates a fallible handler with a stable diagnostic name.
+    pub fn try_named(
+        name: impl Into<String>,
+        matcher: RuntimeFunctionMatcher,
+        function: impl for<'a> Fn(RuntimeCallInfo<'a>, &mut [Fr]) -> eyre::Result<NativeRuntimeOutcome>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
         Self {
+            name: name.into(),
             matcher,
             function: Arc::new(function),
+            coverage: None,
         }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     pub fn matcher(&self) -> &RuntimeFunctionMatcher {
         &self.matcher
+    }
+
+    /// Enables call-shape coverage for this handler and returns the shared inspection handle.
+    ///
+    /// Tracking is opt-in because it adds synchronization to each attempted call. Keep it disabled
+    /// for final performance measurements.
+    pub fn tracked(mut self) -> (Self, NativeRuntimeCoverage) {
+        let coverage = NativeRuntimeCoverage::new(self.name.clone());
+        self.coverage = Some(coverage.clone());
+        (self, coverage)
     }
 
     pub(crate) fn evaluate(
@@ -195,7 +395,12 @@ impl NativeRuntimeFunction {
         call: RuntimeCallInfo<'_>,
         outputs: &mut [Fr],
     ) -> eyre::Result<NativeRuntimeOutcome> {
-        (self.function)(call, outputs)
+        let shape = self.coverage.as_ref().map(|coverage| coverage.begin(call));
+        let result = (self.function)(call, outputs);
+        if let (Some(coverage), Some(shape)) = (&self.coverage, shape) {
+            coverage.finish(&shape, &result);
+        }
+        result
     }
 }
 
@@ -400,6 +605,13 @@ pub(crate) fn resolve(
                 reached_inputs.insert(node);
                 continue;
             }
+            // Constants are implicit leaves of a native region. They are deliberately not owned
+            // by the replacement: the callback bakes their values into native code, while the
+            // same pooled constant node remains available to other replacements and portable
+            // graph instructions.
+            if matches!(nodes[node], Node::Constant(_) | Node::MontConstant(_)) {
+                continue;
+            }
             if !covered.insert(node) {
                 continue;
             }
@@ -485,10 +697,10 @@ pub(crate) fn resolve(
     Ok(resolved)
 }
 
-/// Configuration for deterministic differential fuzzing.
+/// Configuration for deterministic random witness generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FuzzConfig {
-    /// Number of random witnesses to compare.
+    /// Number of random witnesses to generate.
     pub cases: usize,
     /// Reproducible random seed.
     pub seed: u64,
@@ -503,90 +715,185 @@ impl Default for FuzzConfig {
     }
 }
 
-/// Successful differential-fuzz run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FuzzReport {
-    pub cases: usize,
-    pub seed: u64,
-}
-
-/// Compares an original graph and a graph containing native replacements on random field inputs.
-pub fn fuzz_equivalence(
-    original: &Graph,
-    optimized: &Graph,
-    config: FuzzConfig,
-    bbfs: Option<&std::collections::HashMap<String, BlackBoxFunction>>,
-) -> eyre::Result<FuzzReport> {
-    fuzz_equivalence_with(original, optimized, config, bbfs, |_, _| {})
-}
-
-/// Differential fuzzing with a hook for constraining generated inputs.
+/// One pregenerated random input and the BLAKE3 hash of its canonical witness.
 ///
-/// The hook runs after each input buffer is filled with random BN254 field elements. Position zero
-/// is restored to one after the hook, matching [`crate::get_inputs_buffer`]. This is useful for
-/// booleans, bounded integers, or other circuit-specific input domains.
-pub fn fuzz_equivalence_with(
-    original: &Graph,
-    optimized: &Graph,
-    config: FuzzConfig,
-    bbfs: Option<&std::collections::HashMap<String, BlackBoxFunction>>,
-    mut constrain: impl FnMut(usize, &mut [U256]),
-) -> eyre::Result<FuzzReport> {
-    let input_count = original.program.input_count();
-    if optimized.program.input_count() != input_count {
-        bail!(
-            "cannot fuzz graphs with different input counts ({} and {})",
-            input_count,
-            optimized.program.input_count()
-        );
+/// Inputs are regenerated from `seed`; the potentially very large witness is intentionally not
+/// stored. Circuit-specific constraint hooks must therefore be deterministic for a given seed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FuzzCorpusCase {
+    pub seed: u64,
+    pub witness_blake3: String,
+}
+
+/// Replayable fuzz corpus serialized as an array containing only seed/hash pairs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct FuzzCorpus {
+    cases: Vec<FuzzCorpusCase>,
+}
+
+impl FuzzCorpus {
+    pub fn cases(&self) -> &[FuzzCorpusCase] {
+        &self.cases
     }
 
-    let mut rng = StdRng::seed_from_u64(config.seed);
-    let mut original_evaluator = original
+    pub fn len(&self) -> usize {
+        self.cases.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cases.is_empty()
+    }
+}
+
+/// Successful replay of a pregenerated fuzz corpus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FuzzCorpusReport {
+    pub cases: usize,
+}
+
+fn fuzz_inputs(input_count: usize, seed: u64) -> Vec<U256> {
+    let mut inputs = vec![U256::ZERO; input_count];
+    for (index, input) in inputs.iter_mut().enumerate() {
+        let mut attempt = 0_u64;
+        loop {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"circom-witness-rs/fuzz-input/v1\0");
+            hasher.update(&seed.to_le_bytes());
+            hasher.update(&(index as u64).to_le_bytes());
+            hasher.update(&attempt.to_le_bytes());
+            let candidate = U256::from_le_bytes::<32>(*hasher.finalize().as_bytes());
+            if candidate < M {
+                *input = candidate;
+                break;
+            }
+            attempt = attempt.wrapping_add(1);
+        }
+    }
+    inputs
+}
+
+fn finish_fuzz_inputs(
+    mut inputs: Vec<U256>,
+    seed: u64,
+    constrain: &mut impl FnMut(u64, &mut [U256]),
+) -> Vec<U256> {
+    constrain(seed, &mut inputs);
+    if let Some(constant_one) = inputs.first_mut() {
+        *constant_one = U256::ONE;
+    }
+    inputs
+}
+
+fn witness_blake3(witness: &[U256]) -> blake3::Hash {
+    const FIELDS_PER_CHUNK: usize = 1_024;
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"circom-witness-rs/fuzz-witness/v1\0");
+    hasher.update(&(witness.len() as u64).to_le_bytes());
+    let mut bytes = vec![0_u8; FIELDS_PER_CHUNK * 32];
+    for fields in witness.chunks(FIELDS_PER_CHUNK) {
+        for (value, encoded) in fields.iter().zip(bytes.chunks_exact_mut(32)) {
+            encoded.copy_from_slice(&value.to_le_bytes::<32>());
+        }
+        hasher.update(&bytes[..fields.len() * 32]);
+    }
+    hasher.finalize()
+}
+
+/// Pregenerates deterministic random inputs with the original graph and records only seed/hash
+/// pairs. Run this slow oracle phase once, outside the autoresearch optimization loop.
+pub fn record_fuzz_corpus(
+    original: &Graph,
+    config: FuzzConfig,
+    bbfs: Option<&std::collections::HashMap<String, BlackBoxFunction>>,
+) -> eyre::Result<FuzzCorpus> {
+    record_fuzz_corpus_with(original, config, bbfs, |_, _| {})
+}
+
+/// [`record_fuzz_corpus`] with deterministic circuit-specific input constraints.
+///
+/// The hook receives the stored seed, rather than its position in the corpus, so each case remains
+/// independently reproducible if the corpus is reordered or reduced.
+pub fn record_fuzz_corpus_with(
+    original: &Graph,
+    config: FuzzConfig,
+    bbfs: Option<&std::collections::HashMap<String, BlackBoxFunction>>,
+    mut constrain: impl FnMut(u64, &mut [U256]),
+) -> eyre::Result<FuzzCorpus> {
+    if config.cases == 0 {
+        bail!("a fuzz corpus must contain at least one case");
+    }
+    let input_count = original.program.input_count();
+    let mut evaluator = original
         .evaluator(bbfs)
         .wrap_err("failed to prepare original graph")?;
-    let mut optimized_evaluator = optimized
+    let mut cases = Vec::with_capacity(config.cases);
+    for case in 0..config.cases {
+        let seed = config.seed.wrapping_add(case as u64);
+        let inputs = finish_fuzz_inputs(fuzz_inputs(input_count, seed), seed, &mut constrain);
+        let witness = evaluator.evaluate(&inputs).wrap_err_with(|| {
+            format!("original graph failed while recording fuzz case {case}, seed {seed}")
+        })?;
+        cases.push(FuzzCorpusCase {
+            seed,
+            witness_blake3: witness_blake3(witness).to_hex().to_string(),
+        });
+    }
+    Ok(FuzzCorpus { cases })
+}
+
+/// Replays pregenerated seeds against an optimized graph and compares BLAKE3 witness hashes.
+/// The original graph is not evaluated, making this suitable for the autoresearch inner loop.
+pub fn verify_fuzz_corpus(
+    optimized: &Graph,
+    corpus: &FuzzCorpus,
+    bbfs: Option<&std::collections::HashMap<String, BlackBoxFunction>>,
+) -> eyre::Result<FuzzCorpusReport> {
+    verify_fuzz_corpus_with(optimized, corpus, bbfs, |_, _| {})
+}
+
+/// [`verify_fuzz_corpus`] with the same deterministic seed-based constraint hook used while
+/// recording.
+pub fn verify_fuzz_corpus_with(
+    optimized: &Graph,
+    corpus: &FuzzCorpus,
+    bbfs: Option<&std::collections::HashMap<String, BlackBoxFunction>>,
+    mut constrain: impl FnMut(u64, &mut [U256]),
+) -> eyre::Result<FuzzCorpusReport> {
+    if corpus.is_empty() {
+        bail!("a fuzz corpus must contain at least one case");
+    }
+    let input_count = optimized.program.input_count();
+    let mut evaluator = optimized
         .evaluator(bbfs)
         .wrap_err("failed to prepare optimized graph")?;
-    let mut inputs = vec![U256::ZERO; input_count];
-
-    for case in 0..config.cases {
-        for input in &mut inputs {
-            *input = rng.gen::<U256>() % M;
-        }
-        constrain(case, &mut inputs);
-        inputs[0] = U256::ONE;
-
-        let expected = original_evaluator.evaluate(&inputs).wrap_err_with(|| {
+    for (case, expected) in corpus.cases.iter().enumerate() {
+        let expected_hash = blake3::Hash::from_hex(&expected.witness_blake3)
+            .wrap_err_with(|| format!("invalid BLAKE3 hash in fuzz case {case}"))?;
+        let inputs = finish_fuzz_inputs(
+            fuzz_inputs(input_count, expected.seed),
+            expected.seed,
+            &mut constrain,
+        );
+        let witness = evaluator.evaluate(&inputs).wrap_err_with(|| {
             format!(
-                "original graph failed for fuzz case {case}, seed {}",
-                config.seed
+                "optimized graph failed while replaying fuzz case {case}, seed {}",
+                expected.seed
             )
         })?;
-        let actual = optimized_evaluator.evaluate(&inputs).wrap_err_with(|| {
-            format!(
-                "optimized graph failed for fuzz case {case}, seed {}",
-                config.seed
-            )
-        })?;
-        if expected != actual {
-            let output = expected
-                .iter()
-                .zip(actual)
-                .position(|(expected, actual)| expected != actual)
-                .unwrap_or(expected.len().min(actual.len()));
-            let expected_value = expected.get(output);
-            let actual_value = actual.get(output);
-            return Err(eyre!(
-                "witness mismatch at output {output} in fuzz case {case}, seed {} (expected {expected_value:?}, got {actual_value:?}); inputs: {inputs:?}",
-                config.seed,
-            ));
+        let actual_hash = witness_blake3(witness);
+        if actual_hash != expected_hash {
+            bail!(
+                "witness hash mismatch in fuzz case {case}, seed {} (expected {}, got {})",
+                expected.seed,
+                expected_hash.to_hex(),
+                actual_hash.to_hex()
+            );
         }
     }
-
-    Ok(FuzzReport {
-        cases: config.cases,
-        seed: config.seed,
+    Ok(FuzzCorpusReport {
+        cases: corpus.len(),
     })
 }
 
@@ -714,14 +1021,124 @@ mod tests {
         let optimized = original.customize(&[replacement]).unwrap();
 
         assert!(optimized.runtime_instruction_count() < original.runtime_instruction_count());
-        let report = fuzz_equivalence(
-            &original,
-            &optimized,
-            FuzzConfig { cases: 32, seed: 7 },
-            None,
-        )
+        let corpus =
+            record_fuzz_corpus(&original, FuzzConfig { cases: 32, seed: 7 }, None).unwrap();
+        assert_eq!(
+            verify_fuzz_corpus(&optimized, &corpus, None).unwrap().cases,
+            32
+        );
+    }
+
+    #[test]
+    fn fuzz_seed_mapping_has_a_stable_golden_vector() {
+        let inputs = finish_fuzz_inputs(fuzz_inputs(4, 41), 41_u64, &mut |_, _| {});
+        let expected = [
+            "1",
+            "12582430194538003854020091743819204928138720569990892351889268536201142994086",
+            "1131272633747086338100786788918863750075083162243258060160111143945156737083",
+            "10044629985142331560893454010639311256461967596594112127128116628680634758565",
+        ]
+        .map(|value| value.parse::<U256>().unwrap());
+        assert_eq!(inputs, expected);
+    }
+
+    #[test]
+    fn pregenerated_fuzz_corpus_stores_and_replays_only_seed_hash_pairs() {
+        let original = arithmetic_graph();
+        let replacement = NativeSubgraph::new(
+            "sum-and-square",
+            vec![0, 1],
+            vec![2, 3],
+            |inputs, outputs| {
+                outputs[0] = inputs[0] + inputs[1];
+                outputs[1] = outputs[0].square();
+            },
+        );
+        let optimized = original.customize(&[replacement]).unwrap();
+        let corpus =
+            record_fuzz_corpus(&original, FuzzConfig { cases: 3, seed: 41 }, None).unwrap();
+
+        assert_eq!(
+            corpus
+                .cases()
+                .iter()
+                .map(|case| case.seed)
+                .collect::<Vec<_>>(),
+            vec![41, 42, 43]
+        );
+        let serialized = serde_json::to_value(&corpus).unwrap();
+        let cases = serialized.as_array().unwrap();
+        assert_eq!(cases.len(), 3);
+        assert!(cases.iter().all(|case| {
+            let case = case.as_object().unwrap();
+            case.len() == 2 && case.contains_key("seed") && case.contains_key("witness_blake3")
+        }));
+        assert!(corpus
+            .cases()
+            .iter()
+            .all(|case| case.witness_blake3.len() == 64));
+
+        let decoded: FuzzCorpus = serde_json::from_value(serialized).unwrap();
+        assert_eq!(decoded, corpus);
+        assert_eq!(
+            verify_fuzz_corpus(&optimized, &decoded, None)
+                .unwrap()
+                .cases,
+            3
+        );
+
+        let mut corrupt = decoded;
+        corrupt.cases[1].witness_blake3 = "00".repeat(32);
+        let error = verify_fuzz_corpus(&optimized, &corrupt, None).unwrap_err();
+        assert!(error.to_string().contains("seed 42"));
+    }
+
+    #[test]
+    fn constrained_corpus_cases_remain_reproducible_when_reordered() {
+        let graph = arithmetic_graph();
+        let config = FuzzConfig { cases: 3, seed: 51 };
+        let mut corpus = record_fuzz_corpus_with(&graph, config, None, |seed, inputs| {
+            inputs[1] = U256::from(seed);
+        })
         .unwrap();
-        assert_eq!(report.cases, 32);
+        corpus.cases.reverse();
+
+        assert_eq!(
+            verify_fuzz_corpus_with(&graph, &corpus, None, |seed, inputs| {
+                inputs[1] = U256::from(seed);
+            })
+            .unwrap()
+            .cases,
+            3
+        );
+    }
+
+    #[test]
+    fn native_subgraphs_may_share_implicit_constants() {
+        let nodes = vec![
+            Node::Input(0),
+            Node::Constant(U256::ONE),
+            Node::Op(Operation::Shr, 0, 1),
+            Node::Op(Operation::Band, 2, 1),
+            Node::Op(Operation::Shr, 0, 1),
+            Node::Op(Operation::Band, 4, 1),
+        ];
+        let replacements = [3_usize, 5].map(|output| {
+            NativeSubgraph::new(
+                format!("shared-constant-{output}"),
+                vec![0],
+                vec![output],
+                |inputs, outputs| {
+                    let value: U256 = inputs[0].into();
+                    outputs[0] = Fr::from(value.bit(1));
+                },
+            )
+        });
+        let resolved = resolve(&nodes, &[3, 5], &replacements).unwrap();
+        assert_eq!(resolved.len(), 2);
+        assert!(resolved
+            .iter()
+            .all(|replacement| !replacement.covered.contains(&1)));
     }
 
     #[test]
@@ -745,7 +1162,7 @@ mod tests {
     }
 
     #[test]
-    fn differential_fuzzer_reports_reproducible_mismatches() {
+    fn corpus_replay_reports_reproducible_mismatches() {
         let original = arithmetic_graph();
         let replacement = NativeSubgraph::new(
             "wrong-on-purpose",
@@ -757,13 +1174,8 @@ mod tests {
             },
         );
         let optimized = original.customize(&[replacement]).unwrap();
-        let error = fuzz_equivalence(
-            &original,
-            &optimized,
-            FuzzConfig { cases: 1, seed: 9 },
-            None,
-        )
-        .unwrap_err();
+        let corpus = record_fuzz_corpus(&original, FuzzConfig { cases: 1, seed: 9 }, None).unwrap();
+        let error = verify_fuzz_corpus(&optimized, &corpus, None).unwrap_err();
         let error = error.to_string();
         assert!(error.contains("fuzz case 0"));
         assert!(error.contains("seed 9"));
@@ -785,7 +1197,8 @@ mod tests {
                 NativeRuntimeOutcome::Fallback
             },
         );
-        let handler = NativeRuntimeFunction::new(
+        let handler = NativeRuntimeFunction::named(
+            "test-bigint-kernel",
             RuntimeFunctionMatcher::numeric_suffix("bigint_kernel"),
             move |call, outputs| {
                 assert_eq!(call.function_name(), "bigint_kernel_7");
@@ -802,6 +1215,7 @@ mod tests {
                 NativeRuntimeOutcome::Handled
             },
         );
+        let (handler, coverage) = handler.tracked();
         let optimized = original
             .customizer()
             .runtime_function(fallback)
@@ -809,14 +1223,20 @@ mod tests {
             .build()
             .unwrap();
 
-        fuzz_equivalence(
-            &original,
-            &optimized,
-            FuzzConfig { cases: 8, seed: 11 },
-            None,
-        )
-        .unwrap();
+        let corpus =
+            record_fuzz_corpus(&original, FuzzConfig { cases: 8, seed: 11 }, None).unwrap();
+        verify_fuzz_corpus(&optimized, &corpus, None).unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), 8);
+        let coverage = coverage.snapshot();
+        assert_eq!(coverage.handler_name, "test-bigint-kernel");
+        assert_eq!(coverage.attempts, 8);
+        assert_eq!(coverage.handled, 8);
+        assert_eq!(coverage.fallbacks, 0);
+        assert_eq!(coverage.errors, 0);
+        assert_eq!(coverage.shapes.len(), 1);
+        assert_eq!(coverage.shapes[0].shape.function_name, "bigint_kernel_7");
+        assert_eq!(coverage.shapes[0].shape.argument_sizes, [2, 1]);
+        assert_eq!(coverage.shapes[0].shape.result_count, 2);
     }
 
     #[test]
@@ -834,12 +1254,8 @@ mod tests {
             .build()
             .unwrap();
 
-        fuzz_equivalence(
-            &original,
-            &optimized,
-            FuzzConfig { cases: 8, seed: 12 },
-            None,
-        )
-        .unwrap();
+        let corpus =
+            record_fuzz_corpus(&original, FuzzConfig { cases: 8, seed: 12 }, None).unwrap();
+        verify_fuzz_corpus(&optimized, &corpus, None).unwrap();
     }
 }

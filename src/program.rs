@@ -5,7 +5,7 @@ use std::{
 };
 
 use ark_bn254::Fr;
-use ark_ff::Field;
+use ark_ff::{AdditiveGroup, Field};
 use eyre::{bail, eyre, Context as _};
 use ruint::aliases::U256;
 use serde::{Deserialize, Serialize};
@@ -35,9 +35,13 @@ pub(crate) struct Program {
     native_subgraphs: Vec<NativeInstruction>,
     runtime_functions: Vec<RuntimeFunction>,
     native_runtime_functions: Vec<NativeRuntimeFunction>,
+    native_runtime_bindings: Vec<Vec<usize>>,
     runtime_calls: Vec<RuntimeCallInstruction>,
     runtime_call_count: usize,
+    bit_cache_count: usize,
     outputs: Vec<usize>,
+    /// `cache << 8 | bit` for cached bit outputs, or `u32::MAX` for ordinary field outputs.
+    output_bits: Vec<u32>,
     division_batches: Vec<Range<usize>>,
     value_count: usize,
     input_count: usize,
@@ -66,6 +70,7 @@ pub(crate) struct EvaluationWorkspace {
     runtime_parameters: Vec<Fr>,
     runtime_results: Vec<Vec<Fr>>,
     runtime_ready: Vec<bool>,
+    bit_cache: Vec<U256>,
     outputs: Vec<U256>,
 }
 
@@ -95,6 +100,25 @@ enum Instruction {
     BlackBox(u32),
     Native(u32),
     RuntimeCall(u32),
+    /// Evaluates one runtime invocation and materializes all of its contiguous outputs.
+    RuntimeCallBatch(u32),
+    /// Canonicalizes a field value once for a group of bit extractions.
+    CacheBits {
+        source: u32,
+        cache: u32,
+    },
+    /// Extracts one bit from a canonical value populated by `CacheBits`.
+    BitExtract {
+        dependency: u32,
+        cache: u32,
+        bit: u8,
+    },
+    /// Unsigned integer division or remainder by `2^shift`, specialized at graph load.
+    IntDivPow2 {
+        value: u32,
+        shift: u8,
+        remainder: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -428,6 +452,26 @@ fn intern_coefficient(
 
 fn narrow_id(value: usize, kind: &str) -> eyre::Result<u32> {
     u32::try_from(value).map_err(|_| eyre!("{kind} {value} does not fit the compact program"))
+}
+
+fn evaluate_int_div_pow2(value: U256, shift: u8, remainder: bool) -> Fr {
+    let result = if remainder {
+        if shift == 0 {
+            U256::ZERO
+        } else if shift <= 64 {
+            let mask = if shift == 64 {
+                u64::MAX
+            } else {
+                (1_u64 << shift) - 1
+            };
+            U256::from(value.as_limbs()[0] & mask)
+        } else {
+            value & ((U256::ONE << usize::from(shift)) - U256::ONE)
+        }
+    } else {
+        value >> usize::from(shift)
+    };
+    Fr::new(result.into())
 }
 
 /// Compiles nodes into the runtime program. `division_node_batches` refers to ranges in `nodes`
@@ -880,9 +924,12 @@ fn compile_internal(
         native_subgraphs,
         runtime_functions,
         native_runtime_functions: Vec::new(),
+        native_runtime_bindings: Vec::new(),
         runtime_calls,
         runtime_call_count,
+        bit_cache_count: 0,
         outputs,
+        output_bits: Vec::new(),
         division_batches,
         value_count,
         input_count,
@@ -897,6 +944,9 @@ impl Program {
         match instruction {
             Instruction::Pow5(_) => 3,
             Instruction::Native(native) => self.native_subgraphs[*native as usize].output_count,
+            Instruction::RuntimeCallBatch(runtime_call) => {
+                self.runtime_calls[*runtime_call as usize].output_count
+            }
             _ => 1,
         }
     }
@@ -934,13 +984,22 @@ impl Program {
                     "native_subgraph:{}",
                     self.native_subgraphs[*native as usize].name
                 ),
-                Instruction::RuntimeCall(runtime_call) => {
+                Instruction::RuntimeCall(runtime_call)
+                | Instruction::RuntimeCallBatch(runtime_call) => {
                     let runtime_call = &self.runtime_calls[*runtime_call as usize];
                     format!(
                         "runtime_call:{}",
                         self.runtime_functions[runtime_call.function].name
                     )
                 }
+                Instruction::CacheBits { .. } => "cache_bits".to_owned(),
+                Instruction::BitExtract { bit, .. } => format!("bit_extract:{bit}"),
+                Instruction::IntDivPow2 {
+                    shift, remainder, ..
+                } => format!(
+                    "int_{}_pow2:{shift}",
+                    if *remainder { "remainder" } else { "divide" }
+                ),
             };
             *counts.entry(operation).or_default() += 1;
         }
@@ -975,6 +1034,9 @@ impl Program {
             | Instruction::Sub(left, right)
             | Instruction::Op(_, left, right) => vec![*left as usize, *right as usize],
             Instruction::Square(value) | Instruction::Pow5(value) => vec![*value as usize],
+            Instruction::CacheBits { source, .. } => vec![*source as usize],
+            Instruction::BitExtract { dependency, .. } => vec![*dependency as usize],
+            Instruction::IntDivPow2 { value, .. } => vec![*value as usize],
             Instruction::Linear3(linear) => self.linear3[*linear as usize]
                 .iter()
                 .map(|&(value, _)| value as usize)
@@ -993,7 +1055,9 @@ impl Program {
                 .iter()
                 .map(|&value| value as usize)
                 .collect(),
-            Instruction::RuntimeCall(runtime_call) => self.runtime_calls[*runtime_call as usize]
+            Instruction::RuntimeCall(runtime_call)
+            | Instruction::RuntimeCallBatch(runtime_call) => self.runtime_calls
+                [*runtime_call as usize]
                 .parameters
                 .iter()
                 .map(|&value| value as usize)
@@ -1020,13 +1084,22 @@ impl Program {
                 "native_subgraph:{}",
                 self.native_subgraphs[*native as usize].name
             ),
-            Instruction::RuntimeCall(runtime_call) => {
+            Instruction::RuntimeCall(runtime_call)
+            | Instruction::RuntimeCallBatch(runtime_call) => {
                 let runtime_call = &self.runtime_calls[*runtime_call as usize];
                 format!(
                     "runtime_call:{}",
                     self.runtime_functions[runtime_call.function].name
                 )
             }
+            Instruction::CacheBits { .. } => "cache_bits".to_owned(),
+            Instruction::BitExtract { bit, .. } => format!("bit_extract:{bit}"),
+            Instruction::IntDivPow2 {
+                shift, remainder, ..
+            } => format!(
+                "int_{}_pow2:{shift}",
+                if *remainder { "remainder" } else { "divide" }
+            ),
         }
     }
 
@@ -1038,6 +1111,7 @@ impl Program {
                 | Instruction::BlackBox(_)
                 | Instruction::Native(_)
                 | Instruction::RuntimeCall(_)
+                | Instruction::RuntimeCallBatch(_)
         )
     }
 
@@ -1273,7 +1347,8 @@ impl Program {
                 "instruction[{index}]:native_subgraph:{}",
                 self.native_subgraphs[*native as usize].name
             ),
-            Instruction::RuntimeCall(runtime_call) => {
+            Instruction::RuntimeCall(runtime_call)
+            | Instruction::RuntimeCallBatch(runtime_call) => {
                 let runtime_call = &self.runtime_calls[*runtime_call as usize];
                 let name = &self.runtime_functions[runtime_call.function].name;
                 format!(
@@ -1291,6 +1366,9 @@ impl Program {
         functions: Vec<NativeRuntimeFunction>,
     ) -> eyre::Result<Self> {
         for function in &functions {
+            if function.name().is_empty() {
+                bail!("native runtime-function names must not be empty");
+            }
             if function.matcher().is_empty() {
                 bail!("native runtime-function matchers must not be empty");
             }
@@ -1305,6 +1383,19 @@ impl Program {
                 );
             }
         }
+        self.native_runtime_bindings = self
+            .runtime_functions
+            .iter()
+            .map(|candidate| {
+                functions
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, function)| {
+                        function.matcher().matches(&candidate.name).then_some(index)
+                    })
+                    .collect()
+            })
+            .collect();
         self.native_runtime_functions = functions;
         Ok(self)
     }
@@ -1335,16 +1426,427 @@ impl Program {
         Ok(BoundBlackBoxes { functions })
     }
 
+    /// Fuses repeated `(value >> constant) & 1` expansions. One Montgomery conversion is cached
+    /// per source value and all single-use shifts are removed.
+    fn fuse_bit_extractions(&mut self) -> eyre::Result<()> {
+        if self.bit_cache_count != 0 {
+            return Ok(());
+        }
+        let mut producers = Vec::with_capacity(self.value_count);
+        for (instruction, item) in self.instructions.iter().enumerate() {
+            producers.extend(std::iter::repeat_n(
+                instruction,
+                self.instruction_output_count(item),
+            ));
+        }
+        if producers.len() != self.value_count {
+            bail!("program value count is inconsistent");
+        }
+
+        let mut uses = vec![0_usize; self.value_count];
+        for instruction in &self.instructions {
+            for operand in self.instruction_operands(instruction) {
+                uses[operand] += 1;
+            }
+        }
+        for &output in &self.outputs {
+            uses[output] += 1;
+        }
+        let constant = |value: u32| -> Option<U256> {
+            match self.instructions[producers[value as usize]] {
+                Instruction::Constant(coefficient) => {
+                    Some(self.coefficients[coefficient as usize].into())
+                }
+                _ => None,
+            }
+        };
+
+        let mut source_caches = HashMap::<u32, (u32, u32)>::new();
+        let mut fusions = Vec::new();
+        for (band_instruction, instruction) in self.instructions.iter().enumerate() {
+            let Instruction::Op(Operation::Band, left, right) = instruction else {
+                continue;
+            };
+            let Some((shift_value, mask_value)) = [(*left, *right), (*right, *left)]
+                .into_iter()
+                .find(|(value, _)| {
+                    matches!(
+                        self.instructions[producers[*value as usize]],
+                        Instruction::Op(Operation::Shr, _, _)
+                    )
+                })
+            else {
+                continue;
+            };
+            if uses[shift_value as usize] != 1 || constant(mask_value) != Some(U256::ONE) {
+                continue;
+            }
+            let shift_instruction = producers[shift_value as usize];
+            let Instruction::Op(Operation::Shr, source, amount) =
+                self.instructions[shift_instruction]
+            else {
+                unreachable!();
+            };
+            let Some(bit) = constant(amount).and_then(|amount| u8::try_from(amount).ok()) else {
+                continue;
+            };
+            let next_cache = narrow_id(source_caches.len(), "bit cache ID")?;
+            let (cache, dependency) = *source_caches
+                .entry(source)
+                .or_insert((next_cache, shift_value));
+            fusions.push((
+                shift_instruction,
+                band_instruction,
+                source,
+                dependency,
+                cache,
+                bit,
+            ));
+        }
+        if fusions.is_empty() {
+            return Ok(());
+        }
+
+        let mut remove = vec![false; self.instructions.len()];
+        for &(shift_instruction, _, _, _, _, _) in &fusions {
+            remove[shift_instruction] = true;
+        }
+        let mut initialized = vec![false; source_caches.len()];
+        for (_, band_instruction, source, dependency, cache, bit) in fusions {
+            if !initialized[cache as usize] {
+                let cache_instruction = producers[dependency as usize];
+                self.instructions[cache_instruction] = Instruction::CacheBits { source, cache };
+                remove[cache_instruction] = false;
+                initialized[cache as usize] = true;
+            }
+            self.instructions[band_instruction] = Instruction::BitExtract {
+                dependency,
+                cache,
+                bit,
+            };
+        }
+        self.bit_cache_count = source_caches.len();
+        self.compact_instructions(&remove)
+    }
+
+    /// Collapses the one-node-per-output encoding of a runtime invocation when all outputs are
+    /// contiguous. Runtime IR already evaluates every output together, so retaining one compact
+    /// instruction per output only repeats dispatch and cached-result bookkeeping.
+    fn fuse_runtime_call_outputs(&mut self) {
+        let same_invocation = |left: &RuntimeCallInstruction, right: &RuntimeCallInstruction| {
+            left.function == right.function
+                && left.call == right.call
+                && left.output_count == right.output_count
+                && left.arena_size == right.arena_size
+                && left.argument_sizes == right.argument_sizes
+                && left.parameters == right.parameters
+        };
+
+        let mut remove = vec![false; self.instructions.len()];
+        let mut fused_ranges = Vec::<Range<usize>>::new();
+        let mut instruction = 0_usize;
+        while instruction < self.instructions.len() {
+            let Instruction::RuntimeCall(first_id) = self.instructions[instruction] else {
+                instruction += 1;
+                continue;
+            };
+            let first = &self.runtime_calls[first_id as usize];
+            let end = instruction.saturating_add(first.output_count);
+            let fusible = first.output == 0
+                && first.output_count > 0
+                && end <= self.instructions.len()
+                && self.instructions[instruction..end].iter().enumerate().all(
+                    |(output, candidate)| {
+                        let Instruction::RuntimeCall(candidate_id) = candidate else {
+                            return false;
+                        };
+                        let candidate = &self.runtime_calls[*candidate_id as usize];
+                        candidate.output == output && same_invocation(first, candidate)
+                    },
+                );
+            if !fusible {
+                instruction += 1;
+                continue;
+            }
+
+            self.instructions[instruction] = Instruction::RuntimeCallBatch(first_id);
+            remove[instruction + 1..end].fill(true);
+            fused_ranges.push(instruction..end);
+            instruction = end;
+        }
+        if fused_ranges.is_empty() {
+            return;
+        }
+
+        if let Some(source_map) = self.source_map.get_mut() {
+            for range in &fused_ranges {
+                let sources = source_map.instruction_sources[range.clone()]
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                let boundaries = source_map.instruction_boundary_sources[range.clone()]
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                source_map.instruction_sources[range.start] = sources;
+                source_map.instruction_boundary_sources[range.start] = boundaries;
+            }
+            source_map.instruction_sources = source_map
+                .instruction_sources
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !remove[*index])
+                .map(|(_, sources)| sources.clone())
+                .collect();
+            source_map.instruction_boundary_sources = source_map
+                .instruction_boundary_sources
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !remove[*index])
+                .map(|(_, sources)| sources.clone())
+                .collect();
+        }
+        self.instructions = self
+            .instructions
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !remove[*index])
+            .map(|(_, instruction)| instruction.clone())
+            .collect();
+        if !self
+            .instructions
+            .iter()
+            .any(|instruction| matches!(instruction, Instruction::RuntimeCall(_)))
+        {
+            self.runtime_call_count = 0;
+        }
+    }
+
+    fn compact_instructions(&mut self, remove: &[bool]) -> eyre::Result<()> {
+        if remove.len() != self.instructions.len() {
+            bail!("instruction removal mask has the wrong length");
+        }
+        let mut old_value_starts = Vec::with_capacity(self.instructions.len());
+        let mut old_value = 0_usize;
+        for instruction in &self.instructions {
+            old_value_starts.push(old_value);
+            old_value += self.instruction_output_count(instruction);
+        }
+        if old_value != self.value_count {
+            bail!("program value count is inconsistent");
+        }
+        let mut value_renumber = vec![usize::MAX; self.value_count];
+        let mut next_value = 0_usize;
+        for (index, instruction) in self.instructions.iter().enumerate() {
+            if remove[index] {
+                continue;
+            }
+            let produced = self.instruction_output_count(instruction);
+            for offset in 0..produced {
+                value_renumber[old_value_starts[index] + offset] = next_value + offset;
+            }
+            next_value += produced;
+        }
+        let remap = |value: u32| -> eyre::Result<u32> {
+            let value = value_renumber
+                .get(value as usize)
+                .copied()
+                .filter(|value| *value != usize::MAX)
+                .ok_or_else(|| eyre!("removed program value {value} is still referenced"))?;
+            narrow_id(value, "value ID")
+        };
+
+        for terms in &mut self.linear3 {
+            for (value, _) in terms {
+                *value = remap(*value)?;
+            }
+        }
+        for terms in &mut self.linear4 {
+            for (value, _) in terms {
+                *value = remap(*value)?;
+            }
+        }
+        for black_box in &mut self.black_boxes {
+            for value in &mut black_box.parameters {
+                *value = remap(*value)?;
+            }
+        }
+        for native in &mut self.native_subgraphs {
+            for value in &mut native.inputs {
+                *value = remap(*value)?;
+            }
+        }
+        for runtime_call in &mut self.runtime_calls {
+            for value in &mut runtime_call.parameters {
+                *value = remap(*value)?;
+            }
+        }
+
+        let mut instructions = Vec::with_capacity(self.instructions.len());
+        for (index, instruction) in self.instructions.iter().enumerate() {
+            if remove[index] {
+                continue;
+            }
+            instructions.push(match instruction {
+                Instruction::Mul(left, right) => Instruction::Mul(remap(*left)?, remap(*right)?),
+                Instruction::Add(left, right) => Instruction::Add(remap(*left)?, remap(*right)?),
+                Instruction::Sub(left, right) => Instruction::Sub(remap(*left)?, remap(*right)?),
+                Instruction::Op(operation, left, right) => {
+                    Instruction::Op(*operation, remap(*left)?, remap(*right)?)
+                }
+                Instruction::Square(value) => Instruction::Square(remap(*value)?),
+                Instruction::Pow5(value) => Instruction::Pow5(remap(*value)?),
+                Instruction::CacheBits { source, cache } => Instruction::CacheBits {
+                    source: remap(*source)?,
+                    cache: *cache,
+                },
+                Instruction::BitExtract {
+                    dependency,
+                    cache,
+                    bit,
+                } => Instruction::BitExtract {
+                    dependency: remap(*dependency)?,
+                    cache: *cache,
+                    bit: *bit,
+                },
+                Instruction::IntDivPow2 {
+                    value,
+                    shift,
+                    remainder,
+                } => Instruction::IntDivPow2 {
+                    value: remap(*value)?,
+                    shift: *shift,
+                    remainder: *remainder,
+                },
+                instruction => instruction.clone(),
+            });
+        }
+        if let Some(source_map) = self.source_map.get_mut() {
+            source_map.instruction_sources = source_map
+                .instruction_sources
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !remove[*index])
+                .map(|(_, sources)| sources.clone())
+                .collect();
+            source_map.instruction_boundary_sources = source_map
+                .instruction_boundary_sources
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !remove[*index])
+                .map(|(_, sources)| sources.clone())
+                .collect();
+            source_map.value_sources = value_renumber
+                .iter()
+                .enumerate()
+                .filter(|(_, value)| **value != usize::MAX)
+                .map(|(old, _)| source_map.value_sources[old])
+                .collect();
+        }
+        self.outputs = self
+            .outputs
+            .iter()
+            .map(|&output| remap(narrow_id(output, "value ID")?).map(|value| value as usize))
+            .collect::<eyre::Result<Vec<_>>>()?;
+        self.instructions = instructions;
+        self.value_count = next_value;
+        Ok(())
+    }
+
+    /// Lowers unsigned integer division and remainder by a constant power of two to shifts and
+    /// masks. This is a generic compact-program optimization; it does not depend on a circuit or
+    /// function name.
+    fn fuse_power_of_two_integer_ops(&mut self) {
+        let mut producers = Vec::with_capacity(self.value_count);
+        for (instruction, item) in self.instructions.iter().enumerate() {
+            producers.extend(std::iter::repeat_n(
+                instruction,
+                self.instruction_output_count(item),
+            ));
+        }
+        let constant = |value: u32| -> Option<U256> {
+            match self.instructions[producers[value as usize]] {
+                Instruction::Constant(coefficient) => {
+                    Some(self.coefficients[coefficient as usize].into())
+                }
+                _ => None,
+            }
+        };
+        let replacements =
+            self.instructions
+                .iter()
+                .enumerate()
+                .filter_map(|(index, instruction)| {
+                    let Instruction::Op(
+                        operation @ (Operation::IDiv | Operation::Mod),
+                        value,
+                        divisor,
+                    ) = instruction
+                    else {
+                        return None;
+                    };
+                    let divisor = constant(*divisor)?;
+                    divisor.is_power_of_two().then(|| {
+                        (
+                            index,
+                            Instruction::IntDivPow2 {
+                                value: *value,
+                                shift: divisor.trailing_zeros() as u8,
+                                remainder: *operation == Operation::Mod,
+                            },
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+        for (index, instruction) in replacements {
+            self.instructions[index] = instruction;
+        }
+    }
+
+    fn prepare_bit_outputs(&mut self) {
+        if self.bit_cache_count == 0 {
+            self.output_bits.clear();
+            return;
+        }
+        let mut producers = Vec::with_capacity(self.value_count);
+        for (instruction, item) in self.instructions.iter().enumerate() {
+            producers.extend(std::iter::repeat_n(
+                instruction,
+                self.instruction_output_count(item),
+            ));
+        }
+        self.output_bits = self
+            .outputs
+            .iter()
+            .map(|&output| match self.instructions[producers[output]] {
+                Instruction::BitExtract { cache, bit, .. } if cache < (1 << 24) - 1 => {
+                    cache << 8 | u32::from(bit)
+                }
+                _ => u32::MAX,
+            })
+            .collect();
+    }
+
     /// Reorders the already-fused program into division-depth layers without expanding it back
     /// into a [`Node`] DAG. Programs produced by `compile` and `decode` are validated, so this pass
     /// only needs to calculate depths, renumber values, and build the division batch ranges.
     pub(crate) fn prepare_evaluation(mut self) -> eyre::Result<Self> {
+        self.fuse_runtime_call_outputs();
+        self.fuse_bit_extractions()?;
+        self.fuse_power_of_two_integer_ops();
         if !self
             .instructions
             .iter()
             .any(|instruction| matches!(instruction, Instruction::Op(Operation::Div, _, _)))
         {
             self.division_batches.clear();
+            self.prepare_bit_outputs();
             return Ok(self);
         }
 
@@ -1374,6 +1876,9 @@ impl Program {
                     }
                 }
                 Instruction::Square(value) | Instruction::Pow5(value) => value_depth(*value)?,
+                Instruction::CacheBits { source, .. } => value_depth(*source)?,
+                Instruction::BitExtract { dependency, .. } => value_depth(*dependency)?,
+                Instruction::IntDivPow2 { value, .. } => value_depth(*value)?,
                 Instruction::Linear3(linear) => self.linear3[*linear as usize]
                     .iter()
                     .try_fold(0_usize, |depth, &(value, _)| {
@@ -1396,7 +1901,8 @@ impl Program {
                     .try_fold(0_usize, |depth, &value| {
                         Ok::<_, eyre::Report>(depth.max(value_depth(value)?))
                     })?,
-                Instruction::RuntimeCall(runtime_call) => self.runtime_calls
+                Instruction::RuntimeCall(runtime_call)
+                | Instruction::RuntimeCallBatch(runtime_call) => self.runtime_calls
                     [*runtime_call as usize]
                     .parameters
                     .iter()
@@ -1515,6 +2021,28 @@ impl Program {
                 }
                 Instruction::Square(value) => Instruction::Square(remap_value(*value)?),
                 Instruction::Pow5(value) => Instruction::Pow5(remap_value(*value)?),
+                Instruction::CacheBits { source, cache } => Instruction::CacheBits {
+                    source: remap_value(*source)?,
+                    cache: *cache,
+                },
+                Instruction::BitExtract {
+                    dependency,
+                    cache,
+                    bit,
+                } => Instruction::BitExtract {
+                    dependency: remap_value(*dependency)?,
+                    cache: *cache,
+                    bit: *bit,
+                },
+                Instruction::IntDivPow2 {
+                    value,
+                    shift,
+                    remainder,
+                } => Instruction::IntDivPow2 {
+                    value: remap_value(*value)?,
+                    shift: *shift,
+                    remainder: *remainder,
+                },
                 Instruction::Linear3(linear) => {
                     let terms = self.linear3[*linear as usize];
                     let index = narrow_id(linear3.len(), "linear3 ID")?;
@@ -1564,7 +2092,8 @@ impl Program {
                     });
                     Instruction::Native(index)
                 }
-                Instruction::RuntimeCall(runtime_call) => {
+                Instruction::RuntimeCall(runtime_call)
+                | Instruction::RuntimeCallBatch(runtime_call) => {
                     let runtime_call = &self.runtime_calls[*runtime_call as usize];
                     let index = narrow_id(runtime_calls.len(), "runtime-call ID")?;
                     runtime_calls.push(RuntimeCallInstruction {
@@ -1575,7 +2104,14 @@ impl Program {
                             .collect::<eyre::Result<Vec<_>>>()?,
                         ..runtime_call.clone()
                     });
-                    Instruction::RuntimeCall(index)
+                    if matches!(
+                        self.instructions[old_instruction],
+                        Instruction::RuntimeCallBatch(_)
+                    ) {
+                        Instruction::RuntimeCallBatch(index)
+                    } else {
+                        Instruction::RuntimeCall(index)
+                    }
                 }
             };
             instructions.push(instruction);
@@ -1600,6 +2136,7 @@ impl Program {
             })
             .collect::<eyre::Result<Vec<_>>>()?;
         self.division_batches = division_batches;
+        self.prepare_bit_outputs();
         debug_assert!(self.validate().is_ok());
         Ok(self)
     }
@@ -1610,7 +2147,7 @@ impl Program {
         bbfs: Option<&HashMap<String, BlackBoxFunction>>,
     ) -> eyre::Result<Vec<U256>> {
         let mut workspace = EvaluationWorkspace::default();
-        self.evaluate_with_workspace(inputs, bbfs, None, &mut workspace, None)?;
+        self.evaluate_with_workspace::<false>(inputs, bbfs, None, &mut workspace, None)?;
         Ok(workspace.outputs)
     }
 
@@ -1620,7 +2157,7 @@ impl Program {
         black_boxes: &BoundBlackBoxes,
         workspace: &mut EvaluationWorkspace,
     ) -> eyre::Result<()> {
-        self.evaluate_with_workspace(inputs, None, Some(black_boxes), workspace, None)
+        self.evaluate_with_workspace::<false>(inputs, None, Some(black_boxes), workspace, None)
     }
 
     pub(crate) fn evaluate_prepared_profiled(
@@ -1630,10 +2167,16 @@ impl Program {
         workspace: &mut EvaluationWorkspace,
         profile: &mut ProfileCollector,
     ) -> eyre::Result<()> {
-        self.evaluate_with_workspace(inputs, None, Some(black_boxes), workspace, Some(profile))
+        self.evaluate_with_workspace::<true>(
+            inputs,
+            None,
+            Some(black_boxes),
+            workspace,
+            Some(profile),
+        )
     }
 
-    fn evaluate_with_workspace(
+    fn evaluate_with_workspace<const PROFILED: bool>(
         &self,
         inputs: &[U256],
         bbfs: Option<&HashMap<String, BlackBoxFunction>>,
@@ -1651,6 +2194,7 @@ impl Program {
             runtime_parameters,
             runtime_results,
             runtime_ready,
+            bit_cache,
             outputs,
         } = workspace;
         values.clear();
@@ -1663,6 +2207,7 @@ impl Program {
         runtime_results.resize_with(self.runtime_call_count, Vec::new);
         runtime_ready.resize(self.runtime_call_count, false);
         runtime_ready.fill(false);
+        bit_cache.resize(self.bit_cache_count, U256::ZERO);
         outputs.clear();
         outputs.reserve(self.outputs.len());
         let mut batches = self.division_batches.iter().peekable();
@@ -1675,13 +2220,22 @@ impl Program {
                 .peek()
                 .is_some_and(|batch| batch.start == instruction_index)
             {
-                if let Some(token) = profile_block_token.take() {
-                    profile.as_deref_mut().unwrap().exit(token);
+                if PROFILED {
+                    if let Some(token) = profile_block_token.take() {
+                        profile.as_deref_mut().unwrap().exit(token);
+                    }
                 }
                 let batch = batches.next().unwrap().clone();
-                let profile_token = profile.as_deref_mut().map(|profile| {
-                    profile.enter(ProfileFrame::division_batch(batch.start, batch.end))
-                });
+                let profile_token = if PROFILED {
+                    Some(
+                        profile
+                            .as_deref_mut()
+                            .unwrap()
+                            .enter(ProfileFrame::division_batch(batch.start, batch.end)),
+                    )
+                } else {
+                    None
+                };
                 inverses.clear();
                 for instruction in &self.instructions[batch.clone()] {
                     let Instruction::Op(Operation::Div, _, divisor) = instruction else {
@@ -1698,14 +2252,16 @@ impl Program {
                     };
                     values.push(values[*numerator as usize] * inverse);
                 }
-                if let Some(token) = profile_token {
-                    profile.as_deref_mut().unwrap().exit(token);
+                if PROFILED {
+                    if let Some(token) = profile_token {
+                        profile.as_deref_mut().unwrap().exit(token);
+                    }
                 }
                 instruction_index = batch.end;
                 continue;
             }
 
-            if profile.is_some() && profile_block_token.is_none() {
+            if PROFILED && profile_block_token.is_none() {
                 let block_size = profile.as_deref().unwrap().instruction_block_size();
                 let next_batch = batches
                     .peek()
@@ -1719,7 +2275,7 @@ impl Program {
                     ProfileFrame::instruction_block(instruction_index, profile_block_end),
                 ));
             }
-            let profile_token = if profile.is_some() {
+            let profile_token = if PROFILED {
                 self.special_instruction_profile_frame(instruction_index)
                     .map(|frame| profile.as_deref_mut().unwrap().enter(frame))
             } else {
@@ -1752,6 +2308,17 @@ impl Program {
                     values.push(square);
                     values.push(fourth);
                     values.push(fourth * values[value]);
+                }
+                Instruction::CacheBits { source, cache } => {
+                    bit_cache[*cache as usize] = values[*source as usize].into();
+                    values.push(Fr::ZERO);
+                }
+                Instruction::BitExtract { cache, bit, .. } => {
+                    values.push(if bit_cache[*cache as usize].bit(*bit as usize) {
+                        Fr::ONE
+                    } else {
+                        Fr::ZERO
+                    });
                 }
                 Instruction::Linear3(linear) => {
                     let terms = &self.linear3[*linear as usize];
@@ -1830,6 +2397,7 @@ impl Program {
                         runtime_results[runtime_call.call] = crate::runtime::evaluate(
                             &self.runtime_functions,
                             &self.native_runtime_functions,
+                            &self.native_runtime_bindings,
                             profile.as_deref_mut(),
                             crate::runtime::RuntimeInvocation {
                                 function: runtime_call.function,
@@ -1843,12 +2411,48 @@ impl Program {
                     }
                     values.push(runtime_results[runtime_call.call][runtime_call.output]);
                 }
+                Instruction::RuntimeCallBatch(runtime_call) => {
+                    let runtime_call = &self.runtime_calls[*runtime_call as usize];
+                    runtime_parameters.clear();
+                    runtime_parameters.extend(
+                        runtime_call
+                            .parameters
+                            .iter()
+                            .map(|&value| values[value as usize]),
+                    );
+                    let output_start = values.len();
+                    values.resize(output_start + runtime_call.output_count, Fr::ZERO);
+                    crate::runtime::evaluate_into(
+                        &self.runtime_functions,
+                        &self.native_runtime_functions,
+                        &self.native_runtime_bindings,
+                        profile.as_deref_mut(),
+                        crate::runtime::RuntimeInvocation {
+                            function: runtime_call.function,
+                            arguments: runtime_parameters,
+                            argument_sizes: &runtime_call.argument_sizes,
+                            arena_size: runtime_call.arena_size,
+                            result_size: runtime_call.output_count,
+                        },
+                        &mut values[output_start..],
+                    )?;
+                }
+                Instruction::IntDivPow2 {
+                    value,
+                    shift,
+                    remainder,
+                } => {
+                    let value: U256 = values[*value as usize].into();
+                    values.push(evaluate_int_div_pow2(value, *shift, *remainder));
+                }
             }
-            if let Some(token) = profile_token {
-                profile.as_deref_mut().unwrap().exit(token);
+            if PROFILED {
+                if let Some(token) = profile_token {
+                    profile.as_deref_mut().unwrap().exit(token);
+                }
             }
             instruction_index += 1;
-            if profile_block_token.is_some() && instruction_index == profile_block_end {
+            if PROFILED && profile_block_token.is_some() && instruction_index == profile_block_end {
                 profile
                     .as_deref_mut()
                     .unwrap()
@@ -1856,15 +2460,29 @@ impl Program {
             }
         }
 
-        if let Some(token) = profile_block_token {
-            profile.unwrap().exit(token);
+        if PROFILED {
+            if let Some(token) = profile_block_token {
+                profile.unwrap().exit(token);
+            }
         }
 
-        outputs.extend(
-            self.outputs
-                .iter()
-                .map(|&output| -> U256 { values[output].into() }),
-        );
+        if self.output_bits.is_empty() {
+            outputs.extend(
+                self.outputs
+                    .iter()
+                    .map(|&output| -> U256 { values[output].into() }),
+            );
+        } else {
+            outputs.extend(self.outputs.iter().zip(&self.output_bits).map(
+                |(&output, &bit)| -> U256 {
+                    if bit == u32::MAX {
+                        values[output].into()
+                    } else {
+                        U256::from(bit_cache[(bit >> 8) as usize].bit((bit & 0xff) as usize))
+                    }
+                },
+            ));
+        }
         Ok(())
     }
 
@@ -1898,6 +2516,21 @@ impl Program {
                 Instruction::Square(value) | Instruction::Pow5(value) => {
                     check_value(*value as usize)?
                 }
+                Instruction::CacheBits { source, cache } => {
+                    check_value(*source as usize)?;
+                    if *cache as usize >= self.bit_cache_count {
+                        bail!("program instruction {index} references missing bit cache {cache}");
+                    }
+                }
+                Instruction::BitExtract {
+                    dependency, cache, ..
+                } => {
+                    check_value(*dependency as usize)?;
+                    if *cache as usize >= self.bit_cache_count {
+                        bail!("program instruction {index} references missing bit cache {cache}");
+                    }
+                }
+                Instruction::IntDivPow2 { value, .. } => check_value(*value as usize)?,
                 Instruction::Linear3(linear) => {
                     let terms = self.linear3.get(*linear as usize).ok_or_else(|| {
                         eyre!("program instruction {index} references missing linear3 {linear}")
@@ -1939,7 +2572,8 @@ impl Program {
                         check_value(input as usize)?;
                     }
                 }
-                Instruction::RuntimeCall(runtime_call) => {
+                Instruction::RuntimeCall(runtime_call)
+                | Instruction::RuntimeCallBatch(runtime_call) => {
                     let runtime_call = self.runtime_calls.get(*runtime_call as usize).ok_or_else(|| {
                         eyre!("program instruction {index} references missing runtime call {runtime_call}")
                     })?;
@@ -1949,7 +2583,9 @@ impl Program {
                             runtime_call.function
                         );
                     }
-                    if runtime_call.call >= self.runtime_call_count {
+                    if matches!(instruction, Instruction::RuntimeCall(_))
+                        && runtime_call.call >= self.runtime_call_count
+                    {
                         bail!("runtime-call ID {} is out of bounds", runtime_call.call);
                     }
                     if runtime_call.output >= runtime_call.output_count {
@@ -1957,6 +2593,11 @@ impl Program {
                             "runtime-call output {} is out of bounds",
                             runtime_call.output
                         );
+                    }
+                    if matches!(instruction, Instruction::RuntimeCallBatch(_))
+                        && runtime_call.output != 0
+                    {
+                        bail!("batched runtime call does not start at output zero");
                     }
                     let argument_count = runtime_call
                         .argument_sizes
@@ -1981,6 +2622,9 @@ impl Program {
             if output >= self.value_count {
                 bail!("program output value {output} is out of bounds");
             }
+        }
+        if !self.output_bits.is_empty() && self.output_bits.len() != self.outputs.len() {
+            bail!("program cached bit-output annotations have the wrong length");
         }
         if let Some(source_map) = self.source_map.get() {
             if source_map.instruction_sources.len() != self.instructions.len() {
@@ -2071,6 +2715,12 @@ impl Program {
                     )
                 }
                 Instruction::Native(_) => unreachable!("native subgraphs were rejected above"),
+                Instruction::CacheBits { .. }
+                | Instruction::BitExtract { .. }
+                | Instruction::IntDivPow2 { .. }
+                | Instruction::RuntimeCallBatch(_) => {
+                    bail!("evaluation-only instructions cannot be serialized")
+                }
                 Instruction::RuntimeCall(runtime_call) => {
                     let runtime_call = &self.runtime_calls[*runtime_call as usize];
                     EncodedInstruction::RuntimeCall {
@@ -2305,9 +2955,12 @@ impl Program {
             native_subgraphs: Vec::new(),
             runtime_functions,
             native_runtime_functions: Vec::new(),
+            native_runtime_bindings: Vec::new(),
             runtime_calls,
             runtime_call_count,
+            bit_cache_count: 0,
             outputs,
+            output_bits: Vec::new(),
             division_batches: Vec::new(),
             value_count: next_value,
             input_count,
@@ -2335,6 +2988,11 @@ impl Program {
                     value_sources.push(*coefficient as usize);
                     continue;
                 }
+                Instruction::CacheBits { source, .. } => {
+                    instruction_sources.push(Vec::new());
+                    value_sources.push(value_sources[*source as usize]);
+                    continue;
+                }
                 Instruction::Input(_)
                 | Instruction::Mul(_, _)
                 | Instruction::Add(_, _)
@@ -2343,6 +3001,11 @@ impl Program {
                 | Instruction::Square(_)
                 | Instruction::BlackBox(_)
                 | Instruction::RuntimeCall(_) => 1,
+                Instruction::RuntimeCallBatch(runtime_call) => {
+                    self.runtime_calls[*runtime_call as usize].output_count
+                }
+                Instruction::IntDivPow2 { .. } => 2,
+                Instruction::BitExtract { .. } => 4,
                 Instruction::Pow5(_) => 3,
                 Instruction::Linear3(_) => 5,
                 Instruction::Linear4(_) => 7,
@@ -2355,7 +3018,9 @@ impl Program {
             };
             let sources = (next_node..next_node + added_nodes).collect::<Vec<_>>();
             match instruction {
-                Instruction::Pow5(_) => value_sources.extend_from_slice(&sources),
+                Instruction::Pow5(_) | Instruction::RuntimeCallBatch(_) => {
+                    value_sources.extend_from_slice(&sources)
+                }
                 _ => value_sources.push(*sources.last().unwrap()),
             }
             instruction_sources.push(sources);
@@ -2471,6 +3136,20 @@ impl Program {
                     let fifth = push(Node::Op(Operation::Mul, fourth, base), &mut nodes);
                     value_nodes.extend([square, fourth, fifth]);
                 }
+                Instruction::CacheBits { source, .. } => {
+                    value_nodes.push(value_nodes[*source as usize]);
+                }
+                Instruction::BitExtract {
+                    dependency, bit, ..
+                } => {
+                    let shift = push(Node::MontConstant(Fr::from(*bit as u64)), &mut nodes);
+                    let mask = push(Node::MontConstant(Fr::from(1_u64)), &mut nodes);
+                    let shifted = push(
+                        Node::Op(Operation::Shr, value_nodes[*dependency as usize], shift),
+                        &mut nodes,
+                    );
+                    value_nodes.push(push(Node::Op(Operation::Band, shifted, mask), &mut nodes));
+                }
                 Instruction::Linear3(linear) => value_nodes.push(expand_linear(
                     &self.linear3[*linear as usize],
                     &coefficient_nodes,
@@ -2519,6 +3198,50 @@ impl Program {
                                 .map(|&parameter| value_nodes[parameter as usize])
                                 .collect(),
                         },
+                        &mut nodes,
+                    ));
+                }
+                Instruction::RuntimeCallBatch(runtime_call) => {
+                    let runtime_call = &self.runtime_calls[*runtime_call as usize];
+                    let parameters = runtime_call
+                        .parameters
+                        .iter()
+                        .map(|&parameter| value_nodes[parameter as usize])
+                        .collect::<Vec<_>>();
+                    for output in 0..runtime_call.output_count {
+                        value_nodes.push(push(
+                            Node::RuntimeCall {
+                                function: runtime_call.function,
+                                call: runtime_call.call,
+                                output,
+                                output_count: runtime_call.output_count,
+                                arena_size: runtime_call.arena_size,
+                                argument_sizes: runtime_call.argument_sizes.clone(),
+                                parameters: parameters.clone(),
+                            },
+                            &mut nodes,
+                        ));
+                    }
+                }
+                Instruction::IntDivPow2 {
+                    value,
+                    shift,
+                    remainder,
+                } => {
+                    let divisor = push(
+                        Node::MontConstant(Fr::new((U256::ONE << usize::from(*shift)).into())),
+                        &mut nodes,
+                    );
+                    value_nodes.push(push(
+                        Node::Op(
+                            if *remainder {
+                                Operation::Mod
+                            } else {
+                                Operation::IDiv
+                            },
+                            value_nodes[*value as usize],
+                            divisor,
+                        ),
                         &mut nodes,
                     ));
                 }
@@ -2595,10 +3318,173 @@ fn fr_bytes(value: Fr) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::{RuntimeExpression, RuntimeFunction, RuntimeStatement};
 
     #[test]
     fn runtime_instruction_stays_compact() {
         assert!(std::mem::size_of::<Instruction>() <= 16);
+    }
+
+    #[test]
+    fn contiguous_runtime_outputs_are_materialized_by_one_instruction() {
+        let function = RuntimeFunction {
+            name: "pair".to_owned(),
+            variable_count: 2,
+            body: vec![RuntimeStatement::Return {
+                value: RuntimeExpression::Load {
+                    offset: Box::new(RuntimeExpression::Address(0)),
+                    size: 2,
+                },
+                size: 2,
+            }],
+        };
+        let nodes = vec![
+            Node::Input(0),
+            Node::Input(1),
+            Node::RuntimeCall {
+                function: 0,
+                call: 0,
+                output: 0,
+                output_count: 2,
+                arena_size: 2,
+                argument_sizes: vec![2],
+                parameters: vec![0, 1],
+            },
+            Node::RuntimeCall {
+                function: 0,
+                call: 0,
+                output: 1,
+                output_count: 2,
+                arena_size: 2,
+                argument_sizes: vec![2],
+                parameters: vec![0, 1],
+            },
+        ];
+        let original = compile(&nodes, &[2, 3], &[], vec![function.clone()]).unwrap();
+        let prepared = Program::decode(original.encode().unwrap(), vec![function.clone()])
+            .unwrap()
+            .prepare_evaluation()
+            .unwrap();
+
+        assert_eq!(
+            prepared.instruction_count(),
+            original.instruction_count() - 1
+        );
+        assert_eq!(
+            prepared
+                .instructions
+                .iter()
+                .filter(|instruction| matches!(instruction, Instruction::RuntimeCallBatch(_)))
+                .count(),
+            1
+        );
+        let inputs = [U256::from(7_u64), U256::from(11_u64)];
+        let expected = original.evaluate(&inputs, None).unwrap();
+        assert_eq!(prepared.evaluate(&inputs, None).unwrap(), expected);
+        let (prepared_nodes, prepared_outputs) = prepared.to_nodes().unwrap();
+        let round_tripped = crate::init_graph(
+            &crate::serialize_graph_with_runtime(
+                prepared_nodes,
+                prepared_outputs,
+                Vec::new(),
+                vec![function],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(round_tripped.evaluate(&inputs, None).unwrap(), expected);
+    }
+
+    #[test]
+    fn repeated_single_use_bit_extractions_share_a_canonical_cache() {
+        let nodes = vec![
+            Node::Input(0),
+            Node::Constant(U256::ZERO),
+            Node::Constant(U256::from(1_u64)),
+            Node::Op(Operation::Shr, 0, 1),
+            Node::Op(Operation::Band, 3, 2),
+            Node::Op(Operation::Shr, 0, 2),
+            Node::Op(Operation::Band, 5, 2),
+            // This shift is also an output, so replacing it with the masked bit would be invalid.
+            Node::Op(Operation::Shr, 0, 1),
+            Node::Op(Operation::Band, 7, 2),
+        ];
+        let outputs = vec![4, 6, 7, 8];
+        let original = compile(&nodes, &outputs, &[], Vec::new()).unwrap();
+        let prepared = Program::decode(original.encode().unwrap(), Vec::new())
+            .unwrap()
+            .prepare_evaluation()
+            .unwrap();
+
+        assert_eq!(prepared.bit_cache_count, 1);
+        assert_eq!(
+            prepared
+                .instructions
+                .iter()
+                .filter(|instruction| matches!(instruction, Instruction::CacheBits { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            prepared
+                .instructions
+                .iter()
+                .filter(|instruction| matches!(instruction, Instruction::BitExtract { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            prepared.instruction_count(),
+            original.instruction_count() - 1
+        );
+        assert_ne!(prepared.output_bits[0], u32::MAX);
+        assert_ne!(prepared.output_bits[1], u32::MAX);
+        assert_eq!(prepared.output_bits[2..], [u32::MAX, u32::MAX]);
+
+        let inputs = [U256::from(6_u64)];
+        let expected = original.evaluate(&inputs, None).unwrap();
+        assert_eq!(prepared.evaluate(&inputs, None).unwrap(), expected);
+        let (prepared_nodes, prepared_outputs) = prepared.to_nodes().unwrap();
+        assert_eq!(
+            crate::graph::evaluate(&prepared_nodes, &inputs, &prepared_outputs, None).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn power_of_two_integer_ops_are_lowered_to_shifts_and_masks() {
+        let nodes = vec![
+            Node::Input(0),
+            Node::Constant(U256::from(8_u64)),
+            Node::Constant(U256::from(7_u64)),
+            Node::Op(Operation::IDiv, 0, 1),
+            Node::Op(Operation::Mod, 0, 1),
+            Node::Op(Operation::IDiv, 0, 2),
+            Node::Op(Operation::Mod, 0, 2),
+        ];
+        let outputs = vec![3, 4, 5, 6];
+        let original = compile(&nodes, &outputs, &[], Vec::new()).unwrap();
+        let prepared = Program::decode(original.encode().unwrap(), Vec::new())
+            .unwrap()
+            .prepare_evaluation()
+            .unwrap();
+        assert_eq!(
+            prepared
+                .instructions
+                .iter()
+                .filter(|instruction| matches!(instruction, Instruction::IntDivPow2 { .. }))
+                .count(),
+            2
+        );
+
+        let inputs = [U256::from(29_u64)];
+        let expected = original.evaluate(&inputs, None).unwrap();
+        assert_eq!(prepared.evaluate(&inputs, None).unwrap(), expected);
+        let (prepared_nodes, prepared_outputs) = prepared.to_nodes().unwrap();
+        assert_eq!(
+            crate::graph::evaluate(&prepared_nodes, &inputs, &prepared_outputs, None).unwrap(),
+            expected
+        );
     }
 
     #[test]

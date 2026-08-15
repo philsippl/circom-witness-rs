@@ -100,6 +100,7 @@ enum Flow {
 struct Interpreter<'a> {
     functions: &'a [RuntimeFunction],
     native_functions: &'a [NativeRuntimeFunction],
+    native_bindings: &'a [Vec<usize>],
     profile: Option<&'a mut ProfileCollector>,
     steps_left: usize,
 }
@@ -121,6 +122,15 @@ impl<'a> Interpreter<'a> {
         arena_size: usize,
         result_size: usize,
     ) -> eyre::Result<Vec<Fr>> {
+        if self.profile.is_none() {
+            return self.call_inner(
+                function_id,
+                arguments,
+                argument_sizes,
+                arena_size,
+                result_size,
+            );
+        }
         let function_name = self
             .functions
             .get(function_id)
@@ -151,6 +161,60 @@ impl<'a> Interpreter<'a> {
         arena_size: usize,
         result_size: usize,
     ) -> eyre::Result<Vec<Fr>> {
+        let mut outputs = vec![Fr::from(0_u64); result_size];
+        self.call_inner_into(
+            function_id,
+            arguments,
+            argument_sizes,
+            arena_size,
+            &mut outputs,
+        )?;
+        Ok(outputs)
+    }
+
+    fn call_into(
+        &mut self,
+        function_id: usize,
+        arguments: &[Fr],
+        argument_sizes: &[usize],
+        arena_size: usize,
+        outputs: &mut [Fr],
+    ) -> eyre::Result<()> {
+        if self.profile.is_none() {
+            return self.call_inner_into(
+                function_id,
+                arguments,
+                argument_sizes,
+                arena_size,
+                outputs,
+            );
+        }
+        let function_name = self
+            .functions
+            .get(function_id)
+            .ok_or_else(|| eyre!("runtime Circom function {function_id} is missing"))?
+            .name
+            .clone();
+        let profile_token = self.profile.as_deref_mut().map(|profile| {
+            profile.enter(ProfileFrame::runtime_function(function_id, &function_name))
+        });
+        let result =
+            self.call_inner_into(function_id, arguments, argument_sizes, arena_size, outputs);
+        if let Some(token) = profile_token {
+            self.profile.as_deref_mut().unwrap().exit(token);
+        }
+        result
+    }
+
+    fn call_inner_into(
+        &mut self,
+        function_id: usize,
+        arguments: &[Fr],
+        argument_sizes: &[usize],
+        arena_size: usize,
+        outputs: &mut [Fr],
+    ) -> eyre::Result<()> {
+        let result_size = outputs.len();
         let function = self
             .functions
             .get(function_id)
@@ -172,27 +236,28 @@ impl<'a> Interpreter<'a> {
             arena_size,
             result_size,
         );
-        let mut native_outputs = vec![Fr::from(0_u64); result_size];
-        for native in self
-            .native_functions
-            .iter()
-            .filter(|native| native.matcher().matches(&function.name))
-        {
-            native_outputs.fill(Fr::from(0_u64));
+        let native_bindings = self
+            .native_bindings
+            .get(function_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        for &native in native_bindings {
+            let native = &self.native_functions[native];
+            outputs.fill(Fr::from(0_u64));
             let profile_token = self.profile.as_deref_mut().map(|profile| {
                 profile.enter(ProfileFrame::native_runtime_handler(format!(
-                    "native_runtime:{:?}",
-                    native.matcher()
+                    "native_runtime:{}",
+                    native.name()
                 )))
             });
             let result = native
-                .evaluate(call, &mut native_outputs)
-                .wrap_err_with(|| format!("native runtime function {:?} failed", native.matcher()));
+                .evaluate(call, outputs)
+                .wrap_err_with(|| format!("native runtime function {:?} failed", native.name()));
             if let Some(token) = profile_token {
                 self.profile.as_deref_mut().unwrap().exit(token);
             }
             match result? {
-                NativeRuntimeOutcome::Handled => return Ok(native_outputs),
+                NativeRuntimeOutcome::Handled => return Ok(()),
                 NativeRuntimeOutcome::Fallback => {}
             }
         }
@@ -205,14 +270,15 @@ impl<'a> Interpreter<'a> {
         }
         variables[..arguments.len()].copy_from_slice(arguments);
         match self.execute_list(&function.body, &mut variables)? {
-            Flow::Return(mut values) => {
+            Flow::Return(values) => {
                 // Circom passes the caller's requested result size to generated
                 // functions. Some real-world circuits intentionally assign a
                 // shorter returned array to a wider destination; the generated
                 // WASM copies the zero-initialized tail in that case.
-                values.resize(result_size, Fr::from(0_u64));
-                values.truncate(result_size);
-                Ok(values)
+                outputs.fill(Fr::from(0_u64));
+                let copied = values.len().min(result_size);
+                outputs[..copied].copy_from_slice(&values[..copied]);
+                Ok(())
             }
             Flow::Continue => bail!("runtime Circom function {} did not return", function.name),
         }
@@ -402,12 +468,14 @@ pub(crate) struct RuntimeInvocation<'a> {
 pub(crate) fn evaluate(
     functions: &[RuntimeFunction],
     native_functions: &[NativeRuntimeFunction],
+    native_bindings: &[Vec<usize>],
     profile: Option<&mut ProfileCollector>,
     invocation: RuntimeInvocation<'_>,
 ) -> eyre::Result<Vec<Fr>> {
     Interpreter {
         functions,
         native_functions,
+        native_bindings,
         profile,
         steps_left: 100_000_000,
     }
@@ -417,6 +485,33 @@ pub(crate) fn evaluate(
         invocation.argument_sizes,
         invocation.arena_size,
         invocation.result_size,
+    )
+}
+
+pub(crate) fn evaluate_into(
+    functions: &[RuntimeFunction],
+    native_functions: &[NativeRuntimeFunction],
+    native_bindings: &[Vec<usize>],
+    profile: Option<&mut ProfileCollector>,
+    invocation: RuntimeInvocation<'_>,
+    outputs: &mut [Fr],
+) -> eyre::Result<()> {
+    if outputs.len() != invocation.result_size {
+        bail!("runtime Circom output buffer has the wrong size");
+    }
+    Interpreter {
+        functions,
+        native_functions,
+        native_bindings,
+        profile,
+        steps_left: 100_000_000,
+    }
+    .call_into(
+        invocation.function,
+        invocation.arguments,
+        invocation.argument_sizes,
+        invocation.arena_size,
+        outputs,
     )
 }
 
@@ -477,6 +572,7 @@ mod tests {
         assert_eq!(
             evaluate(
                 &[function],
+                &[],
                 &[],
                 None,
                 RuntimeInvocation {

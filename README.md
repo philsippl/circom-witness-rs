@@ -77,7 +77,7 @@ This crate can be used in two complementary modes:
 The second mode is deliberately an extension workflow rather than a growing collection of
 circuit-specific optimizations in this repository. A downstream project owns the generated Rust
 module or companion crate, while `circom-witness-rs` supplies the stable hooks, profiler, portable
-fallback, and differential fuzz tester. See the
+fallback, and seed/BLAKE3 corpus tooling. See the
 **[autoresearch and native extension guide](docs/native-subgraphs.md)** for the full contracts and
 workflow.
 
@@ -88,8 +88,8 @@ A typical downstream project would:
    to its research agent.
 3. Have the agent add structural matchers and `NativeSubgraph` or `NativeRuntimeFunction`
    implementations to that project's own source tree.
-4. Differentially fuzz the tuned graph against the original, then compare their uninstrumented
-   benchmarks in CI.
+4. Pregenerate a seed/BLAKE3 corpus once with the original graph. Every autoresearch iteration
+   replays only those seeds against the tuned graph, then compares uninstrumented benchmarks in CI.
 5. Ship the original graph together with the verified overlay. Runtime handlers can decline
    unsupported call shapes and use the portable implementation; the application can likewise keep
    the original graph available if a static overlay no longer matches.
@@ -119,7 +119,7 @@ rest in the interpreter. A replacement names its input and output boundary using
 missing inputs, or internal values that are still used by the surrounding graph.
 
 ```rust
-use circom_witness_rs::custom::{fuzz_equivalence, FuzzConfig, NativeSubgraph};
+use circom_witness_rs::custom::{verify_fuzz_corpus, FuzzCorpus, NativeSubgraph};
 
 // These IDs are normally emitted or structurally discovered by an application-specific research
 // tool. This example replaces two graph outputs with one native call.
@@ -134,25 +134,29 @@ let replacement = NativeSubgraph::new(
 );
 let optimized = graph.customizer().native_subgraph(replacement).build()?;
 
-// Random BN254 field inputs, with a deterministic seed for reproduction.
-fuzz_equivalence(&graph, &optimized, FuzzConfig::default(), None)?;
+// Generated once by record_fuzz_corpus on the original graph, outside the research loop.
+let corpus: FuzzCorpus = serde_json::from_slice(include_bytes!("../fuzz-corpus.json"))?;
+verify_fuzz_corpus(&optimized, &corpus, None)?;
 ```
 
-Use `fuzz_equivalence_with` when inputs such as booleans or bounded integers need circuit-specific
-constraints. Native callbacks are process-local and intentionally are not serialized into graph
-files. Keep the original graph as the portable source of truth, build replacements after loading,
-and key generated matchers to the exact graph version or discover boundaries structurally.
+Use `record_fuzz_corpus_with` and `verify_fuzz_corpus_with` with the same deterministic hook when
+inputs such as booleans or bounded integers need circuit-specific constraints. A serialized corpus
+contains only each random seed and the BLAKE3 hash of its complete canonical witness. Native
+callbacks are process-local and intentionally are not serialized into graph files. Keep the
+original graph as the portable source of truth, build replacements after loading, and key generated
+matchers to the exact graph version or discover boundaries structurally.
 
 [`examples/semaphore.rs`](examples/semaphore.rs) is a complete example: circuit-specific code finds
 Semaphore's repeated Merkle-tree multiplexers, replaces each with native field arithmetic, and
-differentially fuzzes the customized graph before use.
+replays a pregenerated seed/BLAKE3 corpus against the customized graph before use.
 
 The same builder can intercept dynamic Circom functions, including calls nested inside another
 runtime function. This is useful for input-dependent bigint code such as WebAuthn:
 
 ```rust
 use circom_witness_rs::custom::{
-    NativeRuntimeFunction, NativeRuntimeOutcome, RuntimeFunctionMatcher,
+    verify_fuzz_corpus, FuzzCorpus, NativeRuntimeFunction, NativeRuntimeOutcome,
+    RuntimeFunctionMatcher,
 };
 
 let bigint = NativeRuntimeFunction::new(
@@ -170,7 +174,8 @@ let bigint = NativeRuntimeFunction::new(
     },
 );
 let optimized = graph.customizer().runtime_function(bigint).build()?;
-fuzz_equivalence(&graph, &optimized, FuzzConfig::default(), None)?;
+let corpus: FuzzCorpus = serde_json::from_slice(include_bytes!("../fuzz-corpus.json"))?;
+verify_fuzz_corpus(&optimized, &corpus, None)?;
 ```
 
 `Fallback` tries another matching handler and then the portable runtime IR, so an optimization can
@@ -179,6 +184,24 @@ available for interception. The same API is intended for replacing a whole Posei
 bigint helper, or another heavy region with code produced during an autoresearch run. See the
 [autoresearch and native extension guide](docs/native-subgraphs.md) for boundary invariants and the
 complete workflow.
+
+The [WebAuthn example and reproducibility guide](examples/webauthn/README.md) demonstrate the
+corresponding dynamic-runtime workflow. Its pinned source submodule, artifact generator, eleven
+candidate bigint handlers, call-shape coverage, pregenerated constrained seed/BLAKE3 corpus,
+provenance hashes, and before/after measurements are kept together. The handlers preserve Circom's
+argument-array boundaries and fall back to portable runtime IR for unsupported shapes:
+
+```shell
+cargo run --release --example webauthn -- \
+  --graph target/webauthn/webauthn.graph \
+  --reference target/webauthn/reference.wtns \
+  --reference-only --iterations 10
+```
+
+The final extension measured 98.481 ms versus 105.268 ms for the original hard-coded branch, making
+the extension version 6.4% faster. It matched the 3,413,073-element reference WTNS exactly and
+passed replay of a corpus pregenerated by the portable graph; see the example guide for hashes,
+seeds, cost, coverage, and complete benchmark stages.
 
 See this [example project](https://github.com/philsippl/semaphore-witness-example) for Semaphore with an example. 
 
