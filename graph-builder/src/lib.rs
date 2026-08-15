@@ -22,10 +22,34 @@ use ruint::aliases::U256;
 use circom_witness_rs::{
     graph::{self, Node, Operation},
     runtime::{RuntimeExpression, RuntimeFunction, RuntimeOperation, RuntimeStatement},
-    serialize_graph_with_runtime, HashSignalInfo, M,
+    serialize_graph_with_runtime_and_compression, validate_graph_compression_level, HashSignalInfo,
+    M,
 };
 
+pub use circom_witness_rs::DEFAULT_GRAPH_COMPRESSION_LEVEL;
+
 const CIRCOM_VERSION: &str = "2.2.2";
+
+/// Options applied while compiling and serializing a witness graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphBuildOptions {
+    /// Use Circom's O1 witness-to-signal mapping instead of the default O2 mapping.
+    pub use_o1: bool,
+    /// Zstandard compression level for the generated artifact.
+    ///
+    /// Level 19 is the size-oriented default. Negative levels favor graph-load latency at the cost
+    /// of larger artifacts; for example, `-5` is a useful latency-oriented setting.
+    pub compression_level: i32,
+}
+
+impl Default for GraphBuildOptions {
+    fn default() -> Self {
+        Self {
+            use_o1: false,
+            compression_level: DEFAULT_GRAPH_COMPRESSION_LEVEL,
+        }
+    }
+}
 
 #[derive(Default)]
 struct GraphBuilder {
@@ -1369,7 +1393,11 @@ pub fn generate_witness_graph_from_file(
     circuit_path: impl AsRef<Path>,
     library_paths: &[PathBuf],
 ) -> Result<Vec<u8>> {
-    generate_witness_graph_from_file_with_optimization(circuit_path, library_paths, false)
+    generate_witness_graph_from_file_with_options(
+        circuit_path,
+        library_paths,
+        GraphBuildOptions::default(),
+    )
 }
 
 /// Compile a Circom circuit using either its O1 or O2 witness-to-signal mapping.
@@ -1378,8 +1406,25 @@ pub fn generate_witness_graph_from_file_with_optimization(
     library_paths: &[PathBuf],
     use_o1: bool,
 ) -> Result<Vec<u8>> {
+    generate_witness_graph_from_file_with_options(
+        circuit_path,
+        library_paths,
+        GraphBuildOptions {
+            use_o1,
+            ..GraphBuildOptions::default()
+        },
+    )
+}
+
+/// Compile a Circom circuit with explicit optimization and artifact-compression options.
+pub fn generate_witness_graph_from_file_with_options(
+    circuit_path: impl AsRef<Path>,
+    library_paths: &[PathBuf],
+    options: GraphBuildOptions,
+) -> Result<Vec<u8>> {
+    validate_graph_compression_level(options.compression_level)?;
     let circuit_path = circuit_path.as_ref();
-    let circuit = compile_circuit(circuit_path, library_paths, use_o1)?;
+    let circuit = compile_circuit(circuit_path, library_paths, options.use_o1)?;
     let input_map = circuit
         .c_producer
         .main_input_list
@@ -1397,7 +1442,13 @@ pub fn generate_witness_graph_from_file_with_optimization(
     eprintln!("Graph with {} nodes", nodes.len());
     graph::optimize(&mut nodes, &mut signals);
 
-    let bytes = serialize_graph_with_runtime(nodes, signals, input_map, runtime_functions)?;
+    let bytes = serialize_graph_with_runtime_and_compression(
+        nodes,
+        signals,
+        input_map,
+        runtime_functions,
+        options.compression_level,
+    )?;
     eprintln!("Graph size: {} bytes", bytes.len());
     Ok(bytes)
 }
@@ -1413,7 +1464,23 @@ pub fn generate_witness_graph() -> Result<Vec<u8>> {
         .into_iter()
         .collect::<Vec<_>>();
     let use_o1 = env::var_os("CIRCOM_OPTIMIZATION").is_some_and(|value| value == "O1");
-    generate_witness_graph_from_file_with_optimization(&circuit_path, &library_paths, use_o1)
+    let compression_level = env::var("CIRCOM_GRAPH_COMPRESSION_LEVEL")
+        .ok()
+        .map(|value| {
+            value
+                .parse()
+                .wrap_err("CIRCOM_GRAPH_COMPRESSION_LEVEL must be a signed integer")
+        })
+        .transpose()?
+        .unwrap_or(DEFAULT_GRAPH_COMPRESSION_LEVEL);
+    generate_witness_graph_from_file_with_options(
+        &circuit_path,
+        &library_paths,
+        GraphBuildOptions {
+            use_o1,
+            compression_level,
+        },
+    )
 }
 
 /// Compile the selected circuit and write its optimized graph to `graph.bin`.

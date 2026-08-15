@@ -11,7 +11,7 @@ The repository contains two crates with a graph file as their boundary:
 1. `circom-witness-graph-builder` compiles a circuit into a static execution graph as a one-off operation.
 2. `circom-witness-rs` loads that graph and generates witness elements at runtime.
 
-In the first mode, it compiles the circuit in-process with Circom 2.2.2 and symbolically executes the compiler's typed witness IR to build an execution graph. No generated C++, native compiler, or Rust/C++ bridge is involved. The graph is optimized through constant propagation and dead code elimination, then lowered into a compact execution program with fused linear combinations, squaring, and multi-output power-of-five instructions. Constants and coefficients are pooled, references are backward-delta encoded, and the result is compressed with Zstandard. At runtime, independent field divisions are scheduled into batches that use one fast modular inversion per batch. Input-dependent function branches, loops, and array indexes are embedded as portable Circom IR and interpreted only at those graph boundaries; the rest of the witness remains precomputed. The graph can be embedded in the binary and interpreted to generate the witness. Legacy compressed and uncompressed Postcard graphs remain readable.
+In the first mode, it compiles the circuit in-process with Circom 2.2.2 and symbolically executes the compiler's typed witness IR to build an execution graph. No generated C++, native compiler, or Rust/C++ bridge is involved. The graph is optimized through constant propagation and dead code elimination, then lowered into its final compact execution plan with fused linear combinations, bit extraction caches, squaring, multi-output power-of-five instructions, runtime-call batches, and scheduled field-division batches. Constants and coefficients are pooled and the prepared plan is compressed with Zstandard. Input-dependent function branches, loops, and array indexes are embedded as portable Circom IR and interpreted only at those graph boundaries; the rest of the witness remains precomputed. The graph can be embedded in the binary and interpreted to generate the witness.
 
 ## Usage
 
@@ -22,6 +22,9 @@ cargo run --release -p circom-witness-graph-builder -- circuit.circom graph.bin
 
 Additional arguments are treated as Circom library search paths.
 For circuits whose reference artifacts use Circom O1, put `--O1` before the circuit path.
+Graph artifacts use strong zstd level 19 compression by default. Put
+`--compression-level LEVEL` before the circuit path to change it; negative levels trade larger
+artifacts for faster loading, for example `--compression-level -5`.
 
 **2. (At runtime) Generate witness:**
 ```rust
@@ -208,6 +211,21 @@ See this [example project](https://github.com/philsippl/semaphore-witness-exampl
 See `semaphore-rs` for an [example at runtime](https://github.com/worldcoin/semaphore-rs/blob/62f556bdc1a2a25021dcccc97af4dfa522ab5789/src/protocol/mod.rs#L161-L163).
 
 Graph construction is pinned to the [Circom 2.2.2 compiler source](https://github.com/iden3/circom/tree/v2.2.2), so it does not depend on whichever `circom` executable happens to be installed on the host.
+
+### Prepared graph artifacts and cold start
+
+Graph generation performs compact-program fusion, bit-extraction caching, power-of-two lowering,
+division batching, and physical instruction scheduling once. The resulting artifact contains the
+final executable plan; `init_graph` only decompresses, deserializes, restores field elements, and
+validates it. Applications never rerun optimizer passes at startup.
+
+The 0.5 crate uses prepared graph format v4 and intentionally does not load earlier graph formats.
+Regenerate graph artifacts with the matching `circom-witness-graph-builder` when upgrading. Strong
+zstd level 19 compression is the default; `--compression-level LEVEL` selects a different level at
+graph compile time. On the pinned WebAuthn circuit, the default produces an 18,012,360-byte artifact
+that loaded in a 145.7 ms median. `--compression-level -5` produces a 49,585,278-byte artifact that
+loaded in an 82.9 ms median. Both are far below the previous roughly 1.25-second runtime preparation
+path. See the [WebAuthn guide](examples/webauthn/README.md) for reproducible hashes and measurements.
 
 ### Agent-readable graph profiling
 

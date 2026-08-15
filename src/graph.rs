@@ -52,7 +52,7 @@ pub enum Operation {
     Pow,
     Land,
     IDiv,
-    // Keep new variants at the end so existing postcard graph files remain compatible.
+    // The order is part of the prepared graph format; bump its header before reordering variants.
     Bor,
     Bxor,
     Bnot,
@@ -85,14 +85,9 @@ pub(crate) struct EvaluationPlan {
     division_batches: Vec<Range<usize>>,
 }
 
-impl EvaluationPlan {
-    pub(crate) fn division_batches(&self) -> &[Range<usize>] {
-        &self.division_batches
-    }
-}
-
 /// Reorders independent nodes into division-depth layers. Each division block can then use one
 /// field inversion for the whole block, while all node references remain backwards.
+#[cfg(test)]
 pub(crate) fn prepare_evaluation(
     nodes: &mut Vec<Node>,
     outputs: &mut [usize],

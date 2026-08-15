@@ -92,12 +92,20 @@ Expected artifact identities for the pinned source and current graph format are:
 | Artifact | SHA-256 |
 |---|---|
 | Input JSON | `b635e9511a747bb0bea0278d423e3e859b24d386368186c72a8e46e4e0644657` |
-| Graph | `75daf6b5f9f225ccb739a1420f219f99259971afc85ace5539ae63987d014df9` |
+| Graph | `c41b4739b62645940f67878d6c4a83872b87bdf3be6caebf6245bc2ca72f9e0e` |
 | Reference WTNS | `294c8091d87c2dbec8bc8997d0e892b65e81d5f95a14320081dcaefea1a5e0d8` |
 | Witness field payload | `9ba7a4f38e9c11656c07e8b72cfe4b974dab27f224a4fdb60a2da83492a5c177` |
 
 The WTNS contains 3,413,073 BN254 field elements. The example compares every element, not only the
 hash.
+
+The v4 graph is a fully prepared execution plan: generic fusion, bit caching, integer lowering, and
+division scheduling happen once in `circom-witness-graph-builder`, not in every application
+process. The default level 19 zstd encoding is 18,012,360 bytes and its median file-read plus
+initialization time was 145.7 ms. Passing `--compression-level -5` to the graph builder produces a
+49,585,278-byte latency-oriented artifact that loaded in an 82.9 ms median. The previous load-time
+preparation path took roughly 1.25 seconds inside `init_graph`. `graph_load_ms` deliberately excludes
+the optional SHA-256 provenance calculation printed by the example.
 
 ## Pregenerated differential fuzz corpus
 

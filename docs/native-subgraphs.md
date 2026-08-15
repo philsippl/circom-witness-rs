@@ -62,9 +62,10 @@ multiplication, comparisons, carry witnesses, and split functions), whose meanin
 specialized array lengths. Multi-output callbacks cover helpers returning limb arrays. Repeated bit
 extractions can either be one multi-output static subgraph or a runtime-function handler, depending
 on how the builder lowered that circuit. Generic field-operation fast paths remain core runtime
-optimizations rather than extension callbacks. The prepared interpreter also collapses contiguous
-outputs of one runtime invocation into a single compact instruction and lets native handlers write
-those outputs directly into the value arena; extension authors do not need to batch them manually.
+optimizations rather than extension callbacks. During artifact generation, the prepared-program
+compiler also collapses contiguous outputs of one runtime invocation into a single compact
+instruction and lets native handlers write those outputs directly into the value arena; extension
+authors do not need to batch them manually, and applications do not rerun that pass at startup.
 
 ## Autoresearch workflow
 

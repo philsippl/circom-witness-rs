@@ -84,7 +84,7 @@ pub(crate) struct BoundBlackBoxes {
     functions: Vec<BlackBoxFunction>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum Instruction {
     Input(usize),
     Constant(u32),
@@ -113,7 +113,7 @@ enum Instruction {
         cache: u32,
         bit: u8,
     },
-    /// Unsigned integer division or remainder by `2^shift`, specialized at graph load.
+    /// Unsigned integer division or remainder by `2^shift`, specialized at graph generation.
     IntDivPow2 {
         value: u32,
         shift: u8,
@@ -121,7 +121,7 @@ enum Instruction {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct BlackBoxInstruction {
     name: String,
     parameters: Vec<u32>,
@@ -146,7 +146,7 @@ impl std::fmt::Debug for NativeInstruction {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct RuntimeCallInstruction {
     function: usize,
     call: usize,
@@ -157,37 +157,26 @@ struct RuntimeCallInstruction {
     parameters: Vec<u32>,
 }
 
-/// Stable on-disk representation. References are converted to backward deltas by `encode` and
-/// restored to absolute value IDs by `decode`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct EncodedProgram {
+/// Fully optimized executable representation stored in graph artifacts.
+///
+/// This deliberately mirrors the hot in-memory layout: graph generation performs all fusion and
+/// division scheduling once, while loading only deserializes, restores field elements, and
+/// validates the executable plan.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct PreparedProgram {
     coefficients: Vec<[u8; 32]>,
-    instructions: Vec<EncodedInstruction>,
-    output_deltas: Vec<usize>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-enum EncodedInstruction {
-    Input(usize),
-    Constant(usize),
-    Mul(usize, usize),
-    Add(usize, usize),
-    Sub(usize, usize),
-    Op(Operation, usize, usize),
-    Square(usize),
-    Pow5(usize),
-    Linear3([(usize, usize); 3]),
-    Linear4([(usize, usize); 4]),
-    BlackBox(String, Vec<usize>),
-    RuntimeCall {
-        function: usize,
-        call: usize,
-        output: usize,
-        output_count: usize,
-        arena_size: usize,
-        argument_sizes: Vec<usize>,
-        parameters: Vec<usize>,
-    },
+    instructions: Vec<Instruction>,
+    linear3: Vec<[(u32, u32); 3]>,
+    linear4: Vec<[(u32, u32); 4]>,
+    black_boxes: Vec<BlackBoxInstruction>,
+    runtime_calls: Vec<RuntimeCallInstruction>,
+    runtime_call_count: usize,
+    bit_cache_count: usize,
+    outputs: Vec<usize>,
+    output_bits: Vec<u32>,
+    division_batches: Vec<(usize, usize)>,
+    value_count: usize,
+    input_count: usize,
 }
 
 #[derive(Default)]
@@ -476,6 +465,7 @@ fn evaluate_int_div_pow2(value: U256, shift: u8, remainder: bool) -> Fr {
 
 /// Compiles nodes into the runtime program. `division_node_batches` refers to ranges in `nodes`
 /// produced by `prepare_evaluation`; pass an empty slice for a program that is only serialized.
+#[cfg(test)]
 pub(crate) fn compile(
     nodes: &[Node],
     outputs: &[usize],
@@ -2487,7 +2477,26 @@ impl Program {
     }
 
     fn validate(&self) -> eyre::Result<()> {
+        self.validate_layout(false)
+    }
+
+    fn validate_prepared(&self) -> eyre::Result<()> {
+        self.validate_layout(true)
+    }
+
+    fn validate_layout(&self, require_prepared: bool) -> eyre::Result<()> {
+        if self.bit_cache_count > self.instructions.len() {
+            bail!("program bit-cache count is inconsistent");
+        }
+        if self.runtime_call_count > self.instructions.len() {
+            bail!("program runtime-call count is inconsistent");
+        }
+        let mut initialized_bit_caches = vec![false; self.bit_cache_count];
         let mut next_value = 0_usize;
+        let mut input_count = 0_usize;
+        let mut division_count = 0_usize;
+        let mut has_individual_runtime_calls = false;
+        let mut max_runtime_call = 0_usize;
         for (index, instruction) in self.instructions.iter().enumerate() {
             let check_value = |reference: usize| -> eyre::Result<()> {
                 if reference >= next_value {
@@ -2504,7 +2513,13 @@ impl Program {
                 Ok(())
             };
             match instruction {
-                Instruction::Input(_) => {}
+                Instruction::Input(input) => {
+                    input_count = input_count.max(
+                        input
+                            .checked_add(1)
+                            .ok_or_else(|| eyre!("program input index overflowed"))?,
+                    );
+                }
                 Instruction::Constant(coefficient) => check_coefficient(*coefficient as usize)?,
                 Instruction::Mul(left, right)
                 | Instruction::Add(left, right)
@@ -2512,22 +2527,33 @@ impl Program {
                 | Instruction::Op(_, left, right) => {
                     check_value(*left as usize)?;
                     check_value(*right as usize)?;
+                    if matches!(instruction, Instruction::Op(Operation::Div, _, _)) {
+                        division_count += 1;
+                    }
                 }
                 Instruction::Square(value) | Instruction::Pow5(value) => {
                     check_value(*value as usize)?
                 }
                 Instruction::CacheBits { source, cache } => {
                     check_value(*source as usize)?;
-                    if *cache as usize >= self.bit_cache_count {
+                    let cache = *cache as usize;
+                    if cache >= self.bit_cache_count {
                         bail!("program instruction {index} references missing bit cache {cache}");
+                    }
+                    if std::mem::replace(&mut initialized_bit_caches[cache], true) {
+                        bail!("program bit cache {cache} is initialized more than once");
                     }
                 }
                 Instruction::BitExtract {
                     dependency, cache, ..
                 } => {
                     check_value(*dependency as usize)?;
-                    if *cache as usize >= self.bit_cache_count {
+                    let cache = *cache as usize;
+                    if cache >= self.bit_cache_count {
                         bail!("program instruction {index} references missing bit cache {cache}");
+                    }
+                    if !initialized_bit_caches[cache] {
+                        bail!("program instruction {index} reads uninitialized bit cache {cache}");
                     }
                 }
                 Instruction::IntDivPow2 { value, .. } => check_value(*value as usize)?,
@@ -2588,6 +2614,14 @@ impl Program {
                     {
                         bail!("runtime-call ID {} is out of bounds", runtime_call.call);
                     }
+                    has_individual_runtime_calls |=
+                        matches!(instruction, Instruction::RuntimeCall(_));
+                    max_runtime_call = max_runtime_call.max(
+                        runtime_call
+                            .call
+                            .checked_add(1)
+                            .ok_or_else(|| eyre!("runtime-call ID overflowed"))?,
+                    );
                     if runtime_call.output >= runtime_call.output_count {
                         bail!(
                             "runtime-call output {} is out of bounds",
@@ -2618,6 +2652,23 @@ impl Program {
         if next_value != self.value_count {
             bail!("program value count is inconsistent");
         }
+        if input_count != self.input_count {
+            bail!("program input count is inconsistent");
+        }
+        let expected_runtime_call_count = if has_individual_runtime_calls {
+            max_runtime_call
+        } else {
+            0
+        };
+        if expected_runtime_call_count != self.runtime_call_count {
+            bail!("program runtime-call count is inconsistent");
+        }
+        if initialized_bit_caches
+            .iter()
+            .any(|initialized| !initialized)
+        {
+            bail!("program contains an uninitialized bit cache");
+        }
         for &output in &self.outputs {
             if output >= self.value_count {
                 bail!("program output value {output} is out of bounds");
@@ -2625,6 +2676,35 @@ impl Program {
         }
         if !self.output_bits.is_empty() && self.output_bits.len() != self.outputs.len() {
             bail!("program cached bit-output annotations have the wrong length");
+        }
+        if require_prepared
+            && ((self.bit_cache_count == 0 && !self.output_bits.is_empty())
+                || (self.bit_cache_count != 0 && self.output_bits.len() != self.outputs.len()))
+        {
+            bail!("prepared program has inconsistent cached bit-output annotations");
+        }
+        for &bit in &self.output_bits {
+            if bit != u32::MAX && (bit >> 8) as usize >= self.bit_cache_count {
+                bail!("program output references a missing bit cache");
+            }
+        }
+        let mut previous_batch_end = 0_usize;
+        let mut batched_divisions = 0_usize;
+        for batch in &self.division_batches {
+            if batch.is_empty()
+                || batch.end > self.instructions.len()
+                || batch.start < previous_batch_end
+                || !self.instructions[batch.clone()]
+                    .iter()
+                    .all(|instruction| matches!(instruction, Instruction::Op(Operation::Div, _, _)))
+            {
+                bail!("program contains an invalid division batch {batch:?}");
+            }
+            batched_divisions += batch.len();
+            previous_batch_end = batch.end;
+        }
+        if require_prepared && batched_divisions != division_count {
+            bail!("prepared program does not batch every division");
         }
         if let Some(source_map) = self.source_map.get() {
             if source_map.instruction_sources.len() != self.instructions.len() {
@@ -2650,131 +2730,61 @@ impl Program {
         Ok(())
     }
 
-    pub(crate) fn encode(&self) -> eyre::Result<EncodedProgram> {
-        self.validate()?;
-        if !self.native_subgraphs.is_empty() || !self.native_runtime_functions.is_empty() {
+    pub(crate) fn into_prepared(self) -> eyre::Result<(PreparedProgram, Vec<RuntimeFunction>)> {
+        self.validate_prepared()?;
+        if !self.native_subgraphs.is_empty()
+            || !self.native_runtime_functions.is_empty()
+            || !self.native_runtime_bindings.is_empty()
+        {
             bail!("graphs with process-local native customizations cannot be serialized");
         }
-        let mut next_value = 0_usize;
-        let mut instructions = Vec::with_capacity(self.instructions.len());
-        for instruction in &self.instructions {
-            let backward = |reference: usize| {
-                next_value
-                    .checked_sub(reference + 1)
-                    .ok_or_else(|| eyre!("program reference is not backwards"))
-            };
-            let instruction = match instruction {
-                Instruction::Input(input) => EncodedInstruction::Input(*input),
-                Instruction::Constant(coefficient) => {
-                    EncodedInstruction::Constant(*coefficient as usize)
-                }
-                Instruction::Mul(left, right) => {
-                    EncodedInstruction::Mul(backward(*left as usize)?, backward(*right as usize)?)
-                }
-                Instruction::Add(left, right) => {
-                    EncodedInstruction::Add(backward(*left as usize)?, backward(*right as usize)?)
-                }
-                Instruction::Sub(left, right) => {
-                    EncodedInstruction::Sub(backward(*left as usize)?, backward(*right as usize)?)
-                }
-                Instruction::Op(operation, left, right) => EncodedInstruction::Op(
-                    *operation,
-                    backward(*left as usize)?,
-                    backward(*right as usize)?,
-                ),
-                Instruction::Square(value) => {
-                    EncodedInstruction::Square(backward(*value as usize)?)
-                }
-                Instruction::Pow5(value) => EncodedInstruction::Pow5(backward(*value as usize)?),
-                Instruction::Linear3(linear) => {
-                    let terms = &self.linear3[*linear as usize];
-                    EncodedInstruction::Linear3([
-                        (backward(terms[0].0 as usize)?, terms[0].1 as usize),
-                        (backward(terms[1].0 as usize)?, terms[1].1 as usize),
-                        (backward(terms[2].0 as usize)?, terms[2].1 as usize),
-                    ])
-                }
-                Instruction::Linear4(linear) => {
-                    let terms = &self.linear4[*linear as usize];
-                    EncodedInstruction::Linear4([
-                        (backward(terms[0].0 as usize)?, terms[0].1 as usize),
-                        (backward(terms[1].0 as usize)?, terms[1].1 as usize),
-                        (backward(terms[2].0 as usize)?, terms[2].1 as usize),
-                        (backward(terms[3].0 as usize)?, terms[3].1 as usize),
-                    ])
-                }
-                Instruction::BlackBox(black_box) => {
-                    let black_box = &self.black_boxes[*black_box as usize];
-                    EncodedInstruction::BlackBox(
-                        black_box.name.clone(),
-                        black_box
-                            .parameters
-                            .iter()
-                            .map(|&parameter| backward(parameter as usize))
-                            .collect::<eyre::Result<Vec<_>>>()?,
-                    )
-                }
-                Instruction::Native(_) => unreachable!("native subgraphs were rejected above"),
-                Instruction::CacheBits { .. }
-                | Instruction::BitExtract { .. }
-                | Instruction::IntDivPow2 { .. }
-                | Instruction::RuntimeCallBatch(_) => {
-                    bail!("evaluation-only instructions cannot be serialized")
-                }
-                Instruction::RuntimeCall(runtime_call) => {
-                    let runtime_call = &self.runtime_calls[*runtime_call as usize];
-                    EncodedInstruction::RuntimeCall {
-                        function: runtime_call.function,
-                        call: runtime_call.call,
-                        output: runtime_call.output,
-                        output_count: runtime_call.output_count,
-                        arena_size: runtime_call.arena_size,
-                        argument_sizes: runtime_call.argument_sizes.clone(),
-                        parameters: runtime_call
-                            .parameters
-                            .iter()
-                            .map(|&parameter| backward(parameter as usize))
-                            .collect::<eyre::Result<Vec<_>>>()?,
-                    }
-                }
-            };
-            instructions.push(instruction);
-            next_value += self.instruction_output_count(&self.instructions[instructions.len() - 1]);
-        }
 
-        let mut previous = 0_usize;
-        let output_deltas = self
-            .outputs
-            .iter()
-            .map(|&output| {
-                let encoded = if output >= previous {
-                    output
-                        .checked_sub(previous)
-                        .and_then(|delta| delta.checked_mul(2))
-                } else {
-                    previous
-                        .checked_sub(output)
-                        .and_then(|delta| delta.checked_mul(2))
-                        .and_then(|delta| delta.checked_sub(1))
-                }
-                .ok_or_else(|| eyre!("program output delta overflowed"))?;
-                previous = output;
-                Ok(encoded)
-            })
-            .collect::<eyre::Result<Vec<_>>>()?;
-
-        Ok(EncodedProgram {
-            coefficients: self.coefficients.iter().copied().map(fr_bytes).collect(),
+        let Program {
+            coefficients,
             instructions,
-            output_deltas,
-        })
+            linear3,
+            linear4,
+            black_boxes,
+            native_subgraphs: _,
+            runtime_functions,
+            native_runtime_functions: _,
+            native_runtime_bindings: _,
+            runtime_calls,
+            runtime_call_count,
+            bit_cache_count,
+            outputs,
+            output_bits,
+            division_batches,
+            value_count,
+            input_count,
+            source_map: _,
+        } = self;
+        let prepared = PreparedProgram {
+            coefficients: coefficients.into_iter().map(fr_bytes).collect(),
+            instructions,
+            linear3,
+            linear4,
+            black_boxes,
+            runtime_calls,
+            runtime_call_count,
+            bit_cache_count,
+            outputs,
+            output_bits,
+            division_batches: division_batches
+                .into_iter()
+                .map(|batch| (batch.start, batch.end))
+                .collect(),
+            value_count,
+            input_count,
+        };
+        Ok((prepared, runtime_functions))
     }
 
-    pub(crate) fn decode(
-        encoded: EncodedProgram,
+    pub(crate) fn from_prepared(
+        prepared: PreparedProgram,
         runtime_functions: Vec<RuntimeFunction>,
     ) -> eyre::Result<Self> {
-        let coefficients = encoded
+        let coefficients = prepared
             .coefficients
             .into_iter()
             .map(|bytes| {
@@ -2785,190 +2795,33 @@ impl Program {
                 Ok(Fr::new(value.into()))
             })
             .collect::<eyre::Result<Vec<_>>>()?;
-        let mut instructions = Vec::with_capacity(encoded.instructions.len());
-        let mut linear3 = Vec::new();
-        let mut linear4 = Vec::new();
-        let mut black_boxes = Vec::new();
-        let mut runtime_calls = Vec::new();
-        let mut runtime_call_count = 0_usize;
-        let mut next_value = 0_usize;
-        let mut input_count = 0_usize;
-        for encoded_instruction in encoded.instructions {
-            let absolute = |distance: usize| {
-                next_value
-                    .checked_sub(
-                        distance
-                            .checked_add(1)
-                            .ok_or_else(|| eyre!("program reference distance overflowed"))?,
-                    )
-                    .ok_or_else(|| {
-                        eyre!("program reference distance {distance} is invalid at value {next_value}")
-                    })
-            };
-            let instruction = match encoded_instruction {
-                EncodedInstruction::Input(input) => {
-                    input_count = input_count.max(
-                        input
-                            .checked_add(1)
-                            .ok_or_else(|| eyre!("input index overflowed"))?,
-                    );
-                    Instruction::Input(input)
-                }
-                EncodedInstruction::Constant(coefficient) => {
-                    Instruction::Constant(narrow_id(coefficient, "coefficient ID")?)
-                }
-                EncodedInstruction::Mul(left, right) => Instruction::Mul(
-                    narrow_id(absolute(left)?, "value ID")?,
-                    narrow_id(absolute(right)?, "value ID")?,
-                ),
-                EncodedInstruction::Add(left, right) => Instruction::Add(
-                    narrow_id(absolute(left)?, "value ID")?,
-                    narrow_id(absolute(right)?, "value ID")?,
-                ),
-                EncodedInstruction::Sub(left, right) => Instruction::Sub(
-                    narrow_id(absolute(left)?, "value ID")?,
-                    narrow_id(absolute(right)?, "value ID")?,
-                ),
-                EncodedInstruction::Op(operation, left, right) => Instruction::Op(
-                    operation,
-                    narrow_id(absolute(left)?, "value ID")?,
-                    narrow_id(absolute(right)?, "value ID")?,
-                ),
-                EncodedInstruction::Square(value) => {
-                    Instruction::Square(narrow_id(absolute(value)?, "value ID")?)
-                }
-                EncodedInstruction::Pow5(value) => {
-                    Instruction::Pow5(narrow_id(absolute(value)?, "value ID")?)
-                }
-                EncodedInstruction::Linear3(terms) => {
-                    let index = narrow_id(linear3.len(), "linear3 ID")?;
-                    linear3.push([
-                        (
-                            narrow_id(absolute(terms[0].0)?, "value ID")?,
-                            narrow_id(terms[0].1, "coefficient ID")?,
-                        ),
-                        (
-                            narrow_id(absolute(terms[1].0)?, "value ID")?,
-                            narrow_id(terms[1].1, "coefficient ID")?,
-                        ),
-                        (
-                            narrow_id(absolute(terms[2].0)?, "value ID")?,
-                            narrow_id(terms[2].1, "coefficient ID")?,
-                        ),
-                    ]);
-                    Instruction::Linear3(index)
-                }
-                EncodedInstruction::Linear4(terms) => {
-                    let index = narrow_id(linear4.len(), "linear4 ID")?;
-                    linear4.push([
-                        (
-                            narrow_id(absolute(terms[0].0)?, "value ID")?,
-                            narrow_id(terms[0].1, "coefficient ID")?,
-                        ),
-                        (
-                            narrow_id(absolute(terms[1].0)?, "value ID")?,
-                            narrow_id(terms[1].1, "coefficient ID")?,
-                        ),
-                        (
-                            narrow_id(absolute(terms[2].0)?, "value ID")?,
-                            narrow_id(terms[2].1, "coefficient ID")?,
-                        ),
-                        (
-                            narrow_id(absolute(terms[3].0)?, "value ID")?,
-                            narrow_id(terms[3].1, "coefficient ID")?,
-                        ),
-                    ]);
-                    Instruction::Linear4(index)
-                }
-                EncodedInstruction::BlackBox(name, parameters) => {
-                    let index = narrow_id(black_boxes.len(), "black-box ID")?;
-                    black_boxes.push(BlackBoxInstruction {
-                        name,
-                        parameters: parameters
-                            .into_iter()
-                            .map(|parameter| narrow_id(absolute(parameter)?, "value ID"))
-                            .collect::<eyre::Result<Vec<_>>>()?,
-                    });
-                    Instruction::BlackBox(index)
-                }
-                EncodedInstruction::RuntimeCall {
-                    function,
-                    call,
-                    output,
-                    output_count,
-                    arena_size,
-                    argument_sizes,
-                    parameters,
-                } => {
-                    let index = narrow_id(runtime_calls.len(), "runtime-call ID")?;
-                    runtime_call_count = runtime_call_count.max(
-                        call.checked_add(1)
-                            .ok_or_else(|| eyre!("runtime-call ID overflowed"))?,
-                    );
-                    runtime_calls.push(RuntimeCallInstruction {
-                        function,
-                        call,
-                        output,
-                        output_count,
-                        arena_size,
-                        argument_sizes,
-                        parameters: parameters
-                            .into_iter()
-                            .map(|parameter| narrow_id(absolute(parameter)?, "value ID"))
-                            .collect::<eyre::Result<Vec<_>>>()?,
-                    });
-                    Instruction::RuntimeCall(index)
-                }
-            };
-            next_value = next_value
-                .checked_add(if matches!(instruction, Instruction::Pow5(_)) {
-                    3
-                } else {
-                    1
-                })
-                .ok_or_else(|| eyre!("program value count overflowed"))?;
-            instructions.push(instruction);
-        }
-
-        let mut previous = 0_usize;
-        let outputs = encoded
-            .output_deltas
-            .into_iter()
-            .map(|delta| {
-                let output = if delta & 1 == 0 {
-                    previous.checked_add(delta / 2)
-                } else {
-                    previous.checked_sub(delta / 2 + 1)
-                }
-                .ok_or_else(|| eyre!("program output delta is invalid"))?;
-                previous = output;
-                Ok(output)
-            })
-            .collect::<eyre::Result<Vec<_>>>()?;
-
         let program = Self {
             coefficients,
-            instructions,
-            linear3,
-            linear4,
-            black_boxes,
+            instructions: prepared.instructions,
+            linear3: prepared.linear3,
+            linear4: prepared.linear4,
+            black_boxes: prepared.black_boxes,
             native_subgraphs: Vec::new(),
             runtime_functions,
             native_runtime_functions: Vec::new(),
             native_runtime_bindings: Vec::new(),
-            runtime_calls,
-            runtime_call_count,
-            bit_cache_count: 0,
-            outputs,
-            output_bits: Vec::new(),
-            division_batches: Vec::new(),
-            value_count: next_value,
-            input_count,
+            runtime_calls: prepared.runtime_calls,
+            runtime_call_count: prepared.runtime_call_count,
+            bit_cache_count: prepared.bit_cache_count,
+            outputs: prepared.outputs,
+            output_bits: prepared.output_bits,
+            division_batches: prepared
+                .division_batches
+                .into_iter()
+                .map(|(start, end)| start..end)
+                .collect(),
+            value_count: prepared.value_count,
+            input_count: prepared.input_count,
             source_map: OnceLock::new(),
         };
         program
-            .validate()
-            .wrap_err("invalid encoded witness program")?;
+            .validate_prepared()
+            .wrap_err("invalid prepared witness program")?;
         Ok(program)
     }
 
@@ -3361,10 +3214,7 @@ mod tests {
             },
         ];
         let original = compile(&nodes, &[2, 3], &[], vec![function.clone()]).unwrap();
-        let prepared = Program::decode(original.encode().unwrap(), vec![function.clone()])
-            .unwrap()
-            .prepare_evaluation()
-            .unwrap();
+        let prepared = original.clone().prepare_evaluation().unwrap();
 
         assert_eq!(
             prepared.instruction_count(),
@@ -3411,10 +3261,7 @@ mod tests {
         ];
         let outputs = vec![4, 6, 7, 8];
         let original = compile(&nodes, &outputs, &[], Vec::new()).unwrap();
-        let prepared = Program::decode(original.encode().unwrap(), Vec::new())
-            .unwrap()
-            .prepare_evaluation()
-            .unwrap();
+        let prepared = original.clone().prepare_evaluation().unwrap();
 
         assert_eq!(prepared.bit_cache_count, 1);
         assert_eq!(
@@ -3464,10 +3311,7 @@ mod tests {
         ];
         let outputs = vec![3, 4, 5, 6];
         let original = compile(&nodes, &outputs, &[], Vec::new()).unwrap();
-        let prepared = Program::decode(original.encode().unwrap(), Vec::new())
-            .unwrap()
-            .prepare_evaluation()
-            .unwrap();
+        let prepared = original.clone().prepare_evaluation().unwrap();
         assert_eq!(
             prepared
                 .instructions
@@ -3554,7 +3398,12 @@ mod tests {
             .iter()
             .any(|instruction| matches!(instruction, Instruction::Pow5(_))));
 
-        let decoded = Program::decode(program.encode().unwrap(), Vec::new()).unwrap();
+        let (prepared, runtime_functions) = program
+            .prepare_evaluation()
+            .unwrap()
+            .into_prepared()
+            .unwrap();
+        let decoded = Program::from_prepared(prepared, runtime_functions).unwrap();
         let inputs = [U256::from(3_u64), U256::from(2_u64)];
         assert_eq!(
             crate::graph::evaluate(&nodes, &inputs, &outputs, None).unwrap(),
@@ -3570,20 +3419,27 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_forward_references_and_noncanonical_coefficients() {
-        let invalid_reference = EncodedProgram {
-            coefficients: Vec::new(),
-            instructions: vec![EncodedInstruction::Square(0)],
-            output_deltas: vec![0],
-        };
-        assert!(Program::decode(invalid_reference, Vec::new()).is_err());
+    fn prepared_program_rejects_forward_references_and_noncanonical_coefficients() {
+        let program = compile(&[Node::Input(0)], &[0], &[], Vec::new())
+            .unwrap()
+            .prepare_evaluation()
+            .unwrap();
+        let (mut invalid_reference, runtime_functions) = program.into_prepared().unwrap();
+        invalid_reference.instructions[0] = Instruction::Square(0);
+        assert!(Program::from_prepared(invalid_reference, runtime_functions).is_err());
 
-        let invalid_coefficient = EncodedProgram {
-            coefficients: vec![M.to_le_bytes()],
-            instructions: vec![EncodedInstruction::Constant(0)],
-            output_deltas: vec![0],
-        };
-        assert!(Program::decode(invalid_coefficient, Vec::new()).is_err());
+        let program = compile(
+            &[Node::MontConstant(Fr::from(1_u64))],
+            &[0],
+            &[],
+            Vec::new(),
+        )
+        .unwrap()
+        .prepare_evaluation()
+        .unwrap();
+        let (mut invalid_coefficient, runtime_functions) = program.into_prepared().unwrap();
+        invalid_coefficient.coefficients[0] = M.to_le_bytes();
+        assert!(Program::from_prepared(invalid_coefficient, runtime_functions).is_err());
     }
 
     #[test]
@@ -3635,7 +3491,12 @@ mod tests {
         }
         let outputs = [nodes.len() - 1];
         let program = compile(&nodes, &outputs, &[], Vec::new()).unwrap();
-        let decoded = Program::decode(program.encode().unwrap(), Vec::new()).unwrap();
+        let (prepared, runtime_functions) = program
+            .prepare_evaluation()
+            .unwrap()
+            .into_prepared()
+            .unwrap();
+        let decoded = Program::from_prepared(prepared, runtime_functions).unwrap();
         let (expanded, expanded_outputs) = decoded.to_nodes().unwrap();
         compile(&expanded, &expanded_outputs, &[], Vec::new()).unwrap();
     }

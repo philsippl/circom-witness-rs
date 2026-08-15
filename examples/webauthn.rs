@@ -926,9 +926,10 @@ fn main() -> eyre::Result<()> {
 
     let graph_started = Instant::now();
     let graph_bytes = fs::read(&config.graph).wrap_err("failed to read graph")?;
-    let graph_hash = sha256(&graph_bytes);
     let original = init_graph(&graph_bytes)?;
     let graph_load = graph_started.elapsed();
+    // Artifact hashing is provenance work, not part of witness-generator cold start.
+    let graph_hash = sha256(&graph_bytes);
     let input_bytes = fs::read(&config.input).wrap_err("failed to read input JSON")?;
     let input_hash = sha256(&input_bytes);
     let inputs = read_inputs(&config.input)?;
