@@ -6,3 +6,7 @@
 	path = graph-builder/tests/fixtures/circomlib
 	url = https://github.com/iden3/circomlib.git
 	shallow = true
+[submodule "examples-webauthn-source"]
+	path = examples/webauthn/webauthn-circom
+	url = https://github.com/privacy-ethereum/webauth-circom.git
+	shallow = true

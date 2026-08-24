@@ -11,7 +11,7 @@ The repository contains two crates with a graph file as their boundary:
 1. `circom-witness-graph-builder` compiles a circuit into a static execution graph as a one-off operation.
 2. `circom-witness-rs` loads that graph and generates witness elements at runtime.
 
-In the first mode, it compiles the circuit in-process with Circom 2.2.2 and symbolically executes the compiler's typed witness IR to build an execution graph. No generated C++, native compiler, or Rust/C++ bridge is involved. The graph is optimized through constant propagation and dead code elimination, then lowered into a compact execution program with fused linear combinations, squaring, and multi-output power-of-five instructions. Constants and coefficients are pooled, references are backward-delta encoded, and the result is compressed with Zstandard. At runtime, independent field divisions are scheduled into batches that use one fast modular inversion per batch. Input-dependent function branches, loops, and array indexes are embedded as portable Circom IR and interpreted only at those graph boundaries; the rest of the witness remains precomputed. The graph can be embedded in the binary and interpreted to generate the witness. Legacy compressed and uncompressed Postcard graphs remain readable.
+In the first mode, it compiles the circuit in-process with Circom 2.2.2 and symbolically executes the compiler's typed witness IR to build an execution graph. No generated C++, native compiler, or Rust/C++ bridge is involved. The graph is optimized through constant propagation and dead code elimination, then lowered into its final compact execution plan with fused linear combinations, bit extraction caches, squaring, multi-output power-of-five instructions, runtime-call batches, and scheduled field-division batches. Constants and coefficients are pooled and the prepared plan is compressed with Zstandard. Input-dependent function branches, loops, and array indexes are embedded as portable Circom IR and interpreted only at those graph boundaries; the rest of the witness remains precomputed. The graph can be embedded in the binary and interpreted to generate the witness.
 
 ## Usage
 
@@ -22,6 +22,9 @@ cargo run --release -p circom-witness-graph-builder -- circuit.circom graph.bin
 
 Additional arguments are treated as Circom library search paths.
 For circuits whose reference artifacts use Circom O1, put `--O1` before the circuit path.
+Graph artifacts use strong zstd level 19 compression by default. Put
+`--compression-level LEVEL` before the circuit path to change it; negative levels trade larger
+artifacts for faster loading, for example `--compression-level -5`.
 
 **2. (At runtime) Generate witness:**
 ```rust
@@ -64,11 +67,205 @@ let witness: &[U256] = evaluator.evaluate(&inputs_buffer).unwrap();
 The evaluator resolves black-box callbacks once and reuses its execution and output buffers. The
 returned witness slice is overwritten by the next call to `evaluate` on that evaluator.
 
+### Two modes: off the shelf or autoresearch-tuned
+
+This crate can be used in two complementary modes:
+
+- **Off the shelf:** load a generated graph and evaluate it with the portable interpreter. This is
+  the default: no circuit-specific Rust, research step, or maintenance burden is required.
+- **Autoresearch-tuned:** keep the same graph as the canonical implementation, but let an LLM agent
+  profile one important circuit and generate project-local native implementations for its hottest
+  repeated subgraphs or dynamic functions. The rest of the witness still runs in the interpreter.
+
+The second mode is deliberately an extension workflow rather than a growing collection of
+circuit-specific optimizations in this repository. A downstream project owns the generated Rust
+module or companion crate, while `circom-witness-rs` supplies the stable hooks, profiler, portable
+fallback, and seed/BLAKE3 corpus tooling. See the
+**[autoresearch and native extension guide](docs/native-subgraphs.md)** for the full contracts and
+workflow.
+
+A typical downstream project would:
+
+1. Generate and retain the ordinary graph artifact.
+2. Run `circom-witness-profile` on representative inputs and give the JSON or LLM-oriented report
+   to its research agent.
+3. Have the agent add structural matchers and `NativeSubgraph` or `NativeRuntimeFunction`
+   implementations to that project's own source tree.
+4. Pregenerate a seed/BLAKE3 corpus once with the original graph. Every autoresearch iteration
+   replays only those seeds against the tuned graph, then compares uninstrumented benchmarks in CI.
+5. Ship the original graph together with the verified overlay. Runtime handlers can decline
+   unsupported call shapes and use the portable implementation; the application can likewise keep
+   the original graph available if a static overlay no longer matches.
+6. Pin or hash the graph artifact and repeat the research workflow when the circuit changes.
+
+This makes tuning optional and incremental: start with the off-the-shelf evaluator, then specialize
+only projects where witness-generation latency justifies maintaining circuit-specific native code.
+Conceptually, the native overlay is a fine-tuning layer for one circuit: it specializes the generic
+witness engine without forking it or giving up the interpreter as the reference implementation.
+
+Production integration remains a normal library call. The downstream optimization module accepts
+the portable graph and returns a customized `Graph`; omitting that one step selects the off-the-shelf
+mode:
+
+```rust
+let portable = circom_witness_rs::init_graph(include_bytes!("../circuit.graph"))?;
+let graph = my_circuit_optimizations::apply(&portable)?; // Omit for off-the-shelf mode.
+let mut evaluator = graph.evaluator(None)?;
+let witness = evaluator.evaluate(&input_buffer)?;
+```
+
+### Native witness extensions
+
+Applications can replace expensive regions of a loaded graph with native Rust while leaving the
+rest in the interpreter. A replacement names its input and output boundary using node IDs from
+`Graph::nodes()`. The library traces the region between those boundaries and rejects overlaps,
+missing inputs, or internal values that are still used by the surrounding graph.
+
+```rust
+use circom_witness_rs::custom::{verify_fuzz_corpus, FuzzCorpus, NativeSubgraph};
+
+// These IDs are normally emitted or structurally discovered by an application-specific research
+// tool. This example replaces two graph outputs with one native call.
+let replacement = NativeSubgraph::new(
+    "native-heavy-region",
+    vec![input_a_node, input_b_node],
+    vec![output_node, intermediate_output_node],
+    |inputs, outputs| {
+        outputs[0] = native_implementation(inputs[0], inputs[1]);
+        outputs[1] = another_native_output(inputs[0], inputs[1]);
+    },
+);
+let optimized = graph.customizer().native_subgraph(replacement).build()?;
+
+// Generated once by record_fuzz_corpus on the original graph, outside the research loop.
+let corpus: FuzzCorpus = serde_json::from_slice(include_bytes!("../fuzz-corpus.json"))?;
+verify_fuzz_corpus(&optimized, &corpus, None)?;
+```
+
+Use `record_fuzz_corpus_with` and `verify_fuzz_corpus_with` with the same deterministic hook when
+inputs such as booleans or bounded integers need circuit-specific constraints. A serialized corpus
+contains only each random seed and the BLAKE3 hash of its complete canonical witness. Native
+callbacks are process-local and intentionally are not serialized into graph files. Keep the
+original graph as the portable source of truth, build replacements after loading, and key generated
+matchers to the exact graph version or discover boundaries structurally.
+
+[`examples/semaphore.rs`](examples/semaphore.rs) is a complete example: circuit-specific code finds
+Semaphore's repeated Merkle-tree multiplexers, replaces each with native field arithmetic, and
+replays a pregenerated seed/BLAKE3 corpus against the customized graph before use.
+
+The same builder can intercept dynamic Circom functions, including calls nested inside another
+runtime function. This is useful for input-dependent bigint code such as WebAuthn:
+
+```rust
+use circom_witness_rs::custom::{
+    verify_fuzz_corpus, FuzzCorpus, NativeRuntimeFunction, NativeRuntimeOutcome,
+    RuntimeFunctionMatcher,
+};
+
+let bigint = NativeRuntimeFunction::new(
+    RuntimeFunctionMatcher::numeric_suffix("long_div2"),
+    |call, outputs| {
+        // Exact array boundaries are retained even though Circom passes a flat field buffer.
+        let Some(dividend) = call.argument(0) else {
+            return NativeRuntimeOutcome::Fallback;
+        };
+        if !supported_shape(call.argument_sizes(), call.result_count()) {
+            return NativeRuntimeOutcome::Fallback;
+        }
+        native_long_div2(dividend, call.arguments(), outputs);
+        NativeRuntimeOutcome::Handled
+    },
+);
+let optimized = graph.customizer().runtime_function(bigint).build()?;
+let corpus: FuzzCorpus = serde_json::from_slice(include_bytes!("../fuzz-corpus.json"))?;
+verify_fuzz_corpus(&optimized, &corpus, None)?;
+```
+
+`Fallback` tries another matching handler and then the portable runtime IR, so an optimization can
+support only the call shapes it understands. `Graph::runtime_function_names()` lists the functions
+available for interception. The same API is intended for replacing a whole Poseidon permutation,
+bigint helper, or another heavy region with code produced during an autoresearch run. See the
+[autoresearch and native extension guide](docs/native-subgraphs.md) for boundary invariants and the
+complete workflow.
+
+The [WebAuthn example and reproducibility guide](examples/webauthn/README.md) demonstrate the
+corresponding dynamic-runtime workflow. Its pinned source submodule, artifact generator, eleven
+candidate bigint handlers, call-shape coverage, pregenerated constrained seed/BLAKE3 corpus,
+provenance hashes, and before/after measurements are kept together. The handlers preserve Circom's
+argument-array boundaries and fall back to portable runtime IR for unsupported shapes:
+
+```shell
+cargo run --release --example webauthn -- \
+  --graph target/webauthn/webauthn.graph \
+  --reference target/webauthn/reference.wtns \
+  --reference-only --iterations 10
+```
+
+The final extension measured 98.481 ms versus 105.268 ms for the original hard-coded branch, making
+the extension version 6.4% faster. It matched the 3,413,073-element reference WTNS exactly and
+passed replay of a corpus pregenerated by the portable graph; see the example guide for hashes,
+seeds, cost, coverage, and complete benchmark stages.
+
 See this [example project](https://github.com/philsippl/semaphore-witness-example) for Semaphore with an example. 
 
 See `semaphore-rs` for an [example at runtime](https://github.com/worldcoin/semaphore-rs/blob/62f556bdc1a2a25021dcccc97af4dfa522ab5789/src/protocol/mod.rs#L161-L163).
 
 Graph construction is pinned to the [Circom 2.2.2 compiler source](https://github.com/iden3/circom/tree/v2.2.2), so it does not depend on whichever `circom` executable happens to be installed on the host.
+
+### Prepared graph artifacts and cold start
+
+Graph generation performs compact-program fusion, bit-extraction caching, power-of-two lowering,
+division batching, and physical instruction scheduling once. The resulting artifact contains the
+final executable plan; `init_graph` only decompresses, deserializes, restores field elements, and
+validates it. Applications never rerun optimizer passes at startup.
+
+The 0.5 crate uses prepared graph format v4 and intentionally does not load earlier graph formats.
+Regenerate graph artifacts with the matching `circom-witness-graph-builder` when upgrading. Strong
+zstd level 19 compression is the default; `--compression-level LEVEL` selects a different level at
+graph compile time. On the pinned WebAuthn circuit, the default produces an 18,012,360-byte artifact
+that loaded in a 145.7 ms median. `--compression-level -5` produces a 49,585,278-byte artifact that
+loaded in an 82.9 ms median. Both are far below the previous roughly 1.25-second runtime preparation
+path. See the [WebAuthn guide](examples/webauthn/README.md) for reproducible hashes and measurements.
+
+### Agent-readable graph profiling
+
+`circom-witness-profile` benchmarks a graph with real Circom input JSON and emits a structured,
+flamegraph-like trace:
+
+```shell
+cargo run --release --bin circom-witness-profile -- \
+  graph.bin input.json --iterations 50 --trace-iterations 2 --top 40 --format llm
+```
+
+The default line format uses stable record types (`PROFILE`, `BENCHMARK`, `TRACE`, `MIX`,
+`STRUCTURE`, `SELF`, and `INCLUSIVE`) plus explicit key/value fields and JSON-encoded stack paths.
+`--format json` emits the complete typed report, while `--format folded` emits conventional
+semicolon-separated collapsed stacks. `--output profile.json` writes any format to a file.
+
+Latency statistics come from uninstrumented evaluations. Hotspots come from a separate instrumented
+trace and therefore do not distort the reported mean, p50, or p95. Ordinary arithmetic instructions
+are timed in low-overhead ranges of 128 compact instructions by default; use `--block-size N` to
+change the resolution. Runtime functions, nested calls, black boxes, native subgraphs, and native
+runtime handlers receive their own stack frames.
+
+Every instruction hotspot includes half-open `source_node_ranges` into the loaded
+`Graph::nodes()` view. `STRUCTURE` records group repeated arithmetic shapes, stop at shared values
+and graph outputs, and provide sample root, covered, and boundary node IDs that an agent can use to
+generate `NativeSubgraph` matchers. Their times are estimates apportioned from measured instruction
+blocks; run with a smaller `--block-size` when ranking nearby candidates, then trust the
+uninstrumented before/after benchmark for the final decision.
+
+Customized graphs can be profiled directly through the library API:
+
+```rust
+use circom_witness_rs::profile::{profile_graph, ProfileConfig};
+
+let report = profile_graph(&optimized, &input_buffer, None, ProfileConfig::default())?;
+println!("{}", report.to_json_pretty()?);
+```
+
+The CLI cannot construct application-specific black-box or native callbacks; applications using
+those should call `profile_graph` after building their customized `Graph`.
 
 ## Licensing
 
