@@ -8,3 +8,4 @@ constants.dat
 Cargo.lock
 .claude
 *.bin
+!tests/fixtures/semaphore/graph-v0.3.0.bin

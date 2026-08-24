@@ -1,5 +1,6 @@
 pub mod custom;
 pub mod graph;
+mod legacy;
 pub mod profile;
 mod program;
 #[doc(hidden)]
@@ -23,6 +24,7 @@ pub const M: U256 =
     uint!(21888242871839275222246405745257275088548364400416034343698204186575808495617_U256);
 
 const GRAPH_HEADER: &[u8; 8] = b"CWGR\x04PZ\0";
+const GRAPH_MAGIC: &[u8; 4] = b"CWGR";
 #[doc(hidden)]
 pub const DEFAULT_GRAPH_COMPRESSION_LEVEL: i32 = 19;
 
@@ -39,7 +41,6 @@ pub fn validate_graph_compression_level(compression_level: i32) -> eyre::Result<
         ))
     }
 }
-
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HashSignalInfo {
     pub hash: u64,
@@ -268,8 +269,19 @@ fn fnv1a(s: &str) -> u64 {
     hash
 }
 
-/// Loads the graph from bytes
+/// Loads either the current graph format or an unversioned v0.3.0-and-earlier graph.
 pub fn init_graph(graph_bytes: &[u8]) -> eyre::Result<Graph> {
+    if !graph_bytes.starts_with(GRAPH_MAGIC) {
+        let (nodes, signals, input_mapping) = legacy::decode(graph_bytes)?;
+        let program = program::compile_for_serialization(&nodes, &signals, Vec::new())?
+            .prepare_evaluation()?;
+        return Ok(Graph {
+            compatibility: OnceLock::from(CompatibilityGraph { nodes, signals }),
+            input_mapping,
+            program,
+        });
+    }
+
     let payload = graph_bytes
         .strip_prefix(GRAPH_HEADER)
         .ok_or_else(|| eyre!("unsupported witness graph format"))?;
@@ -503,10 +515,17 @@ mod tests {
     }
 
     #[test]
-    fn unknown_graph_versions_are_rejected() {
-        let error = init_graph(b"CWGR\x03FZ\0payload").err().unwrap();
-        assert!(error
-            .to_string()
-            .contains("unsupported witness graph format"));
+    fn intermediate_and_unknown_graph_versions_are_rejected() {
+        for bytes in [
+            b"CWGR\x01DZ\0payload".as_slice(),
+            b"CWGR\x02FZ\0payload".as_slice(),
+            b"CWGR\x03FZ\0payload".as_slice(),
+            b"CWGR\x05PZ\0payload".as_slice(),
+        ] {
+            let error = init_graph(bytes).err().unwrap();
+            assert!(error
+                .to_string()
+                .contains("unsupported witness graph format"));
+        }
     }
 }
