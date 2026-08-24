@@ -1,4 +1,6 @@
+pub mod custom;
 pub mod graph;
+pub mod profile;
 mod program;
 #[doc(hidden)]
 pub mod runtime;
@@ -20,11 +22,23 @@ pub type BlackBoxFunction = Arc<dyn Fn(&[Fr]) -> Fr + Send + Sync + 'static>;
 pub const M: U256 =
     uint!(21888242871839275222246405745257275088548364400416034343698204186575808495617_U256);
 
-const LEGACY_GRAPH_HEADER: &[u8; 8] = b"CWGR\x01DZ\0";
-const PREVIOUS_FUSED_GRAPH_HEADER: &[u8; 8] = b"CWGR\x02FZ\0";
-const GRAPH_HEADER: &[u8; 8] = b"CWGR\x03FZ\0";
-const GRAPH_MAGIC: &[u8; 4] = b"CWGR";
-const GRAPH_COMPRESSION_LEVEL: i32 = 19;
+const GRAPH_HEADER: &[u8; 8] = b"CWGR\x04PZ\0";
+#[doc(hidden)]
+pub const DEFAULT_GRAPH_COMPRESSION_LEVEL: i32 = 19;
+
+#[doc(hidden)]
+pub fn validate_graph_compression_level(compression_level: i32) -> eyre::Result<()> {
+    let supported_levels = zstd::compression_level_range();
+    if supported_levels.contains(&compression_level) {
+        Ok(())
+    } else {
+        Err(eyre!(
+            "zstd compression level {compression_level} is outside the supported range {}..={}",
+            supported_levels.start(),
+            supported_levels.end(),
+        ))
+    }
+}
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HashSignalInfo {
@@ -102,6 +116,68 @@ impl Graph {
         })
     }
 
+    /// Returns a graph that evaluates selected DAG regions with native Rust callbacks.
+    ///
+    /// Node IDs in each replacement refer to this graph's [`Graph::nodes`] view. Replacements are
+    /// validated as closed subgraphs: every dependency entering a region must be listed as an
+    /// input, and every covered value used outside it must be listed as an output.
+    pub fn customize(&self, replacements: &[custom::NativeSubgraph]) -> eyre::Result<Self> {
+        self.apply_customizations(replacements, &[])
+    }
+
+    /// Starts a builder for combining native DAG replacements and dynamic runtime-function
+    /// implementations in one customized graph.
+    pub fn customizer(&self) -> custom::GraphCustomizer<'_> {
+        custom::GraphCustomizer::new(self)
+    }
+
+    /// Names of dynamic Circom functions embedded in this graph's portable runtime IR.
+    ///
+    /// These are the names accepted by [`custom::RuntimeFunctionMatcher`].
+    pub fn runtime_function_names(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.program
+            .runtime_functions()
+            .iter()
+            .map(|function| function.name.as_str())
+    }
+
+    pub(crate) fn apply_customizations(
+        &self,
+        replacements: &[custom::NativeSubgraph],
+        runtime_functions: &[custom::NativeRuntimeFunction],
+    ) -> eyre::Result<Self> {
+        if replacements.is_empty() && runtime_functions.is_empty() {
+            return Ok(self.clone());
+        }
+        if self.program.has_customizations() {
+            return Err(eyre!(
+                "a customized graph cannot be customized again; register all customizations on the original graph"
+            ));
+        }
+        let mut compatibility = self.compatibility.get().cloned();
+        let program = if replacements.is_empty() {
+            self.program.clone()
+        } else {
+            let graph = self.compatibility();
+            let resolved = custom::resolve(&graph.nodes, &graph.signals, replacements)?;
+            compatibility = Some(graph.clone());
+            program::compile_with_native(
+                &graph.nodes,
+                &graph.signals,
+                &[],
+                self.program.runtime_functions().to_vec(),
+                &resolved,
+            )?
+            .prepare_evaluation()?
+        }
+        .with_native_runtime_functions(runtime_functions.to_vec())?;
+        Ok(Self {
+            compatibility: compatibility.map_or_else(OnceLock::new, OnceLock::from),
+            input_mapping: self.input_mapping.clone(),
+            program,
+        })
+    }
+
     /// Returns the number of compact runtime instructions after graph preparation and fusion.
     #[doc(hidden)]
     pub fn runtime_instruction_count(&self) -> usize {
@@ -119,47 +195,19 @@ impl WitnessEvaluator<'_> {
             .evaluate_prepared(inputs, &self.black_boxes, &mut self.workspace)?;
         Ok(self.workspace.outputs())
     }
-}
 
-#[cfg(test)]
-fn encode_backward_reference(node: usize, reference: usize) -> eyre::Result<usize> {
-    node.checked_sub(reference)
-        .and_then(|distance| distance.checked_sub(1))
-        .ok_or_else(|| eyre!("graph node {node} does not reference an earlier node {reference}"))
-}
-
-fn decode_backward_reference(node: usize, distance: usize) -> eyre::Result<usize> {
-    node.checked_sub(
-        distance
-            .checked_add(1)
-            .ok_or_else(|| eyre!("graph reference distance overflowed"))?,
-    )
-    .ok_or_else(|| eyre!("graph reference distance {distance} is invalid at node {node}"))
-}
-
-#[cfg(test)]
-fn encode_output_delta(output: usize, previous: usize) -> eyre::Result<usize> {
-    if output >= previous {
-        (output - previous)
-            .checked_mul(2)
-            .ok_or_else(|| eyre!("graph output delta overflowed"))
-    } else {
-        (previous - output)
-            .checked_mul(2)
-            .and_then(|delta| delta.checked_sub(1))
-            .ok_or_else(|| eyre!("graph output delta overflowed"))
-    }
-}
-
-fn decode_output_delta(encoded: usize, previous: usize) -> eyre::Result<usize> {
-    if encoded & 1 == 0 {
-        previous
-            .checked_add(encoded / 2)
-            .ok_or_else(|| eyre!("graph output delta overflowed"))
-    } else {
-        previous
-            .checked_sub(encoded / 2 + 1)
-            .ok_or_else(|| eyre!("graph output delta is invalid"))
+    pub(crate) fn evaluate_profiled(
+        &mut self,
+        inputs: &[U256],
+        profile: &mut profile::ProfileCollector,
+    ) -> eyre::Result<&[U256]> {
+        self.graph.program.evaluate_prepared_profiled(
+            inputs,
+            &self.black_boxes,
+            &mut self.workspace,
+            profile,
+        )?;
+        Ok(self.workspace.outputs())
     }
 }
 
@@ -179,49 +227,36 @@ pub fn serialize_graph_with_runtime(
     input_mapping: Vec<HashSignalInfo>,
     runtime_functions: Vec<runtime::RuntimeFunction>,
 ) -> eyre::Result<Vec<u8>> {
-    // Preserve the builder's topological order on disk. Division-depth reordering improves runtime
-    // but measurably hurts compression on large graphs, so it is deliberately done only at load.
-    let encoded_program =
-        program::compile(&nodes, &signals, &[], runtime_functions.clone())?.encode()?;
-    let postcard = postcard::to_stdvec(&(&encoded_program, &input_mapping, &runtime_functions))?;
-    let compressed = zstd::stream::encode_all(postcard.as_slice(), GRAPH_COMPRESSION_LEVEL)
+    serialize_graph_with_runtime_and_compression(
+        nodes,
+        signals,
+        input_mapping,
+        runtime_functions,
+        DEFAULT_GRAPH_COMPRESSION_LEVEL,
+    )
+}
+
+#[doc(hidden)]
+pub fn serialize_graph_with_runtime_and_compression(
+    nodes: Vec<Node>,
+    signals: Vec<usize>,
+    input_mapping: Vec<HashSignalInfo>,
+    runtime_functions: Vec<runtime::RuntimeFunction>,
+    compression_level: i32,
+) -> eyre::Result<Vec<u8>> {
+    validate_graph_compression_level(compression_level)?;
+    // Graph generation pays for all generic fusion and scheduling once. The artifact contains the
+    // exact executable layout so applications only decompress, deserialize, and validate it.
+    let program = program::compile_for_serialization(&nodes, &signals, runtime_functions)?
+        .prepare_evaluation()?;
+    let (prepared, runtime_functions) = program.into_prepared()?;
+    let postcard = postcard::to_stdvec(&(&prepared, &input_mapping, &runtime_functions))?;
+    let compressed = zstd::bulk::compress(&postcard, compression_level)
         .wrap_err("failed to compress witness graph")?;
     let mut encoded = Vec::with_capacity(GRAPH_HEADER.len() + compressed.len());
     encoded.extend_from_slice(GRAPH_HEADER);
     encoded.extend_from_slice(&compressed);
     Ok(encoded)
-}
-
-fn restore_absolute_references(nodes: &mut [Node], signals: &mut [usize]) -> eyre::Result<()> {
-    for (index, node) in nodes.iter_mut().enumerate() {
-        match node {
-            Node::Op(_, left, right) => {
-                *left = decode_backward_reference(index, *left)?;
-                *right = decode_backward_reference(index, *right)?;
-            }
-            Node::BBF(_, parameters) => {
-                for parameter in parameters {
-                    *parameter = decode_backward_reference(index, *parameter)?;
-                }
-            }
-            Node::RuntimeCall { parameters, .. } => {
-                for parameter in parameters {
-                    *parameter = decode_backward_reference(index, *parameter)?;
-                }
-            }
-            Node::Input(_) | Node::Constant(_) | Node::MontConstant(_) => {}
-        }
-    }
-
-    let mut previous = 0;
-    for output in signals {
-        *output = decode_output_delta(*output, previous)?;
-        if *output >= nodes.len() {
-            return Err(eyre!("graph output node {} is out of bounds", *output));
-        }
-        previous = *output;
-    }
-    Ok(())
 }
 
 fn fnv1a(s: &str) -> u64 {
@@ -235,94 +270,34 @@ fn fnv1a(s: &str) -> u64 {
 
 /// Loads the graph from bytes
 pub fn init_graph(graph_bytes: &[u8]) -> eyre::Result<Graph> {
-    #[derive(Clone, Copy)]
-    enum Format {
-        Fused,
-        PreviousFused,
-        LegacyCompressed,
-        LegacyRaw,
+    let payload = graph_bytes
+        .strip_prefix(GRAPH_HEADER)
+        .ok_or_else(|| eyre!("unsupported witness graph format"))?;
+    let decompressed_size = zstd::zstd_safe::get_frame_content_size(payload)
+        .map_err(|error| eyre!("invalid witness graph compression frame: {error:?}"))?
+        .ok_or_else(|| eyre!("witness graph compression frame is missing its content size"))?;
+    let decompressed_size = usize::try_from(decompressed_size)
+        .map_err(|_| eyre!("witness graph is too large for this platform"))?;
+    let mut decompressed = Vec::new();
+    decompressed
+        .try_reserve_exact(decompressed_size)
+        .wrap_err("witness graph decompressed size cannot be allocated")?;
+    let written = zstd::bulk::Decompressor::new()
+        .wrap_err("failed to initialize witness graph decompressor")?
+        .decompress_to_buffer(payload, &mut decompressed)
+        .wrap_err("failed to decompress witness graph")?;
+    if written != decompressed_size || decompressed.len() != decompressed_size {
+        return Err(eyre!("witness graph decompressed to an unexpected size"));
     }
-
-    let (format, payload) = if graph_bytes.starts_with(GRAPH_MAGIC) {
-        let header = graph_bytes
-            .get(..GRAPH_HEADER.len())
-            .ok_or_else(|| eyre!("witness graph header is truncated"))?;
-        if header == GRAPH_HEADER {
-            (Format::Fused, &graph_bytes[GRAPH_HEADER.len()..])
-        } else if header == PREVIOUS_FUSED_GRAPH_HEADER {
-            (
-                Format::PreviousFused,
-                &graph_bytes[PREVIOUS_FUSED_GRAPH_HEADER.len()..],
-            )
-        } else if header == LEGACY_GRAPH_HEADER {
-            (
-                Format::LegacyCompressed,
-                &graph_bytes[LEGACY_GRAPH_HEADER.len()..],
-            )
-        } else {
-            return Err(eyre!("unsupported witness graph format"));
-        }
-    } else {
-        (Format::LegacyRaw, graph_bytes)
-    };
-
-    let decompressed;
-    let payload = if matches!(format, Format::LegacyRaw) {
-        payload
-    } else {
-        decompressed =
-            zstd::stream::decode_all(payload).wrap_err("failed to decompress witness graph")?;
-        decompressed.as_slice()
-    };
-
-    if matches!(format, Format::Fused | Format::PreviousFused) {
-        let (encoded, input_mapping, runtime_functions) = if matches!(format, Format::Fused) {
-            let (encoded, input_mapping, runtime_functions): (
-                program::EncodedProgram,
-                Vec<HashSignalInfo>,
-                Vec<runtime::RuntimeFunction>,
-            ) = postcard::from_bytes(payload).wrap_err("failed to decode fused witness graph")?;
-            (encoded, input_mapping, runtime_functions)
-        } else {
-            let (encoded, input_mapping): (program::EncodedProgram, Vec<HashSignalInfo>) =
-                postcard::from_bytes(payload)
-                    .wrap_err("failed to decode previous fused witness graph")?;
-            (encoded, input_mapping, Vec::new())
-        };
-        let program = program::Program::decode(encoded, runtime_functions)?.prepare_evaluation()?;
-        return Ok(Graph {
-            compatibility: OnceLock::new(),
-            input_mapping,
-            program,
-        });
-    }
-
-    let (mut nodes, mut signals, input_mapping) = match format {
-        Format::Fused | Format::PreviousFused => unreachable!(),
-        Format::LegacyCompressed => {
-            let (mut nodes, mut signals, input_mapping): (
-                Vec<Node>,
-                Vec<usize>,
-                Vec<HashSignalInfo>,
-            ) = postcard::from_bytes(payload).wrap_err("failed to decode legacy witness graph")?;
-            restore_absolute_references(&mut nodes, &mut signals)?;
-            (nodes, signals, input_mapping)
-        }
-        Format::LegacyRaw => {
-            postcard::from_bytes(payload).wrap_err("failed to decode legacy witness graph")?
-        }
-    };
-
-    let evaluation_plan = graph::prepare_evaluation(&mut nodes, &mut signals)?;
-    let program = program::compile(
-        &nodes,
-        &signals,
-        evaluation_plan.division_batches(),
-        Vec::new(),
-    )?;
+    let (prepared, input_mapping, runtime_functions): (
+        program::PreparedProgram,
+        Vec<HashSignalInfo>,
+        Vec<runtime::RuntimeFunction>,
+    ) = postcard::from_bytes(&decompressed).wrap_err("failed to decode prepared witness graph")?;
+    let program = program::Program::from_prepared(prepared, runtime_functions)?;
 
     Ok(Graph {
-        compatibility: OnceLock::from(CompatibilityGraph { nodes, signals }),
+        compatibility: OnceLock::new(),
         input_mapping,
         program,
     })
@@ -341,7 +316,15 @@ pub fn get_inputs_buffer(size: usize) -> Vec<U256> {
 }
 
 /// Calculates the position of the given signal in the inputs buffer
-pub fn get_input_mapping(input_list: &Vec<String>, graph: &Graph) -> HashMap<String, usize> {
+pub fn get_input_mapping(input_list: &[String], graph: &Graph) -> HashMap<String, usize> {
+    try_get_input_mapping(input_list, graph).expect("input signal is missing from witness graph")
+}
+
+/// Fallible variant of [`get_input_mapping`] for command-line tools and untrusted input objects.
+pub fn try_get_input_mapping(
+    input_list: &[String],
+    graph: &Graph,
+) -> eyre::Result<HashMap<String, usize>> {
     let mut input_mapping = HashMap::new();
     for key in input_list {
         let h = fnv1a(key);
@@ -349,11 +332,11 @@ pub fn get_input_mapping(input_list: &Vec<String>, graph: &Graph) -> HashMap<Str
             .input_mapping
             .iter()
             .position(|x| x.hash == h)
-            .unwrap();
+            .ok_or_else(|| eyre!("input signal {key:?} is missing from witness graph"))?;
         let si = (graph.input_mapping[pos].signalid) as usize;
         input_mapping.insert(key.to_string(), si);
     }
-    input_mapping
+    Ok(input_mapping)
 }
 
 /// Sets all provided inputs given the mapping and inputs buffer
@@ -376,7 +359,8 @@ pub fn calculate_witness(
     bbfs: Option<&HashMap<String, BlackBoxFunction>>,
 ) -> eyre::Result<Vec<U256>> {
     let mut inputs_buffer = get_inputs_buffer(get_inputs_size(graph));
-    let input_mapping = get_input_mapping(&input_list.keys().cloned().collect(), graph);
+    let input_names = input_list.keys().cloned().collect::<Vec<_>>();
+    let input_mapping = get_input_mapping(&input_names, graph);
     populate_inputs(&input_list, &input_mapping, &mut inputs_buffer);
     graph.evaluate(&inputs_buffer, bbfs)
 }
@@ -385,7 +369,6 @@ pub fn calculate_witness(
 mod tests {
     use super::*;
     use crate::graph::Operation;
-    use crate::runtime::{RuntimeExpression, RuntimeFunction, RuntimeStatement};
 
     fn graph_parts() -> (Vec<Node>, Vec<usize>, Vec<HashSignalInfo>) {
         let nodes = vec![
@@ -449,42 +432,51 @@ mod tests {
     }
 
     #[test]
-    fn legacy_compressed_graphs_remain_supported() {
-        let (mut nodes, mut signals, input_mapping) = graph_parts();
-        for (index, node) in nodes.iter_mut().enumerate() {
-            match node {
-                Node::Op(_, left, right) => {
-                    *left = encode_backward_reference(index, *left).unwrap();
-                    *right = encode_backward_reference(index, *right).unwrap();
-                }
-                Node::BBF(_, parameters) => {
-                    for parameter in parameters {
-                        *parameter = encode_backward_reference(index, *parameter).unwrap();
-                    }
-                }
-                Node::RuntimeCall { parameters, .. } => {
-                    for parameter in parameters {
-                        *parameter = encode_backward_reference(index, *parameter).unwrap();
-                    }
-                }
-                Node::Input(_) | Node::Constant(_) | Node::MontConstant(_) => {}
-            }
-        }
-        let mut previous = 0;
-        for signal in &mut signals {
-            let absolute = *signal;
-            *signal = encode_output_delta(absolute, previous).unwrap();
-            previous = absolute;
-        }
-        let postcard = postcard::to_stdvec(&(&nodes, &signals, &input_mapping)).unwrap();
-        let compressed = zstd::stream::encode_all(postcard.as_slice(), 19).unwrap();
-        let mut encoded = LEGACY_GRAPH_HEADER.to_vec();
-        encoded.extend(compressed);
+    fn graph_compression_level_is_selected_at_serialization_time() {
+        let nodes = vec![
+            Node::Input(0),
+            Node::Input(1),
+            Node::Op(Operation::Add, 0, 1),
+        ];
+        let default = serialize_graph(nodes.clone(), vec![2], Vec::new()).unwrap();
+        let explicit_default = serialize_graph_with_runtime_and_compression(
+            nodes.clone(),
+            vec![2],
+            Vec::new(),
+            Vec::new(),
+            DEFAULT_GRAPH_COMPRESSION_LEVEL,
+        )
+        .unwrap();
+        assert_eq!(default, explicit_default);
 
-        let graph = init_graph(&encoded).unwrap();
-        let (nodes, signals, _) = graph_parts();
-        assert_eq!(graph.nodes(), nodes);
-        assert_eq!(graph.signals(), signals);
+        let fast = serialize_graph_with_runtime_and_compression(
+            nodes,
+            vec![2],
+            Vec::new(),
+            Vec::new(),
+            -5,
+        )
+        .unwrap();
+        assert_eq!(
+            init_graph(&fast)
+                .unwrap()
+                .evaluate(&[U256::from(2_u64), U256::from(3_u64)], None)
+                .unwrap(),
+            vec![U256::from(5_u64)]
+        );
+
+        let unsupported = zstd::compression_level_range()
+            .end()
+            .checked_add(1)
+            .unwrap();
+        assert!(serialize_graph_with_runtime_and_compression(
+            vec![Node::Input(0)],
+            vec![0],
+            Vec::new(),
+            Vec::new(),
+            unsupported,
+        )
+        .is_err());
     }
 
     #[test]
@@ -511,52 +503,8 @@ mod tests {
     }
 
     #[test]
-    fn fused_graph_round_trips_runtime_ir_calls() {
-        let nodes = vec![
-            Node::Input(0),
-            Node::RuntimeCall {
-                function: 0,
-                call: 0,
-                output: 0,
-                output_count: 1,
-                arena_size: 1,
-                parameters: vec![0],
-            },
-        ];
-        let functions = vec![RuntimeFunction {
-            name: "identity".to_owned(),
-            variable_count: 1,
-            body: vec![RuntimeStatement::Return {
-                value: RuntimeExpression::Load {
-                    offset: Box::new(RuntimeExpression::Address(0)),
-                    size: 1,
-                },
-                size: 1,
-            }],
-        }];
-        let encoded = serialize_graph_with_runtime(nodes, vec![1], Vec::new(), functions).unwrap();
-        let graph = init_graph(&encoded).unwrap();
-
-        assert_eq!(
-            graph.evaluate(&[U256::from(7_u64)], None).unwrap(),
-            vec![U256::from(7_u64)]
-        );
-    }
-
-    #[test]
-    fn legacy_postcard_graphs_remain_supported() {
-        let (nodes, signals, input_mapping) = graph_parts();
-        let encoded = postcard::to_stdvec(&(&nodes, &signals, &input_mapping)).unwrap();
-
-        let graph = init_graph(&encoded).unwrap();
-        assert_eq!(graph.nodes(), nodes);
-        assert_eq!(graph.signals(), signals);
-        assert_eq!(graph.input_mapping, input_mapping);
-    }
-
-    #[test]
     fn unknown_graph_versions_are_rejected() {
-        let error = init_graph(b"CWGR\x02DZ\0payload").err().unwrap();
+        let error = init_graph(b"CWGR\x03FZ\0payload").err().unwrap();
         assert!(error
             .to_string()
             .contains("unsupported witness graph format"));

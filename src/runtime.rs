@@ -2,12 +2,15 @@
 //! a static arithmetic graph (input-dependent branches, loops, or array indexes).
 
 use ark_bn254::Fr;
-use eyre::{bail, eyre};
-use num_bigint::BigUint;
+use eyre::{bail, eyre, Context as _};
 use ruint::aliases::U256;
 use serde::{Deserialize, Serialize};
 
-use crate::graph::Operation;
+use crate::{
+    custom::{NativeRuntimeFunction, NativeRuntimeOutcome, RuntimeCallInfo},
+    graph::Operation,
+    profile::{ProfileCollector, ProfileFrame},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeFunction {
@@ -96,6 +99,9 @@ enum Flow {
 
 struct Interpreter<'a> {
     functions: &'a [RuntimeFunction],
+    native_functions: &'a [NativeRuntimeFunction],
+    native_bindings: &'a [Vec<usize>],
+    profile: Option<&'a mut ProfileCollector>,
     steps_left: usize,
 }
 
@@ -110,17 +116,150 @@ impl<'a> Interpreter<'a> {
 
     fn call(
         &mut self,
-        function: usize,
+        function_id: usize,
         arguments: &[Fr],
+        argument_sizes: &[usize],
         arena_size: usize,
         result_size: usize,
     ) -> eyre::Result<Vec<Fr>> {
+        if self.profile.is_none() {
+            return self.call_inner(
+                function_id,
+                arguments,
+                argument_sizes,
+                arena_size,
+                result_size,
+            );
+        }
+        let function_name = self
+            .functions
+            .get(function_id)
+            .ok_or_else(|| eyre!("runtime Circom function {function_id} is missing"))?
+            .name
+            .clone();
+        let profile_token = self.profile.as_deref_mut().map(|profile| {
+            profile.enter(ProfileFrame::runtime_function(function_id, &function_name))
+        });
+        let result = self.call_inner(
+            function_id,
+            arguments,
+            argument_sizes,
+            arena_size,
+            result_size,
+        );
+        if let Some(token) = profile_token {
+            self.profile.as_deref_mut().unwrap().exit(token);
+        }
+        result
+    }
+
+    fn call_inner(
+        &mut self,
+        function_id: usize,
+        arguments: &[Fr],
+        argument_sizes: &[usize],
+        arena_size: usize,
+        result_size: usize,
+    ) -> eyre::Result<Vec<Fr>> {
+        let mut outputs = vec![Fr::from(0_u64); result_size];
+        self.call_inner_into(
+            function_id,
+            arguments,
+            argument_sizes,
+            arena_size,
+            &mut outputs,
+        )?;
+        Ok(outputs)
+    }
+
+    fn call_into(
+        &mut self,
+        function_id: usize,
+        arguments: &[Fr],
+        argument_sizes: &[usize],
+        arena_size: usize,
+        outputs: &mut [Fr],
+    ) -> eyre::Result<()> {
+        if self.profile.is_none() {
+            return self.call_inner_into(
+                function_id,
+                arguments,
+                argument_sizes,
+                arena_size,
+                outputs,
+            );
+        }
+        let function_name = self
+            .functions
+            .get(function_id)
+            .ok_or_else(|| eyre!("runtime Circom function {function_id} is missing"))?
+            .name
+            .clone();
+        let profile_token = self.profile.as_deref_mut().map(|profile| {
+            profile.enter(ProfileFrame::runtime_function(function_id, &function_name))
+        });
+        let result =
+            self.call_inner_into(function_id, arguments, argument_sizes, arena_size, outputs);
+        if let Some(token) = profile_token {
+            self.profile.as_deref_mut().unwrap().exit(token);
+        }
+        result
+    }
+
+    fn call_inner_into(
+        &mut self,
+        function_id: usize,
+        arguments: &[Fr],
+        argument_sizes: &[usize],
+        arena_size: usize,
+        outputs: &mut [Fr],
+    ) -> eyre::Result<()> {
+        let result_size = outputs.len();
         let function = self
             .functions
-            .get(function)
-            .ok_or_else(|| eyre!("runtime Circom function {function} is missing"))?;
-        if function.name == "mod_inv" || function.name.starts_with("mod_inv_") {
-            return evaluate_mod_inv(arguments, result_size);
+            .get(function_id)
+            .ok_or_else(|| eyre!("runtime Circom function {function_id} is missing"))?;
+        let argument_count = argument_sizes
+            .iter()
+            .try_fold(0_usize, |total, size| total.checked_add(*size));
+        if argument_count != Some(arguments.len()) {
+            bail!(
+                "arguments for runtime Circom function {} do not match their declared boundaries",
+                function.name
+            );
+        }
+        let call = RuntimeCallInfo::new(
+            function_id,
+            &function.name,
+            arguments,
+            argument_sizes,
+            arena_size,
+            result_size,
+        );
+        let native_bindings = self
+            .native_bindings
+            .get(function_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        for &native in native_bindings {
+            let native = &self.native_functions[native];
+            outputs.fill(Fr::from(0_u64));
+            let profile_token = self.profile.as_deref_mut().map(|profile| {
+                profile.enter(ProfileFrame::native_runtime_handler(format!(
+                    "native_runtime:{}",
+                    native.name()
+                )))
+            });
+            let result = native
+                .evaluate(call, outputs)
+                .wrap_err_with(|| format!("native runtime function {:?} failed", native.name()));
+            if let Some(token) = profile_token {
+                self.profile.as_deref_mut().unwrap().exit(token);
+            }
+            match result? {
+                NativeRuntimeOutcome::Handled => return Ok(()),
+                NativeRuntimeOutcome::Fallback => {}
+            }
         }
         let mut variables = vec![Fr::from(0_u64); arena_size.max(function.variable_count)];
         if arguments.len() > variables.len() {
@@ -131,14 +270,15 @@ impl<'a> Interpreter<'a> {
         }
         variables[..arguments.len()].copy_from_slice(arguments);
         match self.execute_list(&function.body, &mut variables)? {
-            Flow::Return(mut values) => {
+            Flow::Return(values) => {
                 // Circom passes the caller's requested result size to generated
                 // functions. Some real-world circuits intentionally assign a
                 // shorter returned array to a wider destination; the generated
                 // WASM copies the zero-initialized tail in that case.
-                values.resize(result_size, Fr::from(0_u64));
-                values.truncate(result_size);
-                Ok(values)
+                outputs.fill(Fr::from(0_u64));
+                let copied = values.len().min(result_size);
+                outputs[..copied].copy_from_slice(&values[..copied]);
+                Ok(())
             }
             Flow::Continue => bail!("runtime Circom function {} did not return", function.name),
         }
@@ -296,82 +436,83 @@ impl<'a> Interpreter<'a> {
                 arguments,
             } => {
                 let mut flattened = Vec::new();
+                let mut argument_sizes = Vec::with_capacity(arguments.len());
                 for (argument, size) in arguments {
                     let values = self.evaluate(argument, variables)?.fields()?;
                     if values.len() < *size {
                         bail!("runtime Circom call argument is shorter than its declared size");
                     }
+                    argument_sizes.push(*size);
                     flattened.extend_from_slice(&values[..*size]);
                 }
-                Value::Fields(self.call(*function, &flattened, *arena_size, *result_size)?)
+                Value::Fields(self.call(
+                    *function,
+                    &flattened,
+                    &argument_sizes,
+                    *arena_size,
+                    *result_size,
+                )?)
             }
         })
     }
 }
 
-fn evaluate_mod_inv(arguments: &[Fr], result_size: usize) -> eyre::Result<Vec<Fr>> {
-    if arguments.len() < 2 {
-        bail!("Circom mod_inv call is missing n and k");
-    }
-    let n = usize::try_from(BigUint::from(arguments[0]))
-        .map_err(|_| eyre!("Circom mod_inv limb width does not fit usize"))?;
-    let k = usize::try_from(BigUint::from(arguments[1]))
-        .map_err(|_| eyre!("Circom mod_inv limb count does not fit usize"))?;
-    if n == 0 || n > 256 || arguments.len() < 2 + 2 * k {
-        bail!("Circom mod_inv has invalid limb dimensions");
-    }
-
-    let compose = |limbs: &[Fr]| {
-        limbs
-            .iter()
-            .enumerate()
-            .fold(BigUint::from(0_u8), |value, (index, limb)| {
-                value + (BigUint::from(*limb) << (n * index))
-            })
-    };
-    let value = compose(&arguments[2..2 + k]);
-    // Circom specializes array parameters at each call site. The bigint
-    // library uses either k, 50, or 100 slots for the first operand, while
-    // only the first k slots carry limbs. Recover the second parameter's
-    // boundary and prefer the nonzero modulus candidate.
-    let modulus = [k, 50, 100]
-        .into_iter()
-        .filter(|operand_size| arguments.len() >= 2 + operand_size + k)
-        .map(|operand_size| compose(&arguments[2 + operand_size..2 + operand_size + k]))
-        .max()
-        .unwrap_or_default();
-    if modulus <= BigUint::from(2_u8) {
-        bail!("Circom mod_inv modulus must be greater than two");
-    }
-    let inverse = if value == BigUint::from(0_u8) {
-        value
-    } else {
-        value.modpow(&(&modulus - BigUint::from(2_u8)), &modulus)
-    };
-    let mask = (BigUint::from(1_u8) << n) - BigUint::from(1_u8);
-    let mut output = Vec::with_capacity(result_size);
-    for index in 0..result_size {
-        output.push(if index < k {
-            Fr::from((&inverse >> (n * index)) & &mask)
-        } else {
-            Fr::from(0_u64)
-        });
-    }
-    Ok(output)
+pub(crate) struct RuntimeInvocation<'a> {
+    pub(crate) function: usize,
+    pub(crate) arguments: &'a [Fr],
+    pub(crate) argument_sizes: &'a [usize],
+    pub(crate) arena_size: usize,
+    pub(crate) result_size: usize,
 }
 
 pub(crate) fn evaluate(
     functions: &[RuntimeFunction],
-    function: usize,
-    arguments: &[Fr],
-    arena_size: usize,
-    result_size: usize,
+    native_functions: &[NativeRuntimeFunction],
+    native_bindings: &[Vec<usize>],
+    profile: Option<&mut ProfileCollector>,
+    invocation: RuntimeInvocation<'_>,
 ) -> eyre::Result<Vec<Fr>> {
     Interpreter {
         functions,
+        native_functions,
+        native_bindings,
+        profile,
         steps_left: 100_000_000,
     }
-    .call(function, arguments, arena_size, result_size)
+    .call(
+        invocation.function,
+        invocation.arguments,
+        invocation.argument_sizes,
+        invocation.arena_size,
+        invocation.result_size,
+    )
+}
+
+pub(crate) fn evaluate_into(
+    functions: &[RuntimeFunction],
+    native_functions: &[NativeRuntimeFunction],
+    native_bindings: &[Vec<usize>],
+    profile: Option<&mut ProfileCollector>,
+    invocation: RuntimeInvocation<'_>,
+    outputs: &mut [Fr],
+) -> eyre::Result<()> {
+    if outputs.len() != invocation.result_size {
+        bail!("runtime Circom output buffer has the wrong size");
+    }
+    Interpreter {
+        functions,
+        native_functions,
+        native_bindings,
+        profile,
+        steps_left: 100_000_000,
+    }
+    .call_into(
+        invocation.function,
+        invocation.arguments,
+        invocation.argument_sizes,
+        invocation.arena_size,
+        outputs,
+    )
 }
 
 #[cfg(test)]
@@ -429,28 +570,21 @@ mod tests {
         };
 
         assert_eq!(
-            evaluate(&[function], 0, &[Fr::from(4_u64)], 2, 1).unwrap(),
+            evaluate(
+                &[function],
+                &[],
+                &[],
+                None,
+                RuntimeInvocation {
+                    function: 0,
+                    arguments: &[Fr::from(4_u64)],
+                    argument_sizes: &[1],
+                    arena_size: 2,
+                    result_size: 1,
+                },
+            )
+            .unwrap(),
             vec![Fr::from(10_u64)]
-        );
-    }
-
-    #[test]
-    fn bigint_mod_inv_specialization_uses_circom_limbs_and_zero_extends() {
-        let function = RuntimeFunction {
-            name: "mod_inv_22".to_owned(),
-            variable_count: 0,
-            body: Vec::new(),
-        };
-        let arguments = [4_u64, 2, 3, 0, 13, 0].map(Fr::from);
-
-        assert_eq!(
-            evaluate(&[function], 0, &arguments, 0, 4).unwrap(),
-            vec![
-                Fr::from(9_u64),
-                Fr::from(0_u64),
-                Fr::from(0_u64),
-                Fr::from(0_u64),
-            ]
         );
     }
 }

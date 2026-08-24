@@ -14,4 +14,13 @@ cargo run --release -p circom-witness-graph-builder -- circuit.circom graph.bin
 
 An optional third and subsequent argument supplies Circom library search paths.
 Pass `--O1` before the circuit when its reference R1CS/WTNS was compiled with O1; O2 remains the
-default.
+default. Graph artifacts use zstd level 19 by default. Pass `--compression-level LEVEL` before the
+circuit to change it; negative levels favor load latency over artifact size:
+
+```shell
+cargo run --release -p circom-witness-graph-builder -- \
+  --O1 --compression-level -5 circuit.circom graph.bin
+```
+
+Library callers can make the same choice with
+`generate_witness_graph_from_file_with_options` and `GraphBuildOptions`.

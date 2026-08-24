@@ -22,10 +22,34 @@ use ruint::aliases::U256;
 use circom_witness_rs::{
     graph::{self, Node, Operation},
     runtime::{RuntimeExpression, RuntimeFunction, RuntimeOperation, RuntimeStatement},
-    serialize_graph_with_runtime, HashSignalInfo, M,
+    serialize_graph_with_runtime_and_compression, validate_graph_compression_level, HashSignalInfo,
+    M,
 };
 
+pub use circom_witness_rs::DEFAULT_GRAPH_COMPRESSION_LEVEL;
+
 const CIRCOM_VERSION: &str = "2.2.2";
+
+/// Options applied while compiling and serializing a witness graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphBuildOptions {
+    /// Use Circom's O1 witness-to-signal mapping instead of the default O2 mapping.
+    pub use_o1: bool,
+    /// Zstandard compression level for the generated artifact.
+    ///
+    /// Level 19 is the size-oriented default. Negative levels favor graph-load latency at the cost
+    /// of larger artifacts; for example, `-5` is a useful latency-oriented setting.
+    pub compression_level: i32,
+}
+
+impl Default for GraphBuildOptions {
+    fn default() -> Self {
+        Self {
+            use_o1: false,
+            compression_level: DEFAULT_GRAPH_COMPRESSION_LEVEL,
+        }
+    }
+}
 
 #[derive(Default)]
 struct GraphBuilder {
@@ -82,6 +106,7 @@ impl GraphBuilder {
         &mut self,
         function: usize,
         params: Vec<usize>,
+        argument_sizes: Vec<usize>,
         arena_size: usize,
         output_count: usize,
     ) -> Vec<usize> {
@@ -97,6 +122,7 @@ impl GraphBuilder {
                         output,
                         output_count,
                         arena_size,
+                        argument_sizes: argument_sizes.clone(),
                         parameters: params.clone(),
                     },
                     value,
@@ -334,6 +360,7 @@ impl<'a> Interpreter<'a> {
         &mut self,
         symbol: &str,
         arguments: Vec<usize>,
+        argument_sizes: Vec<usize>,
         arena_size: usize,
         component: usize,
         result_size: usize,
@@ -352,9 +379,13 @@ impl<'a> Interpreter<'a> {
                 self.graph.values.truncate(checkpoint);
                 self.graph.constant.truncate(checkpoint);
                 let function = self.compile_runtime_function(symbol, component)?;
-                Ok(self
-                    .graph
-                    .runtime_call(function, arguments, arena_size, result_size))
+                Ok(self.graph.runtime_call(
+                    function,
+                    arguments,
+                    argument_sizes,
+                    arena_size,
+                    result_size,
+                ))
             }
             Err(error) => Err(error),
         }
@@ -532,12 +563,14 @@ impl<'a> Interpreter<'a> {
 
     fn execute_call(&mut self, call: &CallBucket, frame: &mut Frame) -> Result<Option<Eval>> {
         let mut arguments = Vec::new();
+        let mut argument_sizes = Vec::with_capacity(call.arguments.len());
         for (argument, context) in call.arguments.iter().zip(&call.argument_types) {
             let (values, component) = self.eval(argument.as_ref(), frame)?.values()?;
             let size = self.resolve_size(context, component)?;
             if values.len() < size {
                 bail!("Circom call argument is shorter than its declared size");
             }
+            argument_sizes.push(size);
             arguments.extend_from_slice(&values[..size]);
         }
 
@@ -557,6 +590,7 @@ impl<'a> Interpreter<'a> {
                     let values = self.execute_function_or_runtime(
                         &call.symbol,
                         arguments,
+                        argument_sizes,
                         call.arena_size,
                         frame.component,
                         1,
@@ -582,6 +616,7 @@ impl<'a> Interpreter<'a> {
                     self.execute_function_or_runtime(
                         &call.symbol,
                         arguments,
+                        argument_sizes,
                         call.arena_size,
                         frame.component,
                         size,
@@ -1358,7 +1393,11 @@ pub fn generate_witness_graph_from_file(
     circuit_path: impl AsRef<Path>,
     library_paths: &[PathBuf],
 ) -> Result<Vec<u8>> {
-    generate_witness_graph_from_file_with_optimization(circuit_path, library_paths, false)
+    generate_witness_graph_from_file_with_options(
+        circuit_path,
+        library_paths,
+        GraphBuildOptions::default(),
+    )
 }
 
 /// Compile a Circom circuit using either its O1 or O2 witness-to-signal mapping.
@@ -1367,8 +1406,25 @@ pub fn generate_witness_graph_from_file_with_optimization(
     library_paths: &[PathBuf],
     use_o1: bool,
 ) -> Result<Vec<u8>> {
+    generate_witness_graph_from_file_with_options(
+        circuit_path,
+        library_paths,
+        GraphBuildOptions {
+            use_o1,
+            ..GraphBuildOptions::default()
+        },
+    )
+}
+
+/// Compile a Circom circuit with explicit optimization and artifact-compression options.
+pub fn generate_witness_graph_from_file_with_options(
+    circuit_path: impl AsRef<Path>,
+    library_paths: &[PathBuf],
+    options: GraphBuildOptions,
+) -> Result<Vec<u8>> {
+    validate_graph_compression_level(options.compression_level)?;
     let circuit_path = circuit_path.as_ref();
-    let circuit = compile_circuit(circuit_path, library_paths, use_o1)?;
+    let circuit = compile_circuit(circuit_path, library_paths, options.use_o1)?;
     let input_map = circuit
         .c_producer
         .main_input_list
@@ -1386,7 +1442,13 @@ pub fn generate_witness_graph_from_file_with_optimization(
     eprintln!("Graph with {} nodes", nodes.len());
     graph::optimize(&mut nodes, &mut signals);
 
-    let bytes = serialize_graph_with_runtime(nodes, signals, input_map, runtime_functions)?;
+    let bytes = serialize_graph_with_runtime_and_compression(
+        nodes,
+        signals,
+        input_map,
+        runtime_functions,
+        options.compression_level,
+    )?;
     eprintln!("Graph size: {} bytes", bytes.len());
     Ok(bytes)
 }
@@ -1402,7 +1464,23 @@ pub fn generate_witness_graph() -> Result<Vec<u8>> {
         .into_iter()
         .collect::<Vec<_>>();
     let use_o1 = env::var_os("CIRCOM_OPTIMIZATION").is_some_and(|value| value == "O1");
-    generate_witness_graph_from_file_with_optimization(&circuit_path, &library_paths, use_o1)
+    let compression_level = env::var("CIRCOM_GRAPH_COMPRESSION_LEVEL")
+        .ok()
+        .map(|value| {
+            value
+                .parse()
+                .wrap_err("CIRCOM_GRAPH_COMPRESSION_LEVEL must be a signed integer")
+        })
+        .transpose()?
+        .unwrap_or(DEFAULT_GRAPH_COMPRESSION_LEVEL);
+    generate_witness_graph_from_file_with_options(
+        &circuit_path,
+        &library_paths,
+        GraphBuildOptions {
+            use_o1,
+            compression_level,
+        },
+    )
 }
 
 /// Compile the selected circuit and write its optimized graph to `graph.bin`.
