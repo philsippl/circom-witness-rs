@@ -312,7 +312,7 @@ fn shift_left(a: U256, amount: U256) -> U256 {
     if amount >= uint!(254) {
         U256::ZERO
     } else {
-        ((a << amount.as_limbs()[0]) & bit_mask()) % M
+        ((a << amount.to::<usize>()) & bit_mask()) % M
     }
 }
 
@@ -320,7 +320,7 @@ fn shift_right(a: U256, amount: U256) -> U256 {
     if amount >= uint!(254) {
         U256::ZERO
     } else {
-        (a >> amount.as_limbs()[0]) % M
+        (a >> amount.to::<usize>()) % M
     }
 }
 
@@ -708,6 +708,11 @@ mod tests {
     #[test]
     fn shifts_follow_circoms_signed_field_semantics() {
         let negative_one = M - U256::ONE;
+        assert_eq!(
+            Operation::Shl.eval(uint!(8_U256), U256::ONE),
+            uint!(16_U256)
+        );
+        assert_eq!(Operation::Shr.eval(uint!(8_U256), U256::ONE), uint!(4_U256));
         assert_eq!(
             Operation::Shl.eval(uint!(8_U256), negative_one),
             uint!(4_U256)
