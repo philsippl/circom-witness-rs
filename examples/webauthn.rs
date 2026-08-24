@@ -794,8 +794,10 @@ fn read_wtns(path: &Path) -> eyre::Result<(Vec<U256>, String)> {
     ensure!(witness.len() == count * 32, "invalid WTNS witness length");
     Ok((
         witness
-            .chunks_exact(32)
-            .map(|value| U256::from_le_bytes::<32>(value.try_into().unwrap()))
+            .as_chunks::<32>()
+            .0
+            .iter()
+            .map(|value| U256::from_le_bytes::<32>(*value))
             .collect(),
         file_hash,
     ))
