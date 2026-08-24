@@ -793,7 +793,7 @@ fn witness_blake3(witness: &[U256]) -> blake3::Hash {
     hasher.update(&(witness.len() as u64).to_le_bytes());
     let mut bytes = vec![0_u8; FIELDS_PER_CHUNK * 32];
     for fields in witness.chunks(FIELDS_PER_CHUNK) {
-        for (value, encoded) in fields.iter().zip(bytes.chunks_exact_mut(32)) {
+        for (value, encoded) in fields.iter().zip(bytes.as_chunks_mut::<32>().0) {
             encoded.copy_from_slice(&value.to_le_bytes::<32>());
         }
         hasher.update(&bytes[..fields.len() * 32]);
