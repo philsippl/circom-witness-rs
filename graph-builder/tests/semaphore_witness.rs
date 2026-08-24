@@ -40,8 +40,13 @@ const INPUT_JSON: &str = r#"
 }
 "#;
 
+const V0_3_GRAPH: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../tests/fixtures/semaphore/graph-v0.3.0.bin"
+));
+
 #[test]
-fn semaphore_wasm_and_rust_witnesses_are_identical() {
+fn semaphore_wasm_latest_and_v0_3_graph_witnesses_are_identical() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -49,6 +54,10 @@ fn semaphore_wasm_and_rust_witnesses_are_identical() {
     let circuit = root.join("tests/fixtures/semaphore/semaphore.circom");
 
     let wasm_witness = wasm_witness(&circuit, "semaphore", INPUT_JSON, &[]);
+
+    let legacy_graph = init_graph(V0_3_GRAPH).unwrap();
+    let legacy_witness = calculate_witness(circom_inputs(INPUT_JSON), &legacy_graph, None).unwrap();
+    assert_witnesses_equal(&legacy_witness, &wasm_witness);
 
     let graph_bytes = generate_witness_graph_from_file(&circuit, &[]).unwrap();
     let graph = init_graph(&graph_bytes).unwrap();

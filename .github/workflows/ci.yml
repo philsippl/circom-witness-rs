@@ -49,7 +49,7 @@ jobs:
           CIRCOM: ${{ runner.temp }}/circom
         run: cargo test -p circom-witness-graph-builder --release --features test-circomlib --test circomlib_witness
 
-      - name: Compare Semaphore WASM and Rust witnesses
+      - name: Compare Semaphore WASM, latest, and v0.3 graph witnesses
         env:
           CIRCOM: ${{ runner.temp }}/circom
         run: cargo test -p circom-witness-graph-builder --release --features test-semaphore --test semaphore_witness
