@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.5.1](https://github.com/philsippl/circom-witness-rs/compare/circom-witness-rs-v0.5.0...circom-witness-rs-v0.5.1) - 2026-08-24
+
+### Fixed
+
+- fix release-plz workflow history handling
+
+### Other
+
+- Fix shifts on 32-bit targets ([#49](https://github.com/philsippl/circom-witness-rs/pull/49))
+- Restore v0.3 graph compatibility ([#48](https://github.com/philsippl/circom-witness-rs/pull/48))
+
 ## [0.3.0](https://github.com/philsippl/circom-witness-rs/compare/v0.2.3...v0.3.0) - 2026-08-07
 
 ### Other
